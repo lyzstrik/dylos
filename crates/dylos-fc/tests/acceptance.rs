@@ -395,38 +395,42 @@ async fn span_records_duration() -> TestResult {
     let dir = tempdir()?;
     let (server, client, _) = server_and_client(&dir)?;
 
-    // Success call
-    server.set_reply(hyper::StatusCode::OK, b"{}".to_vec());
-    let _: Option<Value> = client.get("/vm").await?;
+    // Failed call with delay
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    server.set_reply_with_delay(hyper::StatusCode::NOT_FOUND, b"{}".to_vec(), notify.clone());
 
-    // Failed call
-    server.set_reply(hyper::StatusCode::NOT_FOUND, b"{}".to_vec());
-    let _ = client.get::<Value>("/nothing").await;
+    let notify_clone = notify.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        notify_clone.notify_one();
+    });
 
-    // We can't strictly control 'pending' in the simplistic FakeServer without modifications,
-    // but we have two calls (one success, one fail).
+    let start = std::time::Instant::now();
+    let err_res = client.get::<Value>("/nothing").await;
+    let _elapsed = start.elapsed();
+    assert!(err_res.is_err(), "Expected an error");
+
     server.shutdown().await;
 
     let spans = layer.spans.lock().map_err(|e| e.to_string())?.clone();
 
-    for (m, r) in [("GET", "/vm"), ("GET", "/nothing")] {
-        let span = spans
-            .iter()
-            .find(|c| has_field(c, "method", m) && has_field(c, "route", r))
-            .ok_or_else(|| format!("no span found for {m} {r}"))?;
+    let span = spans
+        .iter()
+        .find(|c| has_field(c, "method", "GET") && has_field(c, "route", "/nothing"))
+        .ok_or("no span found for GET /nothing")?;
 
-        let dur_field = span
-            .fields
-            .iter()
-            .find(|(k, _)| is_duration_field(k))
-            .ok_or_else(|| format!("no duration field on span {m} {r}"))?;
+    let dur_field = span
+        .fields
+        .iter()
+        .find(|(k, _)| is_duration_field(k))
+        .ok_or("no duration field on span GET /nothing")?;
 
-        let _dur_val: u64 = dur_field
-            .1
-            .parse()
-            .map_err(|e| format!("duration not numeric: {e}"))?;
-        assert_eq!(dur_field.0, "duration_ms");
-    }
+    let dur_val: u64 = dur_field
+        .1
+        .parse()
+        .map_err(|e| format!("duration not numeric: {e}"))?;
+    assert_eq!(dur_field.0, "duration_ms");
+    assert!(dur_val >= 100, "duration {dur_val} is less than 100ms");
 
     Ok(())
 }
@@ -522,15 +526,22 @@ async fn error_deserialize_malformed_json() -> TestResult {
 #[tokio::test]
 async fn invalid_route_yields_request_builder_error() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir)?;
+    let (server, client, sock) = server_and_client(&dir)?;
     let err = client
         .get::<Value>(" bad route ")
         .await
         .err()
         .ok_or("expected error")?;
-    let Error::RequestBuilder { method, route, .. } = &err else {
+    let Error::RequestBuilder {
+        path,
+        method,
+        route,
+        ..
+    } = &err
+    else {
         return Err(format!("expected RequestBuilder, got {err:?}").into());
     };
+    assert_eq!(path, &sock);
     assert_eq!(method, "GET");
     assert_eq!(route, " bad route ");
     server.shutdown().await;
@@ -545,11 +556,11 @@ async fn truncated_body_yields_body_read_error() -> TestResult {
 
     let client = FcClient::new(&sock);
 
-    tokio::spawn(async move {
-        if let Ok((stream, _)) = listener.accept().await {
+    let handle = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        if let Ok((mut stream, _)) = listener.accept().await {
             let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"partial\"";
-            let _ = stream.writable().await;
-            let _ = stream.try_write(resp);
+            assert!(stream.write_all(resp).await.is_ok());
             // stream dropped here to simulate truncation
         }
     });
@@ -559,6 +570,9 @@ async fn truncated_body_yields_body_read_error() -> TestResult {
         .await
         .err()
         .ok_or("expected error")?;
+
+    handle.await?;
+
     let Error::BodyRead {
         path,
         method,
@@ -591,12 +605,35 @@ async fn fake_server_shutdown_does_not_block() -> TestResult {
 async fn fake_server_raii_drops_socket() -> TestResult {
     let dir = tempdir()?;
     let sock = dir.path().join("raii.socket");
-    {
+    let conn = {
         let _server = FakeServer::new(&sock)?;
         assert!(sock.exists());
+        tokio::net::UnixStream::connect(&sock).await?
+    };
+
+    let start = std::time::Instant::now();
+    loop {
+        if !sock.exists() {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_millis(500) {
+            return Err("Socket file was not removed by Drop".into());
+        }
+        tokio::task::yield_now().await;
     }
-    // Give it a short moment for drop to complete its async-like effects (if any, though File removal is sync)
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    assert!(!sock.exists(), "Socket file should be removed by Drop");
+
+    assert!(tokio::net::UnixStream::connect(&sock).await.is_err());
+
+    if true {
+        use tokio::io::AsyncReadExt;
+        let mut stream = conn;
+        let mut buf = [0; 10];
+        let res = stream.read(&mut buf).await;
+        assert!(
+            res.is_err() || res.unwrap_or(1) == 0,
+            "open connection should be closed"
+        );
+    }
+
     Ok(())
 }

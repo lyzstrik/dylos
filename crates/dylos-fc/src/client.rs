@@ -96,6 +96,7 @@ impl FcClient {
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(req_body)
             .map_err(|e| Error::RequestBuilder {
+                path: self.socket_path.clone(),
                 method: method.to_string(),
                 route: route.to_string(),
                 source: e,

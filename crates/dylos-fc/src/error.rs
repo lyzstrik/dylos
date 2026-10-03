@@ -62,8 +62,9 @@ pub enum Error {
         #[source]
         source: hyper::Error,
     },
-    #[error("failed to build request for {method} {route}")]
+    #[error("failed to build request for {method} {route} on {path:?}")]
     RequestBuilder {
+        path: PathBuf,
         method: String,
         route: String,
         #[source]

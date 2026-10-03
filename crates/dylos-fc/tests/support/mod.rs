@@ -31,12 +31,18 @@ pub struct RequestRecord {
 pub struct ReplyConfig {
     pub status: StatusCode,
     pub body: Vec<u8>,
+    pub delay: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl FakeServer {
     pub fn new(socket_path: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
         let socket_path = socket_path.into();
-        let _ = std::fs::remove_file(&socket_path);
+        if let Err(e) = std::fs::remove_file(&socket_path) {
+            #[allow(clippy::collapsible_if)]
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e);
+            }
+        }
 
         let listener = UnixListener::bind(&socket_path)?;
 
@@ -44,6 +50,7 @@ impl FakeServer {
         let reply = Arc::new(Mutex::new(ReplyConfig {
             status: StatusCode::NO_CONTENT,
             body: vec![],
+            delay: None,
         }));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let conn_tasks = Arc::new(Mutex::new(Vec::new()));
@@ -90,9 +97,13 @@ impl FakeServer {
                                             });
                                         }
 
-                                        let mut rc = ReplyConfig { status: StatusCode::NO_CONTENT, body: vec![] };
+                                        let mut rc = ReplyConfig { status: StatusCode::NO_CONTENT, body: vec![], delay: None };
                                         if let Ok(reply_lock) = r.lock() {
                                             rc = reply_lock.clone();
+                                        }
+
+                                        if let Some(delay) = rc.delay {
+                                            delay.notified().await;
                                         }
 
                                         let response_body = Full::new(Bytes::from(rc.body));
@@ -134,6 +145,21 @@ impl FakeServer {
         if let Ok(mut r) = self.reply.lock() {
             r.status = status;
             r.body = body;
+            r.delay = None;
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_reply_with_delay(
+        &self,
+        status: StatusCode,
+        body: Vec<u8>,
+        delay: std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        if let Ok(mut r) = self.reply.lock() {
+            r.status = status;
+            r.body = body;
+            r.delay = Some(delay);
         }
     }
 
@@ -147,16 +173,21 @@ impl FakeServer {
 
     pub async fn shutdown(mut self) {
         let _ = self.shutdown_tx.send(true);
+        if let Some(task) = self.server_task.take() {
+            #[allow(clippy::collapsible_if)]
+            if let Err(e) = task.await {
+                assert!(e.is_cancelled(), "Server task panicked: {e}");
+            }
+        }
         let mut tasks = vec![];
         if let Ok(mut c) = self.conn_tasks.lock() {
             tasks.extend(c.drain(..));
         }
         for task in tasks {
             task.abort();
-            let _ = task.await;
-        }
-        if let Some(task) = self.server_task.take() {
-            let _ = task.await;
+            if let Err(e) = task.await {
+                assert!(e.is_cancelled(), "Connection task panicked: {e}");
+            }
         }
     }
 }
@@ -173,10 +204,10 @@ impl Drop for FakeServer {
             }
         }
         if let Err(e) = std::fs::remove_file(&self.socket_path) {
-            #[allow(clippy::collapsible_if)]
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!("FakeServer drop: failed to remove socket file: {}", e);
-            }
+            assert!(
+                e.kind() == std::io::ErrorKind::NotFound,
+                "FakeServer drop: failed to remove socket file: {e}"
+            );
         }
     }
 }
