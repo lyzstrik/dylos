@@ -12,7 +12,7 @@ type TestResult = Result<(), Box<dyn StdError>>;
 async fn test_client_204_success() -> TestResult {
     let dir = tempdir()?;
     let sock = dir.path().join("api.socket");
-    let server = FakeServer::new(&sock).await?;
+    let server = FakeServer::new(&sock)?;
 
     server.set_reply(hyper::StatusCode::NO_CONTENT, vec![]);
 
@@ -38,7 +38,7 @@ async fn test_client_204_success() -> TestResult {
 async fn test_client_400_fault_message() -> TestResult {
     let dir = tempdir()?;
     let sock = dir.path().join("api.socket");
-    let server = FakeServer::new(&sock).await?;
+    let server = FakeServer::new(&sock)?;
 
     server.set_reply(
         hyper::StatusCode::BAD_REQUEST,
@@ -93,7 +93,7 @@ async fn test_client_missing_socket() -> TestResult {
 async fn test_client_non_json_error_body() -> TestResult {
     let dir = tempdir()?;
     let sock = dir.path().join("api.socket");
-    let server = FakeServer::new(&sock).await?;
+    let server = FakeServer::new(&sock)?;
 
     server.set_reply(
         hyper::StatusCode::INTERNAL_SERVER_ERROR,

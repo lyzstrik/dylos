@@ -18,11 +18,11 @@ use tracing_subscriber::{Layer, Registry};
 
 type TestResult = Result<(), Box<dyn StdError>>;
 
-async fn server_and_client(
+fn server_and_client(
     dir: &tempfile::TempDir,
 ) -> Result<(FakeServer, FcClient, std::path::PathBuf), Box<dyn StdError>> {
     let sock = dir.path().join("api.socket");
-    let server = FakeServer::new(&sock).await?;
+    let server = FakeServer::new(&sock)?;
     let client = FcClient::new(&sock);
     Ok((server, client, sock))
 }
@@ -32,7 +32,7 @@ async fn server_and_client(
 #[tokio::test]
 async fn put_sends_method_path_content_type_and_body() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
     let body = json!({"vcpu_count": 2, "mem_size_mib": 256});
 
     let res: Option<Value> = client.put("/machine-config", &body).await?;
@@ -51,7 +51,7 @@ async fn put_sends_method_path_content_type_and_body() -> TestResult {
 #[tokio::test]
 async fn patch_sends_method_path_content_type_and_body() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
     let body = json!({"state": "Paused"});
 
     let res: Option<Value> = client.patch("/vm", &body).await?;
@@ -70,7 +70,7 @@ async fn patch_sends_method_path_content_type_and_body() -> TestResult {
 #[tokio::test]
 async fn get_sends_method_path_and_no_body() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
     server.set_reply(hyper::StatusCode::OK, br#"{"state":"Running"}"#.to_vec());
 
     let res: Option<Value> = client.get("/vm").await?;
@@ -130,7 +130,7 @@ fn assert_api_error(
 #[tokio::test]
 async fn error_4xx_carries_full_context() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, sock) = server_and_client(&dir).await?;
+    let (server, client, sock) = server_and_client(&dir)?;
     server.set_reply(
         hyper::StatusCode::BAD_REQUEST,
         br#"{"fault_message":"The kernel file cannot be opened"}"#.to_vec(),
@@ -156,7 +156,7 @@ async fn error_4xx_carries_full_context() -> TestResult {
 #[tokio::test]
 async fn error_5xx_carries_full_context() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, sock) = server_and_client(&dir).await?;
+    let (server, client, sock) = server_and_client(&dir)?;
     server.set_reply(
         hyper::StatusCode::INTERNAL_SERVER_ERROR,
         br#"{"fault_message":"internal failure"}"#.to_vec(),
@@ -175,7 +175,7 @@ async fn error_5xx_carries_full_context() -> TestResult {
 #[tokio::test]
 async fn error_on_get_carries_context() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, sock) = server_and_client(&dir).await?;
+    let (server, client, sock) = server_and_client(&dir)?;
     server.set_reply(
         hyper::StatusCode::NOT_FOUND,
         br#"{"fault_message":"not found"}"#.to_vec(),
@@ -194,7 +194,7 @@ async fn error_on_get_carries_context() -> TestResult {
 #[tokio::test]
 async fn non_json_error_body_is_still_useful() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, sock) = server_and_client(&dir).await?;
+    let (server, client, sock) = server_and_client(&dir)?;
     server.set_reply(
         hyper::StatusCode::BAD_GATEWAY,
         b"upstream exploded: <html>".to_vec(),
@@ -213,7 +213,7 @@ async fn non_json_error_body_is_still_useful() -> TestResult {
 #[tokio::test]
 async fn empty_error_body_still_reports_status_and_route() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, sock) = server_and_client(&dir).await?;
+    let (server, client, sock) = server_and_client(&dir)?;
     server.set_reply(hyper::StatusCode::INTERNAL_SERVER_ERROR, vec![]);
 
     let err = client
@@ -338,7 +338,7 @@ async fn each_call_has_a_span_with_method_and_route() -> TestResult {
     let _guard = tracing::subscriber::set_default(Registry::default().with(layer.clone()));
 
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
     server.set_reply(hyper::StatusCode::OK, b"{}".to_vec());
     let _: Option<Value> = client.get("/vm").await?;
     let _: Option<Value> = client.put("/machine-config", &json!({})).await?;
@@ -362,7 +362,7 @@ async fn span_records_duration() -> TestResult {
     let _guard = tracing::subscriber::set_default(Registry::default().with(layer.clone()));
 
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
     server.set_reply(hyper::StatusCode::OK, b"{}".to_vec());
     let _: Option<Value> = client.get("/vm").await?;
     server.shutdown().await;
@@ -393,7 +393,7 @@ struct VmInfo {
 #[tokio::test]
 async fn one_server_handles_sequential_requests_in_order() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
 
     let _: Option<Value> = client.put("/a", &json!({"n": 1})).await?;
     let _: Option<Value> = client.patch("/b", &json!({"n": 2})).await?;
@@ -418,7 +418,7 @@ async fn one_server_handles_sequential_requests_in_order() -> TestResult {
 #[tokio::test]
 async fn scripted_2xx_json_body_is_deserialized() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, _) = server_and_client(&dir).await?;
+    let (server, client, _) = server_and_client(&dir)?;
     server.set_reply(
         hyper::StatusCode::OK,
         br#"{"id":"vm-1","state":"Running"}"#.to_vec(),

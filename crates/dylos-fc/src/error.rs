@@ -30,10 +30,20 @@ pub enum Error {
         status: u16,
         fault_message: String,
     },
-    #[error("failed to serialize request body")]
-    Serialize(#[source] serde_json::Error),
-    #[error("failed to deserialize response body")]
-    Deserialize(#[source] serde_json::Error),
+    #[error("failed to serialize request body for {method} {route}")]
+    Serialize {
+        method: String,
+        route: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to deserialize response body for {method} {route}")]
+    Deserialize {
+        method: String,
+        route: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("failed to read response body")]
     BodyRead(#[source] hyper::Error),
     #[error("failed to build request")]

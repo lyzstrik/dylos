@@ -25,8 +25,27 @@ impl FcClient {
         }
     }
 
-    #[tracing::instrument(skip(self, body), fields(method = %method, route = %route))]
+    #[tracing::instrument(skip(self, body), fields(method = %method, route = %route, duration_ms = tracing::field::Empty))]
     async fn request<B, R>(
+        &self,
+        method: hyper::Method,
+        route: &str,
+        body: Option<&B>,
+    ) -> Result<Option<R>>
+    where
+        B: Serialize + ?Sized,
+        R: for<'de> Deserialize<'de>,
+    {
+        let start = std::time::Instant::now();
+        let res = self.request_inner(method, route, body).await;
+        tracing::Span::current().record(
+            "duration_ms",
+            u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        res
+    }
+
+    async fn request_inner<B, R>(
         &self,
         method: hyper::Method,
         route: &str,
@@ -56,7 +75,11 @@ impl FcClient {
         });
 
         let body_bytes = match body {
-            Some(b) => serde_json::to_vec(b).map_err(Error::Serialize)?,
+            Some(b) => serde_json::to_vec(b).map_err(|e| Error::Serialize {
+                method: method.to_string(),
+                route: route.to_string(),
+                source: e,
+            })?,
             None => vec![],
         };
         let req_body = Full::new(Bytes::from(body_bytes));
@@ -104,7 +127,12 @@ impl FcClient {
         if body_bytes.is_empty() {
             Ok(None)
         } else {
-            let parsed: R = serde_json::from_slice(&body_bytes).map_err(Error::Deserialize)?;
+            let parsed: R =
+                serde_json::from_slice(&body_bytes).map_err(|e| Error::Deserialize {
+                    method: method.to_string(),
+                    route: route.to_string(),
+                    source: e,
+                })?;
             Ok(Some(parsed))
         }
     }

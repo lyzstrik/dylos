@@ -34,9 +34,9 @@ pub struct ReplyConfig {
 }
 
 impl FakeServer {
-    pub async fn new(socket_path: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
+    pub fn new(socket_path: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
         let socket_path = socket_path.into();
-        let _ = tokio::fs::remove_file(&socket_path).await;
+        let _ = std::fs::remove_file(&socket_path);
 
         let listener = UnixListener::bind(&socket_path)?;
 
@@ -144,6 +144,6 @@ impl FakeServer {
         if let Some(task) = self.server_task.take() {
             let _ = task.await;
         }
-        let _ = tokio::fs::remove_file(&self.socket_path).await;
+        let _ = std::fs::remove_file(&self.socket_path);
     }
 }
