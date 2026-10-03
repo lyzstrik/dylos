@@ -22,5 +22,11 @@
 - Chemin : /home/lyzi/dylos
 - Système de fichiers : btrfs, reflink vérifié
 
+## Dev tools
+- just : 1.58.0
+- cargo-nextest : 0.9.146
+- cargo-deny : 0.20.2
+- lefthook : 2.1.16
+
 ## Vérification
 `scripts/host-check.sh` doit passer avant toute session de travail.

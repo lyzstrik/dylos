@@ -15,7 +15,7 @@ clippy:
 # Run all checks (format, clippy, tests, cargo-deny)
 check:
     cargo fmt --check
-    cargo clippy --workspace --all-targets -- -D warnings
+    just clippy
     cargo nextest run --workspace
     cargo deny check
 
