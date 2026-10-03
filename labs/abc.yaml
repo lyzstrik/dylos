@@ -1,0 +1,40 @@
+segments:
+  - name: left
+    cidr: 10.0.1.0/24
+  - name: right
+    cidr: 10.0.2.0/24
+
+nodes:
+  - name: A
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: left
+        ip: 10.0.1.2/24
+    static_routes:
+      - destination: 10.0.2.0/24
+        gateway: 10.0.1.1
+  - name: B
+    image: alpine
+    vcpus: 2
+    memory: 512
+    interfaces:
+      - name: eth0
+        segment: left
+        ip: 10.0.1.1/24
+      - name: eth1
+        segment: right
+        ip: 10.0.2.1/24
+  - name: C
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: right
+        ip: 10.0.2.2/24
+    static_routes:
+      - destination: 10.0.1.0/24
+        gateway: 10.0.2.1
