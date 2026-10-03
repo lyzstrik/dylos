@@ -147,11 +147,14 @@ impl VsockOverride {
 }
 
 /// `OpenAPI` definition: `SnapshotLoadParams::huge_pages`
+///
+/// Note: Setting this to [`HugePagesConfig::HugePages2M`] requires the `Uffd` memory backend per the Firecracker specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HugePagesConfig {
     Snapshot,
     None,
     Transparent,
+    /// Requires the `Uffd` memory backend per the Firecracker specification.
     #[serde(rename = "2M")]
     HugePages2M,
 }
@@ -159,11 +162,12 @@ pub enum HugePagesConfig {
 /// `OpenAPI` definition: `SnapshotLoadParams`
 ///
 /// Deprecated fields `enable_diff_snapshots` and `mem_file_path` are omitted.
+/// Firecracker requires exactly one memory backend parameter on snapshot load;
+/// since deprecated `mem_file_path` is omitted, `mem_backend` is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotLoadParams {
     pub snapshot_path: PathBuf,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mem_backend: Option<MemoryBackend>,
+    pub mem_backend: MemoryBackend,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_vm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,6 +178,7 @@ pub struct SnapshotLoadParams {
     pub vsock_override: Option<VsockOverride>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock_realtime: Option<bool>,
+    /// Note: [`HugePagesConfig::HugePages2M`] requires the `Uffd` memory backend per the Firecracker specification.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub huge_pages: Option<HugePagesConfig>,
 }
@@ -183,7 +188,7 @@ impl SnapshotLoadParams {
     pub fn new(snapshot_path: impl Into<PathBuf>, mem_backend: MemoryBackend) -> Self {
         Self {
             snapshot_path: snapshot_path.into(),
-            mem_backend: Some(mem_backend),
+            mem_backend,
             resume_vm: None,
             network_overrides: None,
             track_dirty_pages: None,
@@ -243,6 +248,9 @@ mod tests {
                 "sync_snapshot_files": true
             })
         );
+        let deserialized_full: SnapshotCreateParams =
+            serde_json::from_str(&serde_json::to_string(&full)?)?;
+        assert_eq!(deserialized_full, full);
 
         let diff = SnapshotCreateParams {
             mem_file_path: PathBuf::from("/diff_mem"),
@@ -259,6 +267,9 @@ mod tests {
                 "sync_snapshot_files": false
             })
         );
+        let deserialized_diff: SnapshotCreateParams =
+            serde_json::from_str(&serde_json::to_string(&diff)?)?;
+        assert_eq!(deserialized_diff, diff);
 
         let minimal = SnapshotCreateParams::new("/snap", "/mem");
         let val = serde_json::to_value(&minimal)?;
@@ -268,6 +279,19 @@ mod tests {
         );
         assert!(val.get("snapshot_type").is_none());
         assert!(val.get("sync_snapshot_files").is_none());
+        let deserialized_minimal: SnapshotCreateParams =
+            serde_json::from_str(&serde_json::to_string(&minimal)?)?;
+        assert_eq!(deserialized_minimal, minimal);
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_create_params_roundtrip() -> Result<(), serde_json::Error> {
+        let params = SnapshotCreateParams::full("/var/lib/dylos/snap", "/var/lib/dylos/mem")
+            .with_sync_snapshot_files(true);
+        let serialized = serde_json::to_string(&params)?;
+        let deserialized: SnapshotCreateParams = serde_json::from_str(&serialized)?;
+        assert_eq!(deserialized, params);
         Ok(())
     }
 
@@ -301,19 +325,15 @@ mod tests {
 
     #[test]
     fn test_snapshot_load_params_serialization() -> Result<(), serde_json::Error> {
-        let minimal = SnapshotLoadParams {
-            snapshot_path: PathBuf::from("/snap"),
-            mem_backend: None,
-            resume_vm: None,
-            network_overrides: None,
-            track_dirty_pages: None,
-            vsock_override: None,
-            clock_realtime: None,
-            huge_pages: None,
-        };
+        let minimal = SnapshotLoadParams::with_file_backend("/snap", "/mem");
         let val = serde_json::to_value(&minimal)?;
-        assert_eq!(val, json!({ "snapshot_path": "/snap" }));
-        assert!(val.get("mem_backend").is_none());
+        assert_eq!(
+            val,
+            json!({
+                "snapshot_path": "/snap",
+                "mem_backend": { "backend_path": "/mem", "backend_type": "File" }
+            })
+        );
         assert!(val.get("resume_vm").is_none());
         assert!(val.get("network_overrides").is_none());
         assert!(val.get("track_dirty_pages").is_none());
@@ -322,6 +342,10 @@ mod tests {
         assert!(val.get("huge_pages").is_none());
         assert!(val.get("mem_file_path").is_none());
         assert!(val.get("enable_diff_snapshots").is_none());
+
+        let deserialized_minimal: SnapshotLoadParams =
+            serde_json::from_str(&serde_json::to_string(&minimal)?)?;
+        assert_eq!(deserialized_minimal, minimal);
 
         let loaded = SnapshotLoadParams::with_file_backend("/snap", "/mem")
             .with_resume_vm(true)
@@ -335,10 +359,13 @@ mod tests {
                 "network_overrides": [{ "host_dev_name": "tap0", "iface_id": "eth0" }]
             })
         );
+        let deserialized_loaded: SnapshotLoadParams =
+            serde_json::from_str(&serde_json::to_string(&loaded)?)?;
+        assert_eq!(deserialized_loaded, loaded);
 
         let full = SnapshotLoadParams {
             snapshot_path: PathBuf::from("/snap"),
-            mem_backend: Some(MemoryBackend::uffd("/sock")),
+            mem_backend: MemoryBackend::uffd("/sock"),
             resume_vm: Some(false),
             network_overrides: Some(vec![
                 NetworkOverride::new("eth0", "tap0"),
@@ -365,6 +392,30 @@ mod tests {
                 "huge_pages": "2M"
             })
         );
+        let deserialized_full: SnapshotLoadParams =
+            serde_json::from_str(&serde_json::to_string(&full)?)?;
+        assert_eq!(deserialized_full, full);
+        Ok(())
+    }
+
+    #[test]
+    fn test_snapshot_load_params_roundtrip() -> Result<(), serde_json::Error> {
+        let params = SnapshotLoadParams {
+            snapshot_path: PathBuf::from("/snap"),
+            mem_backend: MemoryBackend::uffd("/sock"),
+            resume_vm: Some(false),
+            network_overrides: Some(vec![
+                NetworkOverride::new("eth0", "tap0"),
+                NetworkOverride::new("eth1", "tap1"),
+            ]),
+            track_dirty_pages: Some(true),
+            vsock_override: Some(VsockOverride::new("/vsock.sock")),
+            clock_realtime: Some(true),
+            huge_pages: Some(HugePagesConfig::HugePages2M),
+        };
+        let serialized = serde_json::to_string(&params)?;
+        let deserialized: SnapshotLoadParams = serde_json::from_str(&serialized)?;
+        assert_eq!(deserialized, params);
         Ok(())
     }
 }
