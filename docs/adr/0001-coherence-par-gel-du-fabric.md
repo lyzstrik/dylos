@@ -21,11 +21,19 @@ This decision is needed now because it fixes the order of the snapshot and resto
 
 A distributed snapshot is a set of local states, one per process, plus the state of the channels between them.
 It is consistent if no message is recorded as received without being recorded as sent (Chandy and Lamport, 1985).
-Messages sent but not yet received are allowed: they are in transit. The classic algorithm records them, so they can be replayed on restore.
+Messages sent but not yet received are allowed: they are in transit. Chandy-Lamport assumes reliable channels, so the classic algorithm records them as channel state and replays them on restore.
+
+In this ADR, a frame is *sent* by a VM once it has left that VM's captured state (guest memory and virtio device state), and *received* once it is part of the receiver's captured state.
+Being forwarded by the bridge or counted by a TAP is neither: it is the channel.
 
 ## Decision
 
-We obtain a consistent cut by freezing the fabric before pausing any VM, and we drop the frames in transit instead of recording them.
+We obtain a consistent cut by freezing the fabric before pausing any VM, and we drop the frames in transit instead of recording them: the channel state of every snapshot is empty.
+
+The freeze contract has two parts, both required:
+
+- **No delivery:** while frozen, no frame enters the captured state of any VM of the lab.
+- **Discard, not retain:** frames already queued on the host side when the freeze starts, and frames emitted by VMs while it lasts, are dropped. None of them may be delivered after the thaw, on the original lab or on a restored clone.
 
 Lab snapshot sequence (each step completes for all VMs before the next starts; steps on several VMs run in parallel):
 
@@ -44,33 +52,44 @@ Let T be the instant at which step 1 has completed on every interface. Every VM 
 
 Take any frame m recorded as received in some VM's snapshot:
 
-1. m was delivered to that VM before T, because the frozen fabric delivers nothing after T.
+1. m entered that VM's state before T, because of the no-delivery part of the freeze contract.
 2. So m was sent before T.
 3. The sender is captured after T, and a VM's state only moves forward, so the sender's snapshot includes having sent m.
 
 No snapshot can therefore contain a reception without the matching emission. This holds whatever the skew between pauses and snapshots, which is exactly the quantity we cannot control.
 
-The freeze does not need to be atomic across interfaces: the argument only needs every delivery to stop before the first VM is paused.
+The proof is conditional on the no-delivery premise, and that premise is about the VM's captured state, not about host interfaces.
+A frame queued at a TAP before T could still be read into guest memory after T without any further TAP counter change, and Firecracker v1.17.0 completes deferred RX work when it prepares a snapshot (`Net::prepare_save`).
+Frozen host-side counters alone therefore do not prove the premise: LYZ-19 must also observe the receive side inside the guest (virtio and guest interface counters) across the freeze.
+
+The freeze does not need to be atomic across interfaces: the argument only needs every delivery to stop before the first VM is paused. A per-TAP freeze is not a counterexample, since every capture happens after the last interface is frozen.
 
 ### Why dropping frames in transit is acceptable
 
 Frames sent before T but not delivered, and frames sent between T and the pause of their sender, are never delivered: they are lost.
-Ethernet makes no delivery guarantee, so every protocol running on it already tolerates loss: TCP retransmits, and UDP-based protocols accept loss by contract.
-To the guests, a snapshot looks like a short burst of packet loss on the lab network, which is a normal network event, not an impossible state.
-This replaces channel recording and replay with nothing, which is what keeps the snapshot fast and the code small.
+Ethernet makes no delivery guarantee, so the restored lab is in a state a real lab could reach: one where the network lost a short burst of frames.
+This is a claim about the network, not a promise that every application behaves as if nothing happened:
+
+- TCP recovers by retransmission, as long as the connection stays within its retransmission and user-timeout budget.
+- A protocol without its own recovery (a one-shot UDP request or notification) loses that message for good, exactly as it would on a real network.
+
+Dylos therefore supports workloads that tolerate packet loss, which is what any workload on a real network must already do. Workloads that cannot recover from a lost datagram are out of scope.
+For the supported workloads, dropping the in-transit frames costs nothing, and it keeps the snapshot fast and the code small.
 
 ## Consequences
 
-- The snapshot and restore sequences above are fixed. Reordering them (for example pausing before the freeze completes, or thawing before every VM has resumed) breaks the guarantee. AGENTS.md already forbids reordering them.
-- Correctness depends on one property of the host, not on Firecracker internals: after the freeze, no frame reaches another VM of the lab. This must be tested (see below).
+- The snapshot and restore sequences above are fixed, and AGENTS.md forbids reordering them. Pausing a VM before the freeze has completed on every interface breaks the guarantee.
+- Thawing only after every VM has resumed is a chosen invariant, not a consistency requirement: once all snapshots exist, delivering a frame to a still-paused VM is only delay. We keep it because it gives one simple rule for readiness on both the original lab and the clones.
+- Correctness depends on the freeze contract (no delivery, discard), not on the pause skew. Both parts must be tested (see below).
 - Long-lived TCP connections must survive a snapshot and a restore through retransmission. This is measured in LYZ-27.
 - The freeze duration adds to the lab's network downtime. It must stay well under the snapshot budget of 1 s for 5 VMs.
 
 ## What this does not cover
 
 - Frames already inside a VM (guest kernel queues, virtio rings) at the freeze: they are part of that VM's state and are captured with it, not lost. On restore, frames still queued for sending are transmitted into a frozen fabric and dropped, or after the thaw delivered late. Both are loss or delay, which Ethernet allows.
-- Host-side queues (TAP queue, bridge, Firecracker device buffers) must not deliver anything after the freeze. This is an assumption to verify by test under heavy traffic, with interface counters frozen during the freeze: LYZ-19.
-- Whether a paused Firecracker VM still receives frames into guest memory is not relied on, but should be observed in the same test, since it changes how much is lost.
+- Host-side queues (TAP queue, bridge, Firecracker device buffers) must neither deliver anything during the freeze nor keep frames for after the thaw. This is an assumption to verify by test under heavy traffic in LYZ-19, observing both host interface counters and the receive side inside the guests.
+- Whether a paused Firecracker VM still moves frames into guest memory is not relied on. It must be observed in the same test, because a delivery into a paused VM after T would violate the premise of the proof, not only change how much is lost.
+- Workloads that cannot recover from packet loss (see above).
 - Disk consistency: pausing stops the vCPUs, but host-side writes may still be in flight before the reflink. Handled in LYZ-22 (fsync, continuous-write test).
 - Guest clock, entropy and identical identities across clones: separate decisions (LYZ-25, LYZ-26 / ADR-0002).
 - Applications whose timeouts are shorter than the freeze window may see the loss as a failure. Not addressed by the spike.
@@ -80,7 +99,7 @@ This replaces channel recording and replay with nothing, which is what keeps the
 ## Alternatives considered
 
 - **Pause the VMs without freezing the fabric.** Simplest, but correctness would depend on the pause skew and on how Firecracker's device emulation and the host queues behave while some VMs are captured and others are not. We cannot prove it consistent, and a rare inconsistency would be very hard to detect.
-- **Chandy-Lamport with recorded channels.** Record the frames in transit on every link and replay them on restore. It needs a recording point per link, marker handling and an exact replay on restore. It is much more code on the critical path, and buys nothing, since losing those frames is allowed.
+- **Chandy-Lamport with recorded channels.** Record the frames in transit on every link and replay them on restore. It needs a recording point per link, marker handling and an exact replay on restore. It is much more code on the critical path. It would only help workloads that cannot tolerate packet loss, which are out of scope.
 - **Record frames at the host and re-inject them on restore** (a capture buffer on the bridge). Same cost as above, plus ordering and timing questions on replay. Rejected for the same reason.
 - **Guest cooperation** (an in-guest agent that quiesces the network or the applications before the snapshot). It requires changing the guests, which contradicts the spike's no-go criterion: the approach must work on unmodified, real operating systems.
 - **Make the pauses simultaneous.** Not available: each VM is a separate Firecracker process, and a smaller skew would still not be zero. The freeze makes the skew irrelevant instead of trying to remove it.
@@ -89,4 +108,5 @@ This replaces channel recording and replay with nothing, which is what keeps the
 
 - K. M. Chandy and L. Lamport, "Distributed Snapshots: Determining Global States of Distributed Systems", ACM TOCS, 1985.
 - Firecracker v1.17.0 snapshot API: `PATCH /vm`, `PUT /snapshot/create`, `PUT /snapshot/load`.
+- Firecracker v1.17.0 network device, `Net::prepare_save`: [src/vmm/src/devices/virtio/net/device.rs](https://github.com/firecracker-microvm/firecracker/blob/v1.17.0/src/vmm/src/devices/virtio/net/device.rs).
 - Dylos design doc, sections "Le problème de cohérence" and "Séquences : snapshot, restauration, fork".
