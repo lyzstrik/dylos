@@ -1,0 +1,12 @@
+[package]
+name = "dylos-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dylos"
+path = "src/main.rs"
+
+[lints]
+workspace = true
