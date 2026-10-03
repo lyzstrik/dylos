@@ -140,10 +140,12 @@ mod manual_tests {
     #![allow(clippy::unwrap_used)]
     #![allow(clippy::expect_used)]
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_abc_yaml() {
-        let yaml = std::fs::read_to_string("../../labs/abc.yaml").unwrap();
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../labs/abc.yaml");
+        let yaml = std::fs::read_to_string(&path).unwrap();
         let spec = LabSpec::from_yaml_str(&yaml).expect("should parse and validate abc.yaml");
         assert_eq!(spec.nodes.len(), 3);
         assert_eq!(spec.segments.len(), 2);
