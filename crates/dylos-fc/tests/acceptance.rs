@@ -93,7 +93,8 @@ fn assert_api_error(
     method: &str,
     route: &str,
     status: u16,
-    fault: &str,
+    exact_fault: Option<&str>,
+    fallback_contains: Option<&str>,
 ) -> TestResult {
     let Error::Api {
         path,
@@ -109,20 +110,33 @@ fn assert_api_error(
     assert_eq!(m, method);
     assert_eq!(r, route);
     assert_eq!(*s, status);
-    assert!(
-        fault_message.contains(fault),
-        "fault_message: {fault_message}"
-    );
+
+    if let Some(f) = exact_fault {
+        assert_eq!(fault_message, f, "exact fault_message mismatch");
+    }
+    if let Some(f) = fallback_contains {
+        assert!(
+            fault_message.contains(f),
+            "fault_message: {fault_message} did not contain {f}"
+        );
+    }
 
     let shown = err.to_string();
-    for needle in [
-        sock.to_string_lossy().as_ref(),
-        method,
-        route,
-        &status.to_string(),
-        fault,
-    ] {
-        assert!(shown.contains(needle), "{needle:?} missing from {shown:?}");
+    let mut needles = vec![
+        sock.to_string_lossy().into_owned(),
+        method.to_string(),
+        route.to_string(),
+        status.to_string(),
+    ];
+    if let Some(f) = exact_fault {
+        needles.push(f.to_string());
+    }
+    if let Some(f) = fallback_contains {
+        needles.push(f.to_string());
+    }
+
+    for needle in needles {
+        assert!(shown.contains(&needle), "{needle:?} missing from {shown:?}");
     }
     Ok(())
 }
@@ -147,7 +161,8 @@ async fn error_4xx_carries_full_context() -> TestResult {
         "PUT",
         "/boot-source",
         400,
-        "The kernel file cannot be opened",
+        Some("The kernel file cannot be opened"),
+        None,
     )?;
     server.shutdown().await;
     Ok(())
@@ -167,7 +182,15 @@ async fn error_5xx_carries_full_context() -> TestResult {
         .await
         .err()
         .ok_or("expected error")?;
-    assert_api_error(&err, &sock, "PATCH", "/vm", 500, "internal failure")?;
+    assert_api_error(
+        &err,
+        &sock,
+        "PATCH",
+        "/vm",
+        500,
+        Some("internal failure"),
+        None,
+    )?;
     server.shutdown().await;
     Ok(())
 }
@@ -186,7 +209,7 @@ async fn error_on_get_carries_context() -> TestResult {
         .await
         .err()
         .ok_or("expected error")?;
-    assert_api_error(&err, &sock, "GET", "/nothing", 404, "not found")?;
+    assert_api_error(&err, &sock, "GET", "/nothing", 404, Some("not found"), None)?;
     server.shutdown().await;
     Ok(())
 }
@@ -205,7 +228,15 @@ async fn non_json_error_body_is_still_useful() -> TestResult {
         .await
         .err()
         .ok_or("expected error")?;
-    assert_api_error(&err, &sock, "GET", "/vm", 502, "upstream exploded")?;
+    assert_api_error(
+        &err,
+        &sock,
+        "GET",
+        "/vm",
+        502,
+        None,
+        Some("upstream exploded"),
+    )?;
     server.shutdown().await;
     Ok(())
 }
@@ -363,22 +394,40 @@ async fn span_records_duration() -> TestResult {
 
     let dir = tempdir()?;
     let (server, client, _) = server_and_client(&dir)?;
+
+    // Success call
     server.set_reply(hyper::StatusCode::OK, b"{}".to_vec());
     let _: Option<Value> = client.get("/vm").await?;
+
+    // Failed call
+    server.set_reply(hyper::StatusCode::NOT_FOUND, b"{}".to_vec());
+    let _ = client.get::<Value>("/nothing").await;
+
+    // We can't strictly control 'pending' in the simplistic FakeServer without modifications,
+    // but we have two calls (one success, one fail).
     server.shutdown().await;
 
     let spans = layer.spans.lock().map_err(|e| e.to_string())?.clone();
-    let events = layer.events.lock().map_err(|e| e.to_string())?.clone();
-    let on_span = spans
-        .iter()
-        .any(|c| c.fields.iter().any(|(k, _)| is_duration_field(k)));
-    let on_event = events
-        .iter()
-        .any(|f| f.iter().any(|(k, _)| is_duration_field(k)));
-    assert!(
-        on_span || on_event,
-        "no duration/elapsed/latency field recorded on the span or in an event; spans: {spans:?}"
-    );
+
+    for (m, r) in [("GET", "/vm"), ("GET", "/nothing")] {
+        let span = spans
+            .iter()
+            .find(|c| has_field(c, "method", m) && has_field(c, "route", r))
+            .ok_or_else(|| format!("no span found for {m} {r}"))?;
+
+        let dur_field = span
+            .fields
+            .iter()
+            .find(|(k, _)| is_duration_field(k))
+            .ok_or_else(|| format!("no duration field on span {m} {r}"))?;
+
+        let _dur_val: u64 = dur_field
+            .1
+            .parse()
+            .map_err(|e| format!("duration not numeric: {e}"))?;
+        assert_eq!(dur_field.0, "duration_ms");
+    }
+
     Ok(())
 }
 
@@ -438,5 +487,116 @@ async fn scripted_2xx_json_body_is_deserialized() -> TestResult {
     let none: Option<VmInfo> = client.get("/").await?;
     assert!(none.is_none());
     server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn error_deserialize_malformed_json() -> TestResult {
+    let dir = tempdir()?;
+    let (server, client, sock) = server_and_client(&dir)?;
+    server.set_reply(hyper::StatusCode::OK, b"{malformed}".to_vec());
+
+    let err = client
+        .get::<Value>("/vm")
+        .await
+        .err()
+        .ok_or("expected error")?;
+    let Error::Deserialize {
+        path,
+        method,
+        route,
+        status,
+        ..
+    } = &err
+    else {
+        return Err(format!("expected Deserialize, got {err:?}").into());
+    };
+    assert_eq!(path, &sock);
+    assert_eq!(method, "GET");
+    assert_eq!(route, "/vm");
+    assert_eq!(*status, 200);
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn invalid_route_yields_request_builder_error() -> TestResult {
+    let dir = tempdir()?;
+    let (server, client, _) = server_and_client(&dir)?;
+    let err = client
+        .get::<Value>(" bad route ")
+        .await
+        .err()
+        .ok_or("expected error")?;
+    let Error::RequestBuilder { method, route, .. } = &err else {
+        return Err(format!("expected RequestBuilder, got {err:?}").into());
+    };
+    assert_eq!(method, "GET");
+    assert_eq!(route, " bad route ");
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn truncated_body_yields_body_read_error() -> TestResult {
+    let dir = tempdir()?;
+    let sock = dir.path().join("trunc.socket");
+    let listener = tokio::net::UnixListener::bind(&sock)?;
+
+    let client = FcClient::new(&sock);
+
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{\"partial\"";
+            let _ = stream.writable().await;
+            let _ = stream.try_write(resp);
+            // stream dropped here to simulate truncation
+        }
+    });
+
+    let err = client
+        .get::<Value>("/vm")
+        .await
+        .err()
+        .ok_or("expected error")?;
+    let Error::BodyRead {
+        path,
+        method,
+        route,
+        status,
+        ..
+    } = &err
+    else {
+        return Err(format!("expected BodyRead, got {err:?}").into());
+    };
+    assert_eq!(path, &sock);
+    assert_eq!(method, "GET");
+    assert_eq!(route, "/vm");
+    assert_eq!(*status, 200);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_server_shutdown_does_not_block() -> TestResult {
+    let dir = tempdir()?;
+    let sock = dir.path().join("api.socket");
+    let server = FakeServer::new(&sock)?;
+    tokio::time::timeout(std::time::Duration::from_secs(1), server.shutdown())
+        .await
+        .map_err(|_| "shutdown timed out")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fake_server_raii_drops_socket() -> TestResult {
+    let dir = tempdir()?;
+    let sock = dir.path().join("raii.socket");
+    {
+        let _server = FakeServer::new(&sock)?;
+        assert!(sock.exists());
+    }
+    // Give it a short moment for drop to complete its async-like effects (if any, though File removal is sync)
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(!sock.exists(), "Socket file should be removed by Drop");
     Ok(())
 }

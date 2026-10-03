@@ -7,14 +7,14 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::net::UnixListener;
-use tokio::sync::Notify;
 
 pub struct FakeServer {
     socket_path: PathBuf,
     history: Arc<Mutex<Vec<RequestRecord>>>,
     reply: Arc<Mutex<ReplyConfig>>,
-    shutdown: Arc<Notify>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
     server_task: Option<tokio::task::JoinHandle<()>>,
+    conn_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -45,22 +45,23 @@ impl FakeServer {
             status: StatusCode::NO_CONTENT,
             body: vec![],
         }));
-        let shutdown = Arc::new(Notify::new());
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let conn_tasks = Arc::new(Mutex::new(Vec::new()));
 
         let h_clone = Arc::clone(&history);
         let r_clone = Arc::clone(&reply);
-        let s_clone = Arc::clone(&shutdown);
+        let c_clone = Arc::clone(&conn_tasks);
 
         let server_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    () = s_clone.notified() => break,
+                    _ = shutdown_rx.changed() => break,
                     accept_res = listener.accept() => {
                         if let Ok((stream, _)) = accept_res {
                             let h = Arc::clone(&h_clone);
                             let r = Arc::clone(&r_clone);
 
-                            tokio::spawn(async move {
+                            let conn_task = tokio::spawn(async move {
                                 let io = hyper_util::rt::TokioIo::new(stream);
                                 let svc = service_fn(move |req: Request<Incoming>| {
                                     let h = Arc::clone(&h);
@@ -109,6 +110,10 @@ impl FakeServer {
                                     tracing::debug!("Server connection error: {:?}", err);
                                 }
                             });
+
+                            if let Ok(mut tasks) = c_clone.lock() {
+                                tasks.push(conn_task);
+                            }
                         }
                     }
                 }
@@ -119,8 +124,9 @@ impl FakeServer {
             socket_path,
             history,
             reply,
-            shutdown,
+            shutdown_tx,
             server_task: Some(server_task),
+            conn_tasks,
         })
     }
 
@@ -140,10 +146,37 @@ impl FakeServer {
     }
 
     pub async fn shutdown(mut self) {
-        self.shutdown.notify_waiters();
+        let _ = self.shutdown_tx.send(true);
+        let mut tasks = vec![];
+        if let Ok(mut c) = self.conn_tasks.lock() {
+            tasks.extend(c.drain(..));
+        }
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
         if let Some(task) = self.server_task.take() {
             let _ = task.await;
         }
-        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
+impl Drop for FakeServer {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+        if let Ok(mut tasks) = self.conn_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+        if let Err(e) = std::fs::remove_file(&self.socket_path) {
+            #[allow(clippy::collapsible_if)]
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!("FakeServer drop: failed to remove socket file: {}", e);
+            }
+        }
     }
 }

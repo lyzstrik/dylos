@@ -59,12 +59,16 @@ impl FcClient {
             .await
             .map_err(|e| Error::Connect {
                 path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
                 source: e,
             })?;
 
         let io = TokioIo::new(stream);
         let (mut sender, conn) = http1::handshake(io).await.map_err(|e| Error::Handshake {
             path: self.socket_path.clone(),
+            method: method.to_string(),
+            route: route.to_string(),
             source: e,
         })?;
 
@@ -76,6 +80,7 @@ impl FcClient {
 
         let body_bytes = match body {
             Some(b) => serde_json::to_vec(b).map_err(|e| Error::Serialize {
+                path: self.socket_path.clone(),
                 method: method.to_string(),
                 route: route.to_string(),
                 source: e,
@@ -90,7 +95,11 @@ impl FcClient {
             .header(hyper::header::ACCEPT, "application/json")
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(req_body)
-            .map_err(Error::RequestBuilder)?;
+            .map_err(|e| Error::RequestBuilder {
+                method: method.to_string(),
+                route: route.to_string(),
+                source: e,
+            })?;
 
         let res = sender.send_request(req).await.map_err(|e| Error::Request {
             path: self.socket_path.clone(),
@@ -104,7 +113,13 @@ impl FcClient {
             .into_body()
             .collect()
             .await
-            .map_err(Error::BodyRead)?
+            .map_err(|e| Error::BodyRead {
+                path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
+                status: status.as_u16(),
+                source: e,
+            })?
             .to_bytes();
 
         if !status.is_success() {
@@ -129,8 +144,10 @@ impl FcClient {
         } else {
             let parsed: R =
                 serde_json::from_slice(&body_bytes).map_err(|e| Error::Deserialize {
+                    path: self.socket_path.clone(),
                     method: method.to_string(),
                     route: route.to_string(),
+                    status: status.as_u16(),
                     source: e,
                 })?;
             Ok(Some(parsed))
