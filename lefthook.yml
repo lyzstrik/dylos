@@ -1,0 +1,8 @@
+pre-commit:
+  piped: true
+  commands:
+    fmt:
+      run: just fmt
+      stage_fixed: true
+    clippy:
+      run: just clippy
