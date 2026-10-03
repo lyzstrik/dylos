@@ -21,6 +21,9 @@ pub struct FakeServer {
 pub struct RequestRecord {
     pub method: String,
     pub path: String,
+    // Not every test binary sharing this module reads it.
+    #[allow(dead_code)]
+    pub content_type: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -65,6 +68,11 @@ impl FakeServer {
                                     async move {
                                         let method = req.method().to_string();
                                         let path = req.uri().path().to_string();
+                                        let content_type = req
+                                            .headers()
+                                            .get(hyper::header::CONTENT_TYPE)
+                                            .and_then(|v| v.to_str().ok())
+                                            .map(str::to_string);
 
                                         // Handle reading the body without unwrap
                                         let request_body = match req.into_body().collect().await {
@@ -76,6 +84,7 @@ impl FakeServer {
                                             hist.push(RequestRecord {
                                                 method,
                                                 path,
+                                                content_type,
                                                 body: request_body,
                                             });
                                         }
