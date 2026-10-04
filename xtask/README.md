@@ -29,6 +29,7 @@ follow-up.
 Measured on the development host on 2026-10-04 using rootless Podman 6.1.3:
 
 - Rootfs image size: 134,217,728 bytes (128 MiB).
-- First and second build time: 56.4 s and 3.6 s.
-- First and second SHA-256: `b7260811f0d7dbd8971f2cca8c4fc664a215ef9b03d3519559cb19e4b5156089`;
-  both runs matched.
+- Build time: 56.4 s for a cold build, 3.6 s when Podman reuses its layer cache.
+- SHA-256: `b7260811f0d7dbd8971f2cca8c4fc664a215ef9b03d3519559cb19e4b5156089`.
+  A cached rebuild does not prove reproducibility, so an independent build was also run with
+  `podman build --no-cache` (42 s): it produced the same SHA-256.
