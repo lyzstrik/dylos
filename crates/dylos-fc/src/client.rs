@@ -172,9 +172,12 @@ impl FcClient {
         }
     }
 
-    /// Sends a GET request to the specified route.
+    /// `route` starts with `/` (for example `/machine-config`). Returns `Ok(None)` when Firecracker
+    /// answers with an empty body, which is the usual `204 No Content` reply to PUT and PATCH.
+    ///
     /// # Errors
-    /// Returns an error if the request fails, if serialization fails, or if the API returns an error status.
+    ///
+    /// Any [`Error`] variant; a non-2xx status gives [`Error::Api`] with Firecracker's `fault_message`.
     pub async fn get<R>(&self, route: &str) -> Result<Option<R>>
     where
         R: for<'de> Deserialize<'de>,
@@ -182,9 +185,11 @@ impl FcClient {
         self.request::<(), R>(hyper::Method::GET, route, None).await
     }
 
-    /// Sends a PUT request to the specified route with the given body.
+    /// Same contract as [`FcClient::get`], with `body` sent as JSON.
+    ///
     /// # Errors
-    /// Returns an error if the request fails, if serialization fails, or if the API returns an error status.
+    ///
+    /// As for [`FcClient::get`].
     pub async fn put<B, R>(&self, route: &str, body: &B) -> Result<Option<R>>
     where
         B: Serialize + ?Sized,
@@ -193,44 +198,16 @@ impl FcClient {
         self.request(hyper::Method::PUT, route, Some(body)).await
     }
 
-    /// Sends a PATCH request to the specified route with the given body.
+    /// Same contract as [`FcClient::get`], with `body` sent as JSON.
+    ///
     /// # Errors
-    /// Returns an error if the request fails, if serialization fails, or if the API returns an error status.
+    ///
+    /// As for [`FcClient::get`].
     pub async fn patch<B, R>(&self, route: &str, body: &B) -> Result<Option<R>>
     where
         B: Serialize + ?Sized,
         R: for<'de> Deserialize<'de>,
     {
         self.request(hyper::Method::PATCH, route, Some(body)).await
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_request_uri_valid() -> std::result::Result<(), String> {
-        let uri = request_uri("/machine-config").map_err(|e| e.to_string())?;
-        assert_eq!(uri.to_string(), "http://localhost/machine-config");
-        Ok(())
-    }
-
-    #[test]
-    fn test_request_uri_missing_slash() -> std::result::Result<(), String> {
-        let err = request_uri("machine-config")
-            .err()
-            .ok_or("expected error")?;
-        assert!(matches!(err, Error::InvalidRoute { .. }));
-        Ok(())
-    }
-
-    #[test]
-    fn test_request_uri_invalid_chars() -> std::result::Result<(), String> {
-        let err = request_uri("/machine config")
-            .err()
-            .ok_or("expected error")?;
-        assert!(matches!(err, Error::InvalidUri { .. }));
-        Ok(())
     }
 }

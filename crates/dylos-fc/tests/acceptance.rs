@@ -585,6 +585,24 @@ async fn invalid_route_yields_invalid_route_error() -> TestResult {
     Ok(())
 }
 
+/// A route that starts with `/` but is not a valid URI path is rejected before anything is sent.
+#[tokio::test]
+async fn unparsable_route_yields_invalid_uri_error() -> TestResult {
+    let dir = tempdir()?;
+    let (server, client, _sock) = server_and_client(&dir)?;
+    let err = client
+        .get::<Value>("/machine config")
+        .await
+        .err()
+        .ok_or("expected error")?;
+    let Error::InvalidUri { route, .. } = &err else {
+        return Err(format!("expected InvalidUri, got {err:?}").into());
+    };
+    assert_eq!(route, "/machine config");
+    server.shutdown().await;
+    Ok(())
+}
+
 /// Tests that a truncated response body yields a body read error.
 /// Catches bugs where the client hangs indefinitely waiting for a dropped connection.
 #[tokio::test]
