@@ -26,6 +26,7 @@ unimplemented = "deny"
 undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
+anyhow = "1.0.100"
 ipnet = "2.9"
 proptest = "1.4"
 serde = { version = "1.0", features = ["derive"] }
