@@ -1,0 +1,38 @@
+# Valid two-segment, dual-stack fixture used as the base of the acceptance tests.
+# Tests derive invalid variants from it by replacing exact substrings, so keep
+# this file stable: changing a line may break tests that edit that line.
+segments:
+  - name: left
+    ipv6: fd64:796c:6f73:1::/64
+    ipv4: 10.0.1.0/24
+  - name: right
+    ipv6: fd64:796c:6f73:2::/64
+    ipv4: 10.0.2.0/24
+nodes:
+  - name: a
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: left
+        ipv6: fd64:796c:6f73:1::2/64
+        ipv4: 10.0.1.2/24
+    static_routes:
+      - destination: fd64:796c:6f73:2::/64
+        gateway: fd64:796c:6f73:1::1
+      - destination: 10.0.2.0/24
+        gateway: 10.0.1.1
+  - name: b
+    image: alpine
+    vcpus: 2
+    memory: 512
+    interfaces:
+      - name: eth0
+        segment: left
+        ipv6: fd64:796c:6f73:1::1/64
+        ipv4: 10.0.1.1/24
+      - name: eth1
+        segment: right
+        ipv6: fd64:796c:6f73:2::1/64
+        ipv4: 10.0.2.1/24
