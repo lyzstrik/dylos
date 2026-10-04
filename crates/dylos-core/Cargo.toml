@@ -6,3 +6,12 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+ipnet = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde-saphyr = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
