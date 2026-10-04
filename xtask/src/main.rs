@@ -10,6 +10,7 @@ const ALPINE_IMAGE: &str = "docker.io/library/alpine@sha256:1f3591b8a02ea153f41c
 const KERNEL_PATH: &str = "kernels/vmlinux.bin";
 const KERNEL_SHA256: &str = "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447";
 const ROOTFS_SIZE: &str = "128M";
+const ROOTFS_TEMP: &str = "rootfs.ext4.tmp";
 const SOURCE_DATE_EPOCH: &str = "1700000000";
 
 fn main() {
@@ -42,9 +43,11 @@ fn run() -> anyhow::Result<()> {
 }
 
 fn build_images() -> anyhow::Result<()> {
-    verify_kernel(Path::new(KERNEL_PATH))?;
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .context("cannot determine the workspace directory from CARGO_MANIFEST_DIR")?;
+    verify_kernel(&workspace.join(KERNEL_PATH))?;
 
-    let workspace = env::current_dir().context("cannot determine the workspace directory")?;
     let output_dir = workspace.join("target/images");
     std::fs::create_dir_all(&output_dir).with_context(|| {
         format!(
@@ -59,7 +62,36 @@ fn build_images() -> anyhow::Result<()> {
         )
     })?;
 
+    let temporary = output_dir.join(ROOTFS_TEMP);
+    let output = output_dir.join("rootfs.ext4");
+    remove_temporary(&temporary)?;
+
     let started = Instant::now();
+    let build_result = build_rootfs(&output_dir, &temporary, &output);
+    let (size, digest) = match build_result {
+        Ok(result) => result,
+        Err(error) => {
+            return match remove_temporary(&temporary) {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(error.context(format!(
+                    "also failed to remove temporary image: {cleanup_error:#}"
+                ))),
+            };
+        }
+    };
+    eprintln!(
+        "built {} ({size} bytes, SHA-256 {digest}) in {:.1}s",
+        output.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+fn build_rootfs(
+    output_dir: &Path,
+    temporary: &Path,
+    output: &Path,
+) -> anyhow::Result<(u64, String)> {
     let status = Command::new("podman")
         .args(["run", "--rm", "--pull=missing", "--platform", "linux/amd64"])
         .arg("--volume")
@@ -76,17 +108,28 @@ fn build_images() -> anyhow::Result<()> {
         bail!("podman failed to build the Alpine rootfs (exit status {status})");
     }
 
-    let output = output_dir.join("rootfs.ext4");
-    let size = std::fs::metadata(&output)
-        .with_context(|| format!("podman did not create {}", output.display()))?
+    let size = std::fs::metadata(temporary)
+        .with_context(|| format!("podman did not create {}", temporary.display()))?
         .len();
-    let digest = sha256(&output)?;
-    eprintln!(
-        "built {} ({size} bytes, SHA-256 {digest}) in {:.1}s",
-        output.display(),
-        started.elapsed().as_secs_f64()
-    );
-    Ok(())
+    let digest = sha256(temporary)?;
+    std::fs::rename(temporary, output).with_context(|| {
+        format!(
+            "cannot rename temporary image {} to {}",
+            temporary.display(),
+            output.display()
+        )
+    })?;
+    Ok((size, digest))
+}
+
+fn remove_temporary(path: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("cannot remove temporary image {}", path.display()))
+        }
+    }
 }
 
 fn verify_kernel(path: &Path) -> anyhow::Result<()> {
@@ -144,5 +187,5 @@ find /rootfs -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 E2FSPROGS_FAKE_TIME="$SOURCE_DATE_EPOCH" mkfs.ext4 -F -q -d /rootfs \
     -U 01234567-89ab-cdef-0123-456789abcdef \
     -E hash_seed=01234567-89ab-cdef-0123-456789abcdef,lazy_itable_init=0,lazy_journal_init=0 \
-    /out/rootfs.ext4 "$ROOTFS_SIZE"
+    /out/rootfs.ext4.tmp "$ROOTFS_SIZE"
 "#;

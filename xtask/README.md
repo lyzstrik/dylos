@@ -1,9 +1,10 @@
 # Guest images
 
-Run `cargo xtask images` from the workspace root. It verifies the local guest kernel
-before invoking rootless Podman; it never downloads the kernel. Install the 6.18.51
-kernel listed in `docs/host.md` at `kernels/vmlinux.bin` first. The command creates
-`target/images/rootfs.ext4` and leaves all generated image files under ignored
+Run `just images` (or `cargo xtask images`) from any directory in the workspace. It
+verifies the local guest kernel before invoking rootless Podman; it never downloads the
+kernel. Install the 6.18.51 kernel listed in `docs/host.md` at `kernels/vmlinux.bin`
+first. The command builds a temporary image under `target/images` and renames it to
+`rootfs.ext4` only after a successful build; generated image files remain under ignored
 `target/`.
 
 The root filesystem is installed from Alpine 3.23.6, pinned to the amd64 OCI image
@@ -18,11 +19,14 @@ install log contains its execution time, so the build clears that transient log 
 creating the filesystem. Two consecutive local builds produced the same hash. The
 pinned container image does not pin APK repository contents: `apk add` resolves the
 current package versions each run, so repository updates can still change the rootfs.
+Pinning APK package versions or using a vendored APK cache is a follow-up.
 
 ## Local build record
 
 Measured on the development host on 2026-10-03 using rootless Podman 6.1.3:
 
 - Rootfs image size: 134,217,728 bytes (128 MiB).
-- First and second build time: 43.4 s and 36.5 s.
-- SHA-256 for both builds: `3edc412fa85ed4da84fbfba3ba91f45cfc56a420f64f7d51351a4e433a5fc25a`.
+- First and second build time: 43.4 s and 36.5 s; latest build: 48.6 s.
+- First and second SHA-256: `3edc412fa85ed4da84fbfba3ba91f45cfc56a420f64f7d51351a4e433a5fc25a`.
+- Latest SHA-256: `b7260811f0d7dbd8971f2cca8c4fc664a215ef9b03d3519559cb19e4b5156089`;
+  it differs because APK repository package contents changed.
