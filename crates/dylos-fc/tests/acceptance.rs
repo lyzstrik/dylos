@@ -1,5 +1,20 @@
-//! Acceptance tests for the Firecracker transport (LYZ-30), derived from the
-//! issue criteria rather than from the implementation.
+//! Acceptance tests for the Firecracker transport (LYZ-30).
+//!
+//! These tests were written by a different model family than the
+//! implementation, from the acceptance criteria of the issue rather than from
+//! the code. They treat `FcClient` as a black box: every test talks to it
+//! through its public API and observes what reaches a fake Firecracker server
+//! listening on a Unix socket in a temporary directory (`tests/support`).
+//!
+//! Criteria covered, in file order:
+//! 1. PUT, PATCH and GET send the right method, path, `Content-Type` and body.
+//! 2. Every error keeps its context: socket path, method, route, HTTP status
+//!    and the `fault_message` returned by Firecracker.
+//! 3. Each call opens a `tracing` span with its method, route and duration.
+//! 4. The fake server is reusable, shuts down without blocking and cleans up
+//!    its socket and connections.
+//!
+//! No test needs KVM or a real Firecracker binary.
 
 mod support;
 

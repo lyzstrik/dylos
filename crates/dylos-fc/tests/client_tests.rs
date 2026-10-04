@@ -1,5 +1,9 @@
-//! Implementer unit-level tests of the transport.
-//! These tests verify the low-level HTTP client behavior directly against a mock server.
+//! Implementer tests of the Firecracker transport (LYZ-30).
+//!
+//! Written together with the implementation, they check the basic contract of
+//! `FcClient` against the fake server in `tests/support`: a `204` success, a
+//! Firecracker error with its `fault_message`, a missing socket and a non-JSON
+//! error body. The broader, criteria-driven suite lives in `acceptance.rs`.
 
 mod support;
 
