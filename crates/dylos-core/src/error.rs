@@ -22,6 +22,16 @@ pub enum Error {
         cidr: IpNet,
     },
 
+    #[error(
+        "{path}: interface prefix /{prefix_len} is wider than segment {segment:?} prefix /{segment_prefix_len}"
+    )]
+    PrefixWiderThanSegment {
+        path: String,
+        prefix_len: u8,
+        segment: String,
+        segment_prefix_len: u8,
+    },
+
     #[error("{path}: interface has ipv4 but segment {segment:?} does not (or vice versa)")]
     Ipv4Mismatch { path: String, segment: String },
 

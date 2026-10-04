@@ -282,6 +282,30 @@ fn assert_ipv4_mismatch(e: Error, want_path: &str, want_segment: &str) {
     }
 }
 
+#[track_caller]
+fn assert_prefix_wider(
+    e: Error,
+    want_path: &str,
+    want_prefix_len: u8,
+    want_segment: &str,
+    want_segment_prefix_len: u8,
+) {
+    match e {
+        Error::PrefixWiderThanSegment {
+            path,
+            prefix_len,
+            segment,
+            segment_prefix_len,
+        } => {
+            assert_eq!(path, want_path);
+            assert_eq!(prefix_len, want_prefix_len);
+            assert_eq!(segment, want_segment);
+            assert_eq!(segment_prefix_len, want_segment_prefix_len);
+        }
+        other => panic!("expected PrefixWiderThanSegment, got {other:?}"),
+    }
+}
+
 #[test]
 fn baseline_validates() {
     valid().validate().unwrap();
@@ -486,6 +510,69 @@ fn rejects_ipv4_just_past_segment_prefix() {
         "left",
         "10.0.1.0/24",
     );
+}
+
+#[test]
+fn rejects_ipv6_interface_prefix_wider_than_segment() {
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv6 = "fd64:796c:6f73:1::2/48".parse().unwrap();
+    assert_prefix_wider(
+        validate_err(&s),
+        "nodes[0].interfaces[0].ipv6",
+        48,
+        "left",
+        64,
+    );
+
+    let yaml = VALID.replace(
+        "        ipv6: fd64:796c:6f73:1::2/64\n",
+        "        ipv6: fd64:796c:6f73:1::2/48\n",
+    );
+    assert_prefix_wider(err_of(&yaml), "nodes[0].interfaces[0].ipv6", 48, "left", 64);
+}
+
+#[test]
+fn rejects_ipv4_interface_prefix_wider_than_segment() {
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv4 = Some("10.0.1.2/16".parse().unwrap());
+    assert_prefix_wider(
+        validate_err(&s),
+        "nodes[0].interfaces[0].ipv4",
+        16,
+        "left",
+        24,
+    );
+
+    let yaml = VALID.replace("        ipv4: 10.0.1.2/24\n", "        ipv4: 10.0.1.2/16\n");
+    assert_prefix_wider(err_of(&yaml), "nodes[0].interfaces[0].ipv4", 16, "left", 24);
+}
+
+#[test]
+fn accepts_ipv6_interface_prefix_equal_to_segment() {
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv6 = "fd64:796c:6f73:1::2/64".parse().unwrap();
+    s.validate().unwrap();
+}
+
+#[test]
+fn accepts_ipv6_interface_prefix_narrower_than_segment() {
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv6 = "fd64:796c:6f73:1::2/112".parse().unwrap();
+    s.validate().unwrap();
+}
+
+#[test]
+fn accepts_ipv4_interface_prefix_equal_to_segment() {
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv4 = Some("10.0.1.2/24".parse().unwrap());
+    s.validate().unwrap();
+}
+
+#[test]
+fn accepts_ipv4_interface_prefix_narrower_than_segment() {
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv4 = Some("10.0.1.2/25".parse().unwrap());
+    s.validate().unwrap();
 }
 
 #[test]
@@ -784,6 +871,20 @@ fn error_messages_name_path_and_offending_value() {
         m.contains("nodes[0].static_routes[1]") && m.contains("10.0.1.200"),
         "{m}"
     );
+
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv4 = Some("10.0.1.2/16".parse().unwrap());
+    let m = validate_err(&s).to_string();
+    for needle in ["nodes[0].interfaces[0].ipv4", "16", "left", "24"] {
+        assert!(m.contains(needle), "{needle} missing from: {m}");
+    }
+
+    let mut s = valid();
+    s.nodes[0].interfaces[0].ipv6 = "fd64:796c:6f73:1::2/48".parse().unwrap();
+    let m = validate_err(&s).to_string();
+    for needle in ["nodes[0].interfaces[0].ipv6", "48", "left", "64"] {
+        assert!(m.contains(needle), "{needle} missing from: {m}");
+    }
 }
 
 #[test]
@@ -1133,6 +1234,50 @@ proptest! {
                 prop_assert_eq!(segment, "does-not-exist");
             }
             other => prop_assert!(false, "expected UnknownSegment, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mutation_interface_prefix_wider_than_segment_is_rejected(
+        spec in valid_spec(),
+        pick in any::<prop::sample::Index>(),
+        v4 in any::<bool>(),
+    ) {
+        let spots = iface_spots(&spec);
+        prop_assume!(!spots.is_empty());
+        let (n, i) = spots[pick.index(spots.len())];
+        prop_assume!(!v4 || spec.nodes[n].interfaces[i].ipv4.is_some());
+        let mut bad = spec;
+        let seg_name = bad.nodes[n].interfaces[i].segment.clone();
+        let seg = bad.segments.iter().find(|s| s.name == seg_name).unwrap();
+        let (field, want_prefix_len, want_seg_prefix_len) = if v4 {
+            let seg_v4_len = seg.ipv4.unwrap().prefix_len();
+            prop_assume!(seg_v4_len > 1);
+            let bad_len = seg_v4_len - 1;
+            let ip = bad.nodes[n].interfaces[i].ipv4.unwrap().addr();
+            bad.nodes[n].interfaces[i].ipv4 = Some(ipnet::Ipv4Net::new(ip, bad_len).unwrap());
+            ("ipv4", bad_len, seg_v4_len)
+        } else {
+            let seg_v6_len = seg.ipv6.prefix_len();
+            prop_assume!(seg_v6_len > 1);
+            let bad_len = seg_v6_len - 1;
+            let ip = bad.nodes[n].interfaces[i].ipv6.addr();
+            bad.nodes[n].interfaces[i].ipv6 = ipnet::Ipv6Net::new(ip, bad_len).unwrap();
+            ("ipv6", bad_len, seg_v6_len)
+        };
+        match bad.validate() {
+            Err(Error::PrefixWiderThanSegment {
+                path,
+                prefix_len,
+                segment,
+                segment_prefix_len,
+            }) => {
+                prop_assert_eq!(path, format!("nodes[{n}].interfaces[{i}].{field}"));
+                prop_assert_eq!(prefix_len, want_prefix_len);
+                prop_assert_eq!(segment, seg_name);
+                prop_assert_eq!(segment_prefix_len, want_seg_prefix_len);
+            }
+            other => prop_assert!(false, "expected PrefixWiderThanSegment, got {:?}", other),
         }
     }
 }

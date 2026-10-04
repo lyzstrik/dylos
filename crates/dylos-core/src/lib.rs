@@ -73,6 +73,15 @@ impl LabSpec {
                     });
                 }
 
+                if iface.ipv6.prefix_len() < segment.ipv6.prefix_len() {
+                    return Err(Error::PrefixWiderThanSegment {
+                        path: format!("nodes[{i}].interfaces[{j}].ipv6"),
+                        prefix_len: iface.ipv6.prefix_len(),
+                        segment: iface.segment.clone(),
+                        segment_prefix_len: segment.ipv6.prefix_len(),
+                    });
+                }
+
                 let ips = segment_ips.entry(&iface.segment).or_default();
                 if !ips.insert(IpAddr::V6(iface.ipv6.addr())) {
                     return Err(Error::DuplicateIp {
@@ -93,6 +102,14 @@ impl LabSpec {
                                 ip: IpAddr::V4(iface_v4.addr()),
                                 segment: iface.segment.clone(),
                                 cidr: ipnet::IpNet::V4(seg_v4),
+                            });
+                        }
+                        if iface_v4.prefix_len() < seg_v4.prefix_len() {
+                            return Err(Error::PrefixWiderThanSegment {
+                                path: format!("nodes[{i}].interfaces[{j}].ipv4"),
+                                prefix_len: iface_v4.prefix_len(),
+                                segment: iface.segment.clone(),
+                                segment_prefix_len: seg_v4.prefix_len(),
                             });
                         }
                         if !ips.insert(IpAddr::V4(iface_v4.addr())) {
