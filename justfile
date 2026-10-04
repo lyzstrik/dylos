@@ -30,3 +30,7 @@ host-check:
 # Run end-to-end tests (requires host prerequisites)
 e2e: host-check
     cargo xtask e2e
+
+# Build guest images (rootfs) with rootless podman
+images:
+    cargo xtask images
