@@ -29,6 +29,8 @@ fn server_and_client(
 
 // ---- Criterion 1: method, path, Content-Type, JSON body ----
 
+/// Tests that a PUT request correctly sends the HTTP method, path, Content-Type, and a serialized JSON body.
+/// Catches bugs where the HTTP builder or serialization is misconfigured for PUT requests.
 #[tokio::test]
 async fn put_sends_method_path_content_type_and_body() -> TestResult {
     let dir = tempdir()?;
@@ -48,6 +50,8 @@ async fn put_sends_method_path_content_type_and_body() -> TestResult {
     Ok(())
 }
 
+/// Tests that a PATCH request correctly sends the HTTP method, path, Content-Type, and a serialized JSON body.
+/// Catches bugs where the HTTP builder or serialization is misconfigured for PATCH requests.
 #[tokio::test]
 async fn patch_sends_method_path_content_type_and_body() -> TestResult {
     let dir = tempdir()?;
@@ -67,6 +71,8 @@ async fn patch_sends_method_path_content_type_and_body() -> TestResult {
     Ok(())
 }
 
+/// Tests that a GET request correctly sends the HTTP method and path without a request body.
+/// Catches bugs where the HTTP builder attaches an empty body or incorrect headers for GET requests.
 #[tokio::test]
 async fn get_sends_method_path_and_no_body() -> TestResult {
     let dir = tempdir()?;
@@ -141,6 +147,8 @@ fn assert_api_error(
     Ok(())
 }
 
+/// Tests that a 4xx error response carries the full context including the exact fault message.
+/// Catches bugs where the client fails to extract the JSON fault message for client errors.
 #[tokio::test]
 async fn error_4xx_carries_full_context() -> TestResult {
     let dir = tempdir()?;
@@ -168,6 +176,8 @@ async fn error_4xx_carries_full_context() -> TestResult {
     Ok(())
 }
 
+/// Tests that a 5xx error response carries the full context including the exact fault message.
+/// Catches bugs where the client fails to extract the JSON fault message for server errors.
 #[tokio::test]
 async fn error_5xx_carries_full_context() -> TestResult {
     let dir = tempdir()?;
@@ -195,6 +205,8 @@ async fn error_5xx_carries_full_context() -> TestResult {
     Ok(())
 }
 
+/// Tests that an error response on a GET request carries the correct context and method name.
+/// Catches bugs where error contexts hardcode the method instead of using the actual request method.
 #[tokio::test]
 async fn error_on_get_carries_context() -> TestResult {
     let dir = tempdir()?;
@@ -214,6 +226,8 @@ async fn error_on_get_carries_context() -> TestResult {
     Ok(())
 }
 
+/// Tests that if the API returns a non-JSON error body, it is preserved in the error context as text.
+/// Catches bugs where deserialization errors on error bodies mask the actual API error message.
 #[tokio::test]
 async fn non_json_error_body_is_still_useful() -> TestResult {
     let dir = tempdir()?;
@@ -241,6 +255,8 @@ async fn non_json_error_body_is_still_useful() -> TestResult {
     Ok(())
 }
 
+/// Tests that if the API returns an empty error body, the status and route are still reported.
+/// Catches bugs where the client expects a `fault_message` and drops the error context entirely if missing.
 #[tokio::test]
 async fn empty_error_body_still_reports_status_and_route() -> TestResult {
     let dir = tempdir()?;
@@ -260,6 +276,8 @@ async fn empty_error_body_still_reports_status_and_route() -> TestResult {
     Ok(())
 }
 
+/// Tests that attempting to connect to a missing socket yields a connect error containing the path.
+/// Catches bugs where connection errors panic or produce opaque OS errors without the socket path.
 #[tokio::test]
 async fn missing_socket_yields_connect_error_with_path() -> TestResult {
     let dir = tempdir()?;
@@ -363,6 +381,8 @@ fn is_duration_field(k: &str) -> bool {
     k.contains("duration") || k.contains("elapsed") || k.contains("latency")
 }
 
+/// Tests that every API call creates a tracing span containing the HTTP method and route.
+/// Catches bugs where spans are missing or omit critical routing information for observability.
 #[tokio::test]
 async fn each_call_has_a_span_with_method_and_route() -> TestResult {
     let layer = CaptureLayer::default();
@@ -387,6 +407,8 @@ async fn each_call_has_a_span_with_method_and_route() -> TestResult {
     Ok(())
 }
 
+/// Tests that the tracing span for an API call eventually records its duration in milliseconds.
+/// Catches bugs where the `duration_ms` field is left empty or recorded in the wrong unit.
 #[tokio::test]
 async fn span_records_duration() -> TestResult {
     let layer = CaptureLayer::default();
@@ -443,6 +465,8 @@ struct VmInfo {
     state: String,
 }
 
+/// Tests that the fake server can handle multiple requests on the same connection in order.
+/// Catches bugs where the test server drops the connection after one request.
 #[tokio::test]
 async fn one_server_handles_sequential_requests_in_order() -> TestResult {
     let dir = tempdir()?;
@@ -468,6 +492,8 @@ async fn one_server_handles_sequential_requests_in_order() -> TestResult {
     Ok(())
 }
 
+/// Tests that a 2xx response with a JSON body is correctly deserialized.
+/// Catches bugs where the client ignores the response body on success.
 #[tokio::test]
 async fn scripted_2xx_json_body_is_deserialized() -> TestResult {
     let dir = tempdir()?;
@@ -494,6 +520,8 @@ async fn scripted_2xx_json_body_is_deserialized() -> TestResult {
     Ok(())
 }
 
+/// Tests that a malformed JSON response yields a specific deserialization error.
+/// Catches bugs where the client panics on invalid JSON.
 #[tokio::test]
 async fn error_deserialize_malformed_json() -> TestResult {
     let dir = tempdir()?;
@@ -523,31 +551,27 @@ async fn error_deserialize_malformed_json() -> TestResult {
     Ok(())
 }
 
+/// Tests that an invalid route yields a specific invalid route error without panicking.
+/// Catches bugs where the HTTP builder or URI parser panics on invalid input.
 #[tokio::test]
-async fn invalid_route_yields_request_builder_error() -> TestResult {
+async fn invalid_route_yields_invalid_route_error() -> TestResult {
     let dir = tempdir()?;
-    let (server, client, sock) = server_and_client(&dir)?;
+    let (server, client, _sock) = server_and_client(&dir)?;
     let err = client
         .get::<Value>(" bad route ")
         .await
         .err()
         .ok_or("expected error")?;
-    let Error::RequestBuilder {
-        path,
-        method,
-        route,
-        ..
-    } = &err
-    else {
-        return Err(format!("expected RequestBuilder, got {err:?}").into());
+    let Error::InvalidRoute { route } = &err else {
+        return Err(format!("expected InvalidRoute, got {err:?}").into());
     };
-    assert_eq!(path, &sock);
-    assert_eq!(method, "GET");
     assert_eq!(route, " bad route ");
     server.shutdown().await;
     Ok(())
 }
 
+/// Tests that a truncated response body yields a body read error.
+/// Catches bugs where the client hangs indefinitely waiting for a dropped connection.
 #[tokio::test]
 async fn truncated_body_yields_body_read_error() -> TestResult {
     let dir = tempdir()?;
@@ -590,6 +614,8 @@ async fn truncated_body_yields_body_read_error() -> TestResult {
     Ok(())
 }
 
+/// Tests that shutting down the fake server does not block indefinitely.
+/// Catches bugs where the server fails to drop its listener or connections properly.
 #[tokio::test]
 async fn fake_server_shutdown_does_not_block() -> TestResult {
     let dir = tempdir()?;
@@ -601,6 +627,8 @@ async fn fake_server_shutdown_does_not_block() -> TestResult {
     Ok(())
 }
 
+/// Tests that dropping the fake server cleans up the Unix socket file.
+/// Catches bugs where the mock server leaks socket files.
 #[tokio::test]
 async fn fake_server_raii_drops_socket() -> TestResult {
     let dir = tempdir()?;

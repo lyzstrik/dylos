@@ -18,6 +18,23 @@ struct FaultMessage {
     fault_message: String,
 }
 
+/// Firecracker ignores the host over a Unix socket, but HTTP/1.1 requires one.
+const API_AUTHORITY: &str = "localhost";
+
+fn request_uri(route: &str) -> Result<hyper::Uri> {
+    if !route.starts_with('/') {
+        return Err(Error::InvalidRoute {
+            route: route.to_string(),
+        });
+    }
+    format!("http://{API_AUTHORITY}{route}")
+        .parse()
+        .map_err(|e| Error::InvalidUri {
+            route: route.to_string(),
+            source: e,
+        })
+}
+
 impl FcClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -91,7 +108,7 @@ impl FcClient {
 
         let req = Request::builder()
             .method(method.clone())
-            .uri(format!("http://localhost{route}"))
+            .uri(request_uri(route)?)
             .header(hyper::header::ACCEPT, "application/json")
             .header(hyper::header::CONTENT_TYPE, "application/json")
             .body(req_body)
@@ -185,5 +202,35 @@ impl FcClient {
         R: for<'de> Deserialize<'de>,
     {
         self.request(hyper::Method::PATCH, route, Some(body)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_request_uri_valid() -> std::result::Result<(), String> {
+        let uri = request_uri("/machine-config").map_err(|e| e.to_string())?;
+        assert_eq!(uri.to_string(), "http://localhost/machine-config");
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_uri_missing_slash() -> std::result::Result<(), String> {
+        let err = request_uri("machine-config")
+            .err()
+            .ok_or("expected error")?;
+        assert!(matches!(err, Error::InvalidRoute { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn test_request_uri_invalid_chars() -> std::result::Result<(), String> {
+        let err = request_uri("/machine config")
+            .err()
+            .ok_or("expected error")?;
+        assert!(matches!(err, Error::InvalidUri { .. }));
+        Ok(())
     }
 }

@@ -70,6 +70,14 @@ pub enum Error {
         #[source]
         source: hyper::http::Error,
     },
+    #[error("invalid route {route:?}: must start with '/'")]
+    InvalidRoute { route: String },
+    #[error("invalid URI for route {route:?}")]
+    InvalidUri {
+        route: String,
+        #[source]
+        source: hyper::http::uri::InvalidUri,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

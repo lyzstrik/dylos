@@ -1,3 +1,6 @@
+//! Implementer unit-level tests of the transport.
+//! These tests verify the low-level HTTP client behavior directly against a mock server.
+
 mod support;
 
 use dylos_fc::{Error, FcClient};
@@ -8,6 +11,8 @@ use tempfile::tempdir;
 
 type TestResult = Result<(), Box<dyn StdError>>;
 
+/// Tests that a successful PUT request with a 204 No Content response works correctly.
+/// Catches bugs where the client fails to handle empty success responses or sends malformed requests.
 #[tokio::test]
 async fn test_client_204_success() -> TestResult {
     let dir = tempdir()?;
@@ -34,6 +39,8 @@ async fn test_client_204_success() -> TestResult {
     Ok(())
 }
 
+/// Tests that a 400 Bad Request with a JSON fault message is correctly parsed.
+/// Catches bugs where the client fails to extract the `fault_message` field from API errors.
 #[tokio::test]
 async fn test_client_400_fault_message() -> TestResult {
     let dir = tempdir()?;
@@ -68,6 +75,8 @@ async fn test_client_400_fault_message() -> TestResult {
     Ok(())
 }
 
+/// Tests that connecting to a non-existent socket yields a connect error.
+/// Catches bugs where the client fails to map socket connection errors appropriately.
 #[tokio::test]
 async fn test_client_missing_socket() -> TestResult {
     let dir = tempdir()?;
@@ -89,6 +98,8 @@ async fn test_client_missing_socket() -> TestResult {
     Ok(())
 }
 
+/// Tests that a 500 error with a plain text body is still captured in the error.
+/// Catches bugs where the client panics or drops the error context when the body isn't JSON.
 #[tokio::test]
 async fn test_client_non_json_error_body() -> TestResult {
     let dir = tempdir()?;
