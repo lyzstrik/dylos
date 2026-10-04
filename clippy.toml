@@ -1,4 +1,5 @@
-# `unwrap`, `expect` and friends are denied in library code (see the workspace lints)
-# but are the idiomatic way to fail a test, so they are allowed in tests only.
+# `unwrap` and `expect` are denied in library code (see the workspace lints) but are
+# the idiomatic way to fail a test. Clippy allows them inside `#[test]` functions and
+# `#[cfg(test)]` modules; helper functions in `tests/*.rs` still need a local allow.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true

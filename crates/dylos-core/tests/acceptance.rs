@@ -14,43 +14,8 @@ use std::path::PathBuf;
 use dylos_core::{Error, Interface, LabSpec, Node, Segment, StaticRoute};
 use proptest::prelude::*;
 
-const VALID: &str = "\
-segments:
-  - name: left
-    ipv6: fd64:796c:6f73:1::/64
-    ipv4: 10.0.1.0/24
-  - name: right
-    ipv6: fd64:796c:6f73:2::/64
-    ipv4: 10.0.2.0/24
-nodes:
-  - name: a
-    image: alpine
-    vcpus: 1
-    memory: 256
-    interfaces:
-      - name: eth0
-        segment: left
-        ipv6: fd64:796c:6f73:1::2/64
-        ipv4: 10.0.1.2/24
-    static_routes:
-      - destination: fd64:796c:6f73:2::/64
-        gateway: fd64:796c:6f73:1::1
-      - destination: 10.0.2.0/24
-        gateway: 10.0.1.1
-  - name: b
-    image: alpine
-    vcpus: 2
-    memory: 512
-    interfaces:
-      - name: eth0
-        segment: left
-        ipv6: fd64:796c:6f73:1::1/64
-        ipv4: 10.0.1.1/24
-      - name: eth1
-        segment: right
-        ipv6: fd64:796c:6f73:2::1/64
-        ipv4: 10.0.2.1/24
-";
+/// Valid dual-stack lab used as the base of most tests (see the fixture header).
+const VALID: &str = include_str!("fixtures/valid_lab.yaml");
 
 /// Parse `yaml` and return the error, panicking if it is accepted.
 fn err_of(yaml: &str) -> Error {
