@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e1c4dbcc4b34ee4a7d5362047f0fb53169e9c00317e519a93004a627655df42b # shrinks to spec = LabSpec { segments: [Segment { name: "seg0", ipv6: fd64:1::/64, ipv4: Some(10.0.0.0/24) }, Segment { name: "seg1", ipv6: fd64:1:1::/64, ipv4: Some(10.0.1.0/24) }], nodes: [Node { name: "node0", image: "alpine", vcpus: 1, memory: 128, interfaces: [Interface { name: "eth1", segment: "seg1", ipv6: fd64:1:1::1/64, ipv4: Some(10.0.1.1/24) }], static_routes: [StaticRoute { destination: 172.20.0.0/16, gateway: 10.0.254.254 }] }] }
