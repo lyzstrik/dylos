@@ -38,6 +38,7 @@ If it is ambiguous, contradicts an ADR, or cannot be done as written: **stop and
 1. **One issue at a time**, only if all its blocking issues are `Done`.
 2. **One issue = one worktree = one branch = one PR.** Branch name: the `gitBranchName` of the Linear issue (it contains `lyz-xx`, which links the PR to the issue).
 3. Keep PRs **under ~400 changed lines** (excluding lockfiles and generated files). If more is needed, stop and propose a split.
+   Acceptance tests added to the branch by an agent of another model family do not count toward this limit; the implementation alone must stay under it.
 4. Run `just check` (section 6). Never open a PR with a failing check.
 5. Open the PR with `gh pr create --base main`, using the format in section 8.
 6. **Never merge. Never approve your own work. Never mark a Linear issue `Done`.** A human does that.
@@ -45,8 +46,9 @@ If it is ambiguous, contradicts an ADR, or cannot be done as written: **stop and
 ### Public repository
 
 Everything you write in commits, PRs and comments is public. No secrets, no internal notes, no personal data. Professional tone.
+No AI attribution: no `Co-Authored-By` trailer for an AI model and no "Generated with ..." line in commits, PRs or comments.
 
-### Issues labeled `chemin-critique`
+### Issues labeled `critical-path`
 
 Critical path (VM lifecycle, network fabric, freeze, snapshot, restore). Do **not** implement them unless the human explicitly asked you to in this session; then open a **draft** PR only.
 
@@ -86,6 +88,12 @@ A crate never depends on a crate above it.
 - **`unsafe`**: `#![forbid(unsafe_code)]` everywhere except `dylos-net` and `dylos-store`. There, each block is minimal, has a `// SAFETY:` comment justifying every invariant, and is wrapped in a safe function. Mention any `unsafe` change under "Risks".
 - **Async**: `tokio` only. Never block in async code; use `spawn_blocking` for blocking syscalls. Lab-wide steps run concurrently, but each step waits for **all** VMs before the next one. Never reorder the snapshot/restore sequences of the design doc and ADR-001.
 - **Observability**: `tracing` only, no `println!` outside CLI output. One span per lab and per VM, with step durations.
+
+### Networking: IPv6-first, dual-stack
+
+Lab networks are IPv6-first and dual-stack by default (ADR-0002).
+Every segment has an IPv6 prefix and, by default, an IPv4 prefix; addresses are static and declared in the LabSpec.
+Code, tests and examples use IPv6 first and also cover IPv4. Never add an IPv4-only code path or test.
 
 ### Resource hygiene (critical)
 
@@ -160,7 +168,7 @@ If you are asked to review a PR, follow `docs/agents/review.md` exactly.
 - acceptance criteria are ambiguous, contradictory or impossible,
 - a change would contradict an ADR or the design doc,
 - you need a new crate, an architecture change, or new dependency category,
-- you would touch `chemin-critique` code without being asked,
+- you would touch `critical-path` code without being asked,
 - a check fails and one honest attempt did not explain why,
 - you are about to exceed ~400 changed lines,
 - you find yourself on `main`.
