@@ -22,15 +22,23 @@ pub enum Error {
         cidr: IpNet,
     },
 
+    #[error("{path}: interface has ipv4 but segment {segment:?} does not (or vice versa)")]
+    Ipv4Mismatch { path: String, segment: String },
+
     #[error("{path}: duplicate IP {ip}")]
     DuplicateIp { path: String, ip: std::net::IpAddr },
 
     #[error("{path}: segment {segment:?} does not exist")]
     UnknownSegment { path: String, segment: String },
 
-    #[error("{path}: gateway {gateway} is not reachable on any segment")]
+    #[error(
+        "{path}: gateway {gateway} is not reachable on any of the node's connected subnets, or is a node's own address"
+    )]
     UnreachableGateway {
         path: String,
         gateway: std::net::IpAddr,
     },
+
+    #[error("{path}: route destination and gateway families do not match")]
+    FamilyMismatch { path: String },
 }

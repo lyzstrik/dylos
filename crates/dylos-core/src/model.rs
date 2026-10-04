@@ -1,11 +1,20 @@
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LabSpec {
-    pub nodes: Vec<Node>,
     pub segments: Vec<Segment>,
+    pub nodes: Vec<Node>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Segment {
+    pub name: String,
+    pub ipv6: Ipv6Net,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<Ipv4Net>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -23,17 +32,12 @@ pub struct Node {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub struct Segment {
-    pub name: String,
-    pub cidr: IpNet,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
 pub struct Interface {
     pub name: String,
     pub segment: String,
-    pub ip: IpNet,
+    pub ipv6: Ipv6Net,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<Ipv4Net>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

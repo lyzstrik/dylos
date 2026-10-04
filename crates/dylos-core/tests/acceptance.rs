@@ -9,7 +9,6 @@
     clippy::doc_markdown
 )]
 
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use dylos_core::{Interface, LabSpec, Node, Segment, StaticRoute};
@@ -18,9 +17,11 @@ use proptest::prelude::*;
 const VALID: &str = "\
 segments:
   - name: left
-    cidr: 10.0.1.0/24
+    ipv6: fd64:796c:6f73:1::/64
+    ipv4: 10.0.1.0/24
   - name: right
-    cidr: 10.0.2.0/24
+    ipv6: fd64:796c:6f73:2::/64
+    ipv4: 10.0.2.0/24
 nodes:
   - name: a
     image: alpine
@@ -29,8 +30,11 @@ nodes:
     interfaces:
       - name: eth0
         segment: left
-        ip: 10.0.1.2/24
+        ipv6: fd64:796c:6f73:1::2/64
+        ipv4: 10.0.1.2/24
     static_routes:
+      - destination: fd64:796c:6f73:2::/64
+        gateway: fd64:796c:6f73:1::1
       - destination: 10.0.2.0/24
         gateway: 10.0.1.1
   - name: b
@@ -40,10 +44,12 @@ nodes:
     interfaces:
       - name: eth0
         segment: left
-        ip: 10.0.1.1/24
+        ipv6: fd64:796c:6f73:1::1/64
+        ipv4: 10.0.1.1/24
       - name: eth1
         segment: right
-        ip: 10.0.2.1/24
+        ipv6: fd64:796c:6f73:2::1/64
+        ipv4: 10.0.2.1/24
 ";
 
 /// Parse `yaml` and return the error message, panicking if it is accepted.
@@ -71,7 +77,8 @@ fn yaml_format_parses_all_fields() {
     let spec = valid();
     assert_eq!(spec.segments.len(), 2);
     assert_eq!(spec.segments[0].name, "left");
-    assert_eq!(spec.segments[0].cidr.to_string(), "10.0.1.0/24");
+    assert_eq!(spec.segments[0].ipv6.to_string(), "fd64:796c:6f73:1::/64");
+    assert_eq!(spec.segments[0].ipv4.unwrap().to_string(), "10.0.1.0/24");
     assert_eq!(spec.nodes.len(), 2);
     let a = &spec.nodes[0];
     assert_eq!(a.name, "a");
@@ -80,9 +87,16 @@ fn yaml_format_parses_all_fields() {
     assert_eq!(a.memory, 256);
     assert_eq!(a.interfaces[0].name, "eth0");
     assert_eq!(a.interfaces[0].segment, "left");
-    assert_eq!(a.interfaces[0].ip.to_string(), "10.0.1.2/24");
-    assert_eq!(a.static_routes[0].destination.to_string(), "10.0.2.0/24");
-    assert_eq!(a.static_routes[0].gateway.to_string(), "10.0.1.1");
+    assert_eq!(a.interfaces[0].ipv6.to_string(), "fd64:796c:6f73:1::2/64");
+    assert_eq!(a.interfaces[0].ipv4.unwrap().to_string(), "10.0.1.2/24");
+    assert_eq!(
+        a.static_routes[0].destination.to_string(),
+        "fd64:796c:6f73:2::/64"
+    );
+    assert_eq!(
+        a.static_routes[0].gateway.to_string(),
+        "fd64:796c:6f73:1::1"
+    );
 }
 
 #[test]
@@ -102,19 +116,18 @@ nodes:
 
 #[test]
 fn yaml_rejects_missing_required_node_fields() {
-    // Each line below is the first node's; removing it must be rejected.
     for line in [
         "  - name: a\n    image: alpine\n",
         "    image: alpine\n    vcpus: 1\n",
         "    vcpus: 1\n    memory: 256\n",
-        "    memory: 256\n    interfaces:\n      - name: eth0\n        segment: left\n        ip: 10.0.1.2/24\n",
+        "    memory: 256\n    interfaces:\n      - name: eth0\n        segment: left\n        ipv6: fd64:796c:6f73:1::2/64\n        ipv4: 10.0.1.2/24\n",
     ] {
         let replacement = match line {
             l if l.starts_with("  - name: a") => "  - image: alpine\n",
             l if l.starts_with("    image") => "    vcpus: 1\n",
             l if l.starts_with("    vcpus") => "    memory: 256\n",
             _ => {
-                "    interfaces:\n      - name: eth0\n        segment: left\n        ip: 10.0.1.2/24\n"
+                "    interfaces:\n      - name: eth0\n        segment: left\n        ipv6: fd64:796c:6f73:1::2/64\n        ipv4: 10.0.1.2/24\n"
             }
         };
         let yaml = VALID.replacen(line, replacement, 1);
@@ -124,14 +137,14 @@ fn yaml_rejects_missing_required_node_fields() {
 }
 
 #[test]
-fn yaml_rejects_missing_segment_cidr() {
+fn yaml_rejects_missing_segment_ipv6() {
     let yaml = "segments:\n  - name: s\nnodes: []\n";
     err_of(yaml);
 }
 
 #[test]
-fn yaml_rejects_missing_interface_ip() {
-    let yaml = VALID.replace("        ip: 10.0.1.2/24\n", "");
+fn yaml_rejects_missing_interface_ipv6() {
+    let yaml = VALID.replace("        ipv6: fd64:796c:6f73:1::2/64\n", "");
     err_of(&yaml);
 }
 
@@ -160,16 +173,16 @@ fn yaml_rejects_unknown_node_field() {
 #[test]
 fn yaml_rejects_unknown_segment_field() {
     rejects_unknown(
-        "    cidr: 10.0.1.0/24\n",
-        "    cidr: 10.0.1.0/24\n    mtu: 1500\n",
+        "    ipv6: fd64:796c:6f73:1::/64\n",
+        "    ipv6: fd64:796c:6f73:1::/64\n    mtu: 1500\n",
     );
 }
 
 #[test]
 fn yaml_rejects_unknown_interface_field() {
     rejects_unknown(
-        "        ip: 10.0.1.2/24\n",
-        "        ip: 10.0.1.2/24\n        mac: aa\n",
+        "        ipv6: fd64:796c:6f73:1::2/64\n",
+        "        ipv6: fd64:796c:6f73:1::2/64\n        mac: aa\n",
     );
 }
 
@@ -184,7 +197,7 @@ fn yaml_rejects_unknown_route_field() {
 #[test]
 fn yaml_rejects_wrong_types() {
     err_of(&VALID.replace("vcpus: 1", "vcpus: many"));
-    err_of(&VALID.replace("cidr: 10.0.1.0/24", "cidr: not-a-cidr"));
+    err_of(&VALID.replace("ipv4: 10.0.1.0/24", "ipv4: not-a-cidr"));
     err_of(&VALID.replace("gateway: 10.0.1.1", "gateway: nope"));
 }
 
@@ -221,22 +234,21 @@ fn rejects_duplicate_interface_name_on_node() {
 
 #[test]
 fn same_interface_name_on_different_nodes_is_fine() {
-    // `eth0` already appears on both nodes in the baseline.
     valid().validate().unwrap();
 }
 
 #[test]
 fn rejects_ip_outside_segment_cidr() {
     let mut s = valid();
-    s.nodes[1].interfaces[0].ip = "192.168.9.9/24".parse().unwrap();
+    s.nodes[1].interfaces[0].ipv4 = Some("192.168.9.9/24".parse().unwrap());
     let m = validate_err(&s);
-    assert!(m.contains("nodes[1].interfaces[0].ip"), "{m}");
+    assert!(m.contains("nodes[1].interfaces[0].ipv4"), "{m}");
 }
 
 #[test]
 fn rejects_duplicate_ip_on_segment() {
     let mut s = valid();
-    s.nodes[1].interfaces[0].ip = "10.0.1.2/24".parse().unwrap(); // same as node a
+    s.nodes[1].interfaces[0].ipv4 = Some("10.0.1.2/24".parse().unwrap());
     let m = validate_err(&s);
     assert!(m.contains("nodes[1].interfaces[0]"), "{m}");
 }
@@ -246,9 +258,11 @@ fn same_ip_on_different_segments_is_allowed() {
     let yaml = "\
 segments:
   - name: s1
-    cidr: 10.0.0.0/24
+    ipv6: fd64:1::/64
+    ipv4: 10.0.0.0/24
   - name: s2
-    cidr: 10.0.0.0/24
+    ipv6: fd64:2::/64
+    ipv4: 10.0.0.0/24
 nodes:
   - name: a
     image: i
@@ -257,10 +271,12 @@ nodes:
     interfaces:
       - name: eth0
         segment: s1
-        ip: 10.0.0.5/24
+        ipv6: fd64:1::5/64
+        ipv4: 10.0.0.5/24
       - name: eth1
         segment: s2
-        ip: 10.0.0.5/24
+        ipv6: fd64:2::5/64
+        ipv4: 10.0.0.5/24
 ";
     LabSpec::from_yaml_str(yaml).expect("IP uniqueness is per segment");
 }
@@ -277,32 +293,31 @@ fn rejects_unknown_segment() {
 #[test]
 fn rejects_gateway_not_in_any_attached_segment() {
     let mut s = valid();
-    s.nodes[0].static_routes[0].gateway = "172.16.0.1".parse().unwrap();
+    s.nodes[0].static_routes[0].gateway = "fd64:796c:6f73:5::1".parse().unwrap();
     let m = validate_err(&s);
     assert!(m.contains("nodes[0].static_routes[0]"), "{m}");
 }
 
 #[test]
 fn rejects_gateway_on_segment_the_node_is_not_attached_to() {
-    // Node a only sits on `left`; 10.0.2.1 lives on `right`.
     let mut s = valid();
-    s.nodes[0].static_routes[0].gateway = "10.0.2.1".parse().unwrap();
+    s.nodes[0].static_routes[0].gateway = "fd64:796c:6f73:2::1".parse().unwrap();
     let m = validate_err(&s);
     assert!(m.contains("nodes[0].static_routes[0]"), "{m}");
 }
 
 #[test]
 fn from_yaml_str_runs_validation() {
-    err_of(&VALID.replace("ip: 10.0.1.2/24", "ip: 10.9.9.9/24"));
+    err_of(&VALID.replace("ipv4: 10.0.1.2/24", "ipv4: 10.9.9.9/24"));
 }
 
 // ---------------------------------------------------------------- 3. errors
 
 #[test]
 fn error_path_for_ip_outside_segment_through_yaml() {
-    let yaml = VALID.replace("        ip: 10.0.1.1/24\n", "        ip: 10.0.7.1/24\n");
+    let yaml = VALID.replace("        ipv4: 10.0.1.1/24\n", "        ipv4: 10.0.7.1/24\n");
     let m = err_of(&yaml);
-    assert!(m.contains("nodes[1].interfaces[0].ip"), "{m}");
+    assert!(m.contains("nodes[1].interfaces[0].ipv4"), "{m}");
 }
 
 #[test]
@@ -315,7 +330,6 @@ fn error_messages_are_human_readable() {
 
 #[test]
 fn parse_errors_keep_line_and_column() {
-    // Type error on line 7 (vcpus).
     let yaml = "\
 segments: []
 nodes:
@@ -342,13 +356,12 @@ fn syntax_errors_keep_line_and_column() {
 
 // ------------------------------------------------------------- 4. proptest
 
-/// Build a valid topology: `segs` /24 segments, `nodes` nodes, node `n`
-/// attached to segment `s` iff bit `s` of `mask[n]` is set.
 fn build(segs: usize, masks: &[u8]) -> LabSpec {
     let segments = (0..segs)
         .map(|s| Segment {
             name: format!("seg{s}"),
-            cidr: format!("10.0.{s}.0/24").parse().unwrap(),
+            ipv6: format!("fd64:1:{s}::/64").parse().unwrap(),
+            ipv4: Some(format!("10.0.{s}.0/24").parse().unwrap()),
         })
         .collect();
     let nodes = masks
@@ -360,18 +373,18 @@ fn build(segs: usize, masks: &[u8]) -> LabSpec {
                 .map(|s| Interface {
                     name: format!("eth{s}"),
                     segment: format!("seg{s}"),
-                    ip: format!("10.0.{s}.{}/24", n + 1).parse().unwrap(),
+                    ipv6: format!("fd64:1:{s}::{:x}/64", n + 1).parse().unwrap(),
+                    ipv4: Some(format!("10.0.{s}.{}/24", n + 1).parse().unwrap()),
                 })
                 .collect();
             let static_routes = interfaces
                 .first()
                 .map(|i| {
-                    let net = i.ip.addr().to_string();
-                    let third: Ipv4Addr = net.parse().unwrap();
-                    let o = third.octets();
+                    let mut gw_octets = i.ipv4.unwrap().addr().octets();
+                    gw_octets[3] = 254;
                     vec![StaticRoute {
                         destination: "172.20.0.0/16".parse().unwrap(),
-                        gateway: Ipv4Addr::new(o[0], o[1], o[2], 254).into(),
+                        gateway: std::net::Ipv4Addr::from(gw_octets).into(),
                     }]
                 })
                 .unwrap_or_default();
@@ -401,7 +414,6 @@ proptest! {
         let yaml = serde_saphyr::to_string(&spec).unwrap();
         let back = LabSpec::from_yaml_str(&yaml).unwrap();
         prop_assert_eq!(&spec, &back);
-        // Second hop is stable too.
         let yaml2 = serde_saphyr::to_string(&back).unwrap();
         prop_assert_eq!(LabSpec::from_yaml_str(&yaml2).unwrap(), spec);
     }
@@ -442,7 +454,7 @@ proptest! {
         prop_assume!(!spots.is_empty());
         let (n, i) = spots[pick.index(spots.len())];
         let mut bad = spec;
-        bad.nodes[n].interfaces[i].ip = "192.168.200.1/24".parse().unwrap();
+        bad.nodes[n].interfaces[i].ipv4 = Some("192.168.200.1/24".parse().unwrap());
         prop_assert!(bad.validate().is_err());
     }
 
@@ -472,6 +484,5 @@ fn labs_abc_yaml_loads_and_validates() {
     let names: Vec<_> = spec.nodes.iter().map(|n| n.name.as_str()).collect();
     assert_eq!(names, ["A", "B", "C"]);
     assert_eq!(spec.segments.len(), 2);
-    // B is the router: attached to both segments.
     assert_eq!(spec.nodes[1].interfaces.len(), 2);
 }
