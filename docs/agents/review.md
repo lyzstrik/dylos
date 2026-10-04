@@ -12,6 +12,7 @@ Post exactly one review comment with `gh pr comment <number>`.
 5. **Tests**: do they test behavior, or only execute code? Could they pass with a broken implementation? Was any test weakened or ignored?
 6. **Architecture**: dependency direction (AGENTS.md section 4), crate boundaries, no system code in `dylos-core`; networking code and tests are IPv6-first and also cover IPv4 (ADR-0002).
 7. **Scope**: unrelated changes, drive-by refactors, unjustified dependencies, commands not going through `just`; size over ~400 lines, not counting acceptance tests written by another model family.
+8. **Comments and tests placement**: comments only where the code is non-obvious, none restating a name or type (AGENTS.md section 5); tests in `tests/*.rs` through the public API.
 8. **Security**: secrets, privilege usage, host side effects outside the lab's namespace, anything inappropriate for a public repo.
 9. **Branch hygiene**: the PR targets `main` from an issue branch; no commits made directly on `main`.
 

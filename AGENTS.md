@@ -88,6 +88,8 @@ A crate never depends on a crate above it.
 - **`unsafe`**: `#![forbid(unsafe_code)]` everywhere except `dylos-net` and `dylos-store`. There, each block is minimal, has a `// SAFETY:` comment justifying every invariant, and is wrapped in a safe function. Mention any `unsafe` change under "Risks".
 - **Async**: `tokio` only. Never block in async code; use `spawn_blocking` for blocking syscalls. Lab-wide steps run concurrently, but each step waits for **all** VMs before the next one. Never reorder the snapshot/restore sequences of the design doc and ADR-001.
 - **Observability**: `tracing` only, no `println!` outside CLI output. One span per lab and per VM, with step durations.
+- **Comments**: only where the code is complicated, non-intuitive or a trap for a reviewer: units, invariants, non-obvious defaults, constraints from the Firecracker spec or an ADR. Never a comment that restates the name or the type. Update comments in the same PR as the code.
+- **Test location**: tests go in `crates/<crate>/tests/*.rs` and use the public API. Keep an in-crate `#[cfg(test)]` module only for a private helper that cannot be reached through the public API.
 
 ### Networking: IPv6-first, dual-stack
 
@@ -120,7 +122,7 @@ CI runs `just check`, so local and CI results must match.
 ## 7. Tests
 
 - Each acceptance criterion maps to at least one test, or the PR explains why not.
-- Unit tests next to the code; property tests (`proptest`) for pure logic in `dylos-core`.
+- Tests in `crates/<crate>/tests/*.rs` through the public API (section 5); property tests (`proptest`) for pure logic in `dylos-core`.
 - KVM/privileged tests are e2e tests (`just e2e`), skipped with an explicit message when `/dev/kvm` is missing.
 - **Never delete, weaken or `#[ignore]` a test to make a check pass.** If a test seems wrong, stop and ask.
 - No sleeps as synchronization: wait on a condition with a timeout.
