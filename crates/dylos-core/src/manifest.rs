@@ -5,6 +5,9 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+/// Deliberately not `Deserialize`: serde reads a document in one pass and cannot reject
+/// an unknown `format_version` before the rest of the schema. Read manifests with
+/// [`SnapshotManifest::from_json_str`].
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SnapshotManifest {
     pub format_version: u32,
@@ -125,20 +128,6 @@ impl RawSnapshotManifest {
         };
         manifest.validate_paths()?;
         Ok(manifest)
-    }
-}
-
-/// Direct serde deserialization applies the same version and path checks, but in a single
-/// pass: an unknown version with an incompatible schema surfaces as a schema error. Use
-/// [`SnapshotManifest::from_json_str`] to get the typed errors.
-impl<'de> Deserialize<'de> for SnapshotManifest {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        RawSnapshotManifest::deserialize(deserializer)?
-            .into_checked()
-            .map_err(serde::de::Error::custom)
     }
 }
 

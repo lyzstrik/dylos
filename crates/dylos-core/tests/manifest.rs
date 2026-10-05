@@ -301,38 +301,6 @@ fn test_verify_integrity() {
 }
 
 #[test]
-fn test_serde_boundary_rejects_unsupported_version() {
-    let json = r#"{
-        "format_version": 2,
-        "lab_spec": { "nodes": [], "segments": [] },
-        "vms": {},
-        "firecracker_version": "1.17.0",
-        "host_cpu_model": "Intel",
-        "created_at_unix_ms": 123456789,
-        "step_durations_ms": {
-            "freeze": 1,
-            "pause": 2,
-            "snapshot": 3,
-            "resume": 4,
-            "thaw": 5
-        }
-    }"#;
-
-    let res = serde_json::from_str::<SnapshotManifest>(json);
-    match res {
-        Err(e) => {
-            assert!(
-                e.to_string()
-                    .contains("unsupported manifest version 2, only version 1 is supported"),
-                "{}",
-                e
-            );
-        }
-        _ => panic!("Expected serde_json::Error"),
-    }
-}
-
-#[test]
 fn test_verify_validates_paths_first() {
     let content = b"hello world";
     let size = content.len() as u64;
@@ -513,7 +481,6 @@ fn test_duplicate_version_key_is_rejected() {
         SnapshotManifest::from_json_str(&json),
         Err(Error::Json(_))
     ));
-    assert!(serde_json::from_str::<SnapshotManifest>(&json).is_err());
 }
 
 #[test]
@@ -524,7 +491,6 @@ fn test_duplicate_nested_field_is_rejected() {
         SnapshotManifest::from_json_str(&json),
         Err(Error::Json(_))
     ));
-    assert!(serde_json::from_str::<SnapshotManifest>(&json).is_err());
 }
 
 #[test]
@@ -536,7 +502,6 @@ fn test_duplicate_vm_name_is_rejected() {
     );
     let err = SnapshotManifest::from_json_str(&json).unwrap_err();
     assert!(err.to_string().contains("duplicate VM `a`"), "{err}");
-    assert!(serde_json::from_str::<SnapshotManifest>(&json).is_err());
 }
 
 #[test]
