@@ -1,0 +1,16 @@
+{
+    "format_version": 1,
+    "lab_spec": { "nodes": [], "segments": [] },
+    "vms": {},
+    "firecracker_version": "1.17.0",
+    "host_cpu_model": "Intel",
+    "created_at_unix_ms": 123456789,
+    "step_durations_ms": {
+        "freeze": 1,
+        "pause": 2,
+        "snapshot": 3,
+        "resume": 4,
+        "thaw": 5
+    },
+    "unknown_field": "unexpected"
+}

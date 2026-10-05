@@ -15,28 +15,8 @@ fn sha_hex(data: &[u8]) -> String {
 }
 
 fn lab_spec() -> LabSpec {
-    let yaml = r"
-segments:
-  - name: lan
-    ipv6: 2001:db8:1::/64
-    ipv4: 192.0.2.0/24
-  - name: v6only
-    ipv6: 2001:db8:2::/64
-nodes:
-  - name: router
-    image: router.img
-    vcpus: 2
-    memory: 512
-    interfaces:
-      - name: eth0
-        segment: lan
-        ipv6: 2001:db8:1::1/64
-        ipv4: 192.0.2.1/24
-      - name: eth1
-        segment: v6only
-        ipv6: 2001:db8:2::1/64
-";
-    LabSpec::from_yaml_str(yaml).expect("valid lab spec")
+    LabSpec::from_yaml_str(include_str!("fixtures/manifest_acceptance_lab.yaml"))
+        .expect("valid lab spec")
 }
 
 fn meta(path: &str, data: &[u8]) -> FileMeta {

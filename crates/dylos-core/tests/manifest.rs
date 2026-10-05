@@ -8,24 +8,7 @@ use std::io::Cursor;
 use std::path::PathBuf;
 
 fn valid_lab_spec() -> LabSpec {
-    let yaml = r"
-nodes:
-  - name: router
-    image: router.qcow2
-    vcpus: 1
-    memory: 256
-    interfaces:
-      - name: eth0
-        segment: wan
-        ipv6: 2001:db8:1::1/64
-        ipv4: 192.0.2.1/24
-    static_routes: []
-segments:
-  - name: wan
-    ipv6: 2001:db8:1::/64
-    ipv4: 192.0.2.0/24
-";
-    LabSpec::from_yaml_str(yaml).expect("valid lab spec")
+    LabSpec::from_yaml_str(include_str!("fixtures/manifest_lab.yaml")).expect("valid lab spec")
 }
 
 fn path_buf_strategy() -> impl Strategy<Value = PathBuf> {
@@ -116,21 +99,7 @@ proptest! {
 
 #[test]
 fn test_unsupported_version() {
-    let json = r#"{
-        "format_version": 2,
-        "lab_spec": { "nodes": [], "segments": [] },
-        "vms": {},
-        "firecracker_version": "1.17.0",
-        "host_cpu_model": "Intel",
-        "created_at_unix_ms": 123456789,
-        "step_durations_ms": {
-            "freeze": 1,
-            "pause": 2,
-            "snapshot": 3,
-            "resume": 4,
-            "thaw": 5
-        }
-    }"#;
+    let json = include_str!("fixtures/manifest_unsupported_version.json");
 
     let res = SnapshotManifest::from_json_str(json);
     assert!(matches!(
@@ -144,22 +113,7 @@ fn test_unsupported_version() {
 
 #[test]
 fn test_reject_unknown_fields() {
-    let json = r#"{
-        "format_version": 1,
-        "lab_spec": { "nodes": [], "segments": [] },
-        "vms": {},
-        "firecracker_version": "1.17.0",
-        "host_cpu_model": "Intel",
-        "created_at_unix_ms": 123456789,
-        "step_durations_ms": {
-            "freeze": 1,
-            "pause": 2,
-            "snapshot": 3,
-            "resume": 4,
-            "thaw": 5
-        },
-        "unknown_field": "unexpected"
-    }"#;
+    let json = include_str!("fixtures/manifest_unknown_field.json");
 
     let res = SnapshotManifest::from_json_str(json);
     match res {
@@ -172,27 +126,7 @@ fn test_reject_unknown_fields() {
 
 #[test]
 fn test_reject_absolute_path() {
-    let json = r#"{
-        "format_version": 1,
-        "lab_spec": { "nodes": [], "segments": [] },
-        "vms": {
-            "router": {
-                "state_file": { "path": "/absolute/path", "sha256": "abc", "size": 123 },
-                "memory_file": { "path": "mem", "sha256": "def", "size": 456 },
-                "disks": []
-            }
-        },
-        "firecracker_version": "1.17.0",
-        "host_cpu_model": "Intel",
-        "created_at_unix_ms": 123456789,
-        "step_durations_ms": {
-            "freeze": 1,
-            "pause": 2,
-            "snapshot": 3,
-            "resume": 4,
-            "thaw": 5
-        }
-    }"#;
+    let json = include_str!("fixtures/manifest_absolute_path.json");
 
     let res = SnapshotManifest::from_json_str(json);
     match res {
@@ -206,27 +140,7 @@ fn test_reject_absolute_path() {
 
 #[test]
 fn test_reject_parent_path() {
-    let json = r#"{
-        "format_version": 1,
-        "lab_spec": { "nodes": [], "segments": [] },
-        "vms": {
-            "router": {
-                "state_file": { "path": "state", "sha256": "abc", "size": 123 },
-                "memory_file": { "path": "mem/../file", "sha256": "def", "size": 456 },
-                "disks": []
-            }
-        },
-        "firecracker_version": "1.17.0",
-        "host_cpu_model": "Intel",
-        "created_at_unix_ms": 123456789,
-        "step_durations_ms": {
-            "freeze": 1,
-            "pause": 2,
-            "snapshot": 3,
-            "resume": 4,
-            "thaw": 5
-        }
-    }"#;
+    let json = include_str!("fixtures/manifest_parent_path.json");
 
     let res = SnapshotManifest::from_json_str(json);
     match res {
