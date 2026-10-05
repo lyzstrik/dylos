@@ -7,7 +7,7 @@
 ## Context
 
 The runtime (LYZ-11) needs to launch Firecracker microVMs using the `jailer` for isolation.
-The upstream `jailer` v1.17.0 forces a specific privilege model: it must start as root in the initial user namespace. It needs root for `chroot`, `mknod` of `/dev/kvm`, `/dev/net/tun` and `/dev/userfaultfd` in the jail, cgroup v2 writes, `setns` into `--netns`, and `setuid`/`setgid`. 
+The upstream `jailer` v1.17.0 forces a specific privilege model: it must start as root in the initial user namespace. It needs root for `chroot`, `mknod` of `/dev/kvm`, `/dev/net/tun` and `/dev/userfaultfd` in the jail, cgroup v2 writes, `setns` into `--netns`, and `setuid`/`setgid`.
 After dropping privileges, the Firecracker process it leaves behind runs as the target uid/gid, chrooted, seccomp-filtered, in its own cgroup, and in the lab network namespace.
 
 The problem is how the Dylos orchestrator itself should run to support the upstream jailer. We need to decide whether to run the entire orchestrator as root, run it inside an unprivileged user namespace (rootless), or split the privileges.
@@ -24,7 +24,7 @@ The target after the spike (post-go) is to split a small privileged helper (for 
 
 - **LYZ-11 (Jailer launch):** The orchestrator runs as root and calls the unmodified upstream jailer.
 - **LYZ-15 (Netns/TAP):** TAP devices must be created with `TUNSETOWNER`/`TUNSETGROUP` matching the jailer's uid/gid.
-- **LYZ-17 (Lab up/down):** Handled by the root orchestrator. 
+- **LYZ-17 (Lab up/down):** Handled by the root orchestrator.
 - **Tests:** Unit tests run unprivileged using fakes. End-to-end (e2e) tests run as root by a human.
 
 ## What this does not cover
