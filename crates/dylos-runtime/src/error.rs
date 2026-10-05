@@ -24,16 +24,18 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    #[error("VM {id}: process exited during start ({state:?})")]
+    #[error("VM {id}: process exited during start ({state:?})\n{output}")]
     ExitedDuringStart {
         id: String,
         state: crate::vm::ProcessState,
+        output: String,
     },
-    #[error("VM {id}: API socket {socket:?} not ready after {timeout:?}")]
+    #[error("VM {id}: API socket {socket:?} not ready after {timeout:?}\n{output}")]
     ReadyTimeout {
         id: String,
         socket: PathBuf,
         timeout: Duration,
+        output: String,
     },
     #[error("VM {id}: {task} task failed")]
     Task {

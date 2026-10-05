@@ -30,6 +30,7 @@ pub enum Mode {
     NoSocket,
     /// Exits with status 3 at once.
     ExitAtOnce,
+    FailDuringStart,
     /// Answers `GET /` but never answers `PUT /actions`; dies on SIGTERM.
     StallActions,
     /// Hands the first API connection to a `cat` that never answers, then exits with status 5,
@@ -135,6 +136,10 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
     match mode {
         "ExitAtOnce" => return 3,
+        "FailDuringStart" => {
+            eprintln!("fake jailer failed during start");
+            return 1;
+        }
         "NoSocket" => std::future::pending::<()>().await,
         _ => {}
     }

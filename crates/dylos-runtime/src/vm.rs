@@ -82,6 +82,8 @@ pub struct Vm {
     supervisor: Option<JoinHandle<Result<()>>>,
     tasks: Vec<JoinHandle<()>>,
     pid: Option<u32>,
+    output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    output_tasks_done: mpsc::Receiver<()>,
 }
 
 impl Vm {
@@ -142,14 +144,25 @@ impl Vm {
         let paths = jail.paths().clone();
         let pid = child.id();
         let mut tasks = Vec::new();
+        let output = Arc::new(std::sync::Mutex::new(
+            std::collections::VecDeque::with_capacity(20),
+        ));
+        let (done_tx, done_rx) = mpsc::channel(1);
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
         // is not daemonized.
         if let Some(out) = child.stdout.take() {
-            tasks.push(tokio::spawn(forward_lines(out, "stdout").in_current_span()));
+            tasks.push(tokio::spawn(
+                forward_lines(out, "stdout", Arc::clone(&output), done_tx.clone())
+                    .in_current_span(),
+            ));
         }
         if let Some(err) = child.stderr.take() {
-            tasks.push(tokio::spawn(forward_lines(err, "stderr").in_current_span()));
+            tasks.push(tokio::spawn(
+                forward_lines(err, "stderr", Arc::clone(&output), done_tx.clone())
+                    .in_current_span(),
+            ));
         }
+        drop(done_tx);
         let (signals, signal_rx) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(ProcessState::Running);
         let expected_exit = Arc::new(AtomicBool::new(false));
@@ -171,6 +184,8 @@ impl Vm {
             supervisor: Some(supervisor),
             tasks,
             pid,
+            output,
+            output_tasks_done: done_rx,
         }
     }
 
@@ -206,30 +221,51 @@ impl Vm {
             .map_or(ProcessState::Lost, |s| s.clone())
     }
 
-    async fn wait_ready(&self) -> Result<()> {
-        // GET / returns the instance info once the API thread serves requests. A request can
-        // stall, so the whole poll is raced against the exit.
+    async fn wait_ready(&mut self) -> Result<()> {
+        let client = &self.client;
+        let mut state = self.state.clone();
+
+        let paths_id = self.paths.id.clone();
+
+        let timeouts_ready = self.timeouts.ready;
+        let output_ref = &self.output;
+        let done_rx = &mut self.output_tasks_done;
+
         let poll = async {
-            while self.client.get::<serde_json::Value>("/").await.is_err() {
+            while client.get::<serde_json::Value>("/").await.is_err() {
                 tokio::time::sleep(READY_RETRY).await;
             }
         };
         let ready = async {
             tokio::select! {
                 () = poll => Ok(()),
-                state = self.exited() => Err(Error::ExitedDuringStart {
-                    id: self.paths.id.clone(),
-                    state,
-                }),
+                res = state.wait_for(|s| *s != ProcessState::Running) => {
+                    let st = res.map_or(ProcessState::Lost, |s| s.clone());
+                    let _ = tokio::time::timeout(Duration::from_millis(50), done_rx.recv()).await;
+                    let output = output_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).collect::<Vec<_>>().join("\n");
+                    Err(Error::ExitedDuringStart {
+                        id: paths_id.clone(),
+                        state: st,
+                        output,
+                    })
+                },
             }
         };
-        tokio::time::timeout(self.timeouts.ready, ready)
+        tokio::time::timeout(timeouts_ready, ready)
             .await
             .unwrap_or_else(|_| {
+                let output = self
+                    .output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .drain(..)
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 Err(Error::ReadyTimeout {
                     id: self.paths.id.clone(),
                     socket: self.paths.api_socket(),
                     timeout: self.timeouts.ready,
+                    output,
                 })
             })
     }
@@ -391,11 +427,25 @@ async fn supervise(
     res
 }
 
-async fn forward_lines(stream: impl AsyncRead + Unpin, source: &'static str) {
+async fn forward_lines(
+    stream: impl AsyncRead + Unpin,
+    source: &'static str,
+    output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    _done_tx: mpsc::Sender<()>,
+) {
     let mut lines = BufReader::new(stream).lines();
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => tracing::info!(target: "dylos::firecracker", source, "{line}"),
+            Ok(Some(line)) => {
+                tracing::info!(target: "dylos::firecracker", source, "{line}");
+                let mut q = output
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if q.len() >= 20 {
+                    q.pop_front();
+                }
+                q.push_back(line);
+            }
             Ok(None) => break,
             Err(e) => {
                 tracing::warn!(source, error = %e, "failed to read Firecracker output");

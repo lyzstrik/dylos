@@ -268,3 +268,17 @@ async fn zero_metrics_poll_is_refused_before_spawning() {
     assert!(matches!(err, Error::ZeroMetricsPoll { .. }), "{err}");
     sandbox.assert_no_jail_left();
 }
+
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn launch_fails_during_start_and_includes_output() {
+    let sandbox = Sandbox::new(Mode::FailDuringStart);
+    let res = Vm::launch(&sandbox.config, &spec(&sandbox)).await;
+    match res {
+        Err(Error::ExitedDuringStart { output, .. }) => {
+            assert!(output.contains("fake jailer failed during start"));
+        }
+        Ok(_) => panic!("expected error, got Ok"),
+        Err(e) => panic!("expected ExitedDuringStart, got {e:?}"),
+    }
+}

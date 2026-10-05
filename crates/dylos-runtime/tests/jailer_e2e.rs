@@ -77,7 +77,7 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
         eprintln!("SKIPPED real_jailer e2e test: {reason}");
         return;
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let config = JailerConfig::new(dir.path(), NOBODY, NOBODY);
     let netns = OwnedNetns::new().await;
 
