@@ -1,0 +1,199 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
+
+use std::ffi::OsString;
+use std::fmt::Write as _;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use dylos_runtime::jailer::JailerConfig;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+
+/// Name of the `#[test]` that turns the test binary into a fake jailer. The launcher re-executes
+/// the test binary with libtest arguments selecting only that test; everything after `--` is
+/// ignored by libtest (unmatched filters) and read by the fake.
+pub const ENTRY: &str = "fake_jailer_entry";
+
+/// What the fake does, written as the content of the `--exec-file` it receives.
+#[derive(Clone, Copy, Debug)]
+pub enum Mode {
+    /// Serves the API; exits 0 on `SendCtrlAltDel`, 7 after `FlushMetrics` if `crash_on_flush`.
+    Serve,
+    CrashOnFlush,
+    /// Answers `SendCtrlAltDel` but keeps running; dies on SIGTERM.
+    IgnoreCtrlAltDel,
+    /// Answers `SendCtrlAltDel` and survives SIGTERM; only SIGKILL stops it.
+    IgnoreTerm,
+    /// Never creates the API socket.
+    NoSocket,
+    /// Exits with status 3 at once.
+    ExitAtOnce,
+}
+
+pub struct Sandbox {
+    pub dir: tempfile::TempDir,
+    pub config: JailerConfig,
+}
+
+impl Sandbox {
+    pub fn new(mode: Mode) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = std::fs::metadata(dir.path()).unwrap();
+        let exec = dir.path().join("firecracker");
+        std::fs::write(&exec, format!("{mode:?}")).unwrap();
+        let mut config = JailerConfig::new(dir.path().join("jails"), meta.uid(), meta.gid());
+        config.jailer = std::env::current_exe().unwrap();
+        config.firecracker = exec;
+        config.launcher_args = [ENTRY, "--exact", "--nocapture", "--"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        Self { dir, config }
+    }
+
+    pub fn assert_no_jail_left(&self) {
+        let base = self.dir.path().join("jails/firecracker");
+        let left: Vec<PathBuf> = match std::fs::read_dir(base) {
+            Ok(entries) => entries.map(|e| e.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        };
+        assert_eq!(left, Vec::<PathBuf>::new());
+    }
+}
+
+/// Runs the fake jailer if this process was launched as one; returns otherwise.
+pub fn run_fake_jailer_if_requested() {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(sep) = args.iter().position(|a| a == "--") else {
+        return;
+    };
+    let args = &args[sep + 1..];
+    let flag = |name: &str| {
+        let i = args.iter().position(|a| a == name)?;
+        args.get(i + 1).cloned()
+    };
+    let (Some(base), Some(exec), Some(id), Some(sock), Some(metrics)) = (
+        flag("--chroot-base-dir"),
+        flag("--exec-file"),
+        flag("--id"),
+        flag("--api-sock"),
+        flag("--metrics-path"),
+    ) else {
+        return;
+    };
+    let root = Path::new(&base).join("firecracker").join(id).join("root");
+    let mode = std::fs::read_to_string(&exec).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let code = rt.block_on(fake_firecracker(
+        &mode,
+        root.join(sock.trim_start_matches('/')),
+        root.join(metrics.trim_start_matches('/')),
+    ));
+    std::process::exit(code);
+}
+
+async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
+    println!("fake firecracker starting in mode {mode}");
+    match mode {
+        "ExitAtOnce" => return 3,
+        "NoSocket" => std::future::pending::<()>().await,
+        _ => {}
+    }
+    let _term = if mode == "IgnoreTerm" {
+        Some(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap())
+    } else {
+        None
+    };
+    let listener = UnixListener::bind(sock).unwrap();
+    loop {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_request(&mut stream).await;
+        let reply = if request.starts_with("GET / ") {
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
+        } else {
+            "HTTP/1.1 204 No Content\r\n\r\n"
+        };
+        stream.write_all(reply.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+        if request.contains("SendCtrlAltDel") && mode == "Serve" {
+            return 0;
+        }
+        if request.contains("FlushMetrics") {
+            let mut line =
+                r#"{"utc_timestamp_ms":1,"api_server":{"process_startup_time_us":42}}"#.to_owned();
+            line.push('\n');
+            let mut f = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&metrics)
+                .await
+                .unwrap();
+            f.write_all(line.as_bytes()).await.unwrap();
+            if mode == "CrashOnFlush" {
+                return 7;
+            }
+        }
+    }
+}
+
+async fn read_request(stream: &mut UnixStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut chunk).await.unwrap();
+        buf.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        if let Some(end) = text.find("\r\n\r\n") {
+            let len = text
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len || n == 0 {
+                return text;
+            }
+        } else if n == 0 {
+            return text;
+        }
+    }
+}
+
+/// Records the message of every `tracing` event emitted on this thread while it is alive.
+pub struct Captured(pub Arc<Mutex<Vec<String>>>);
+
+impl Captured {
+    pub fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::layer::SubscriberExt::with(
+            tracing_subscriber::registry(),
+            Recorder(Arc::clone(&lines)),
+        );
+        (Self(lines), tracing::subscriber::set_default(subscriber))
+    }
+
+    pub fn contains(&self, needle: &str) -> bool {
+        self.0.lock().unwrap().iter().any(|l| l.contains(needle))
+    }
+}
+
+struct Recorder(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Visit(String);
+        impl tracing::field::Visit for Visit {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                let _ = write!(self.0, "{}={value:?} ", field.name());
+            }
+        }
+        let mut visit = Visit(format!("{} ", event.metadata().target()));
+        event.record(&mut visit);
+        self.0.lock().unwrap().push(visit.0);
+    }
+}
