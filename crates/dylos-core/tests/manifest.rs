@@ -3,7 +3,7 @@
 use dylos_core::manifest::{FileMeta, SnapshotManifest, StepDurations, VmManifest};
 use dylos_core::{Error, LabSpec};
 use proptest::prelude::*;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::PathBuf;
 
@@ -84,7 +84,7 @@ fn step_durations_strategy() -> impl Strategy<Value = StepDurations> {
 
 fn manifest_strategy() -> impl Strategy<Value = SnapshotManifest> {
     (
-        prop::collection::hash_map("[a-z0-9]+", vm_manifest_strategy(), 0..3),
+        prop::collection::btree_map("[a-z0-9]+", vm_manifest_strategy(), 0..3),
         "[a-zA-Z0-9.-]+",
         "[a-zA-Z0-9 _-]+",
         any::<u64>(),
@@ -140,6 +140,34 @@ fn test_unsupported_version() {
             supported: 1
         })
     ));
+}
+
+#[test]
+fn test_reject_unknown_fields() {
+    let json = r#"{
+        "format_version": 1,
+        "lab_spec": { "nodes": [], "segments": [] },
+        "vms": {},
+        "firecracker_version": "1.17.0",
+        "host_cpu_model": "Intel",
+        "created_at_unix_ms": 123456789,
+        "step_durations_ms": {
+            "freeze": 1,
+            "pause": 2,
+            "snapshot": 3,
+            "resume": 4,
+            "thaw": 5
+        },
+        "unknown_field": "unexpected"
+    }"#;
+
+    let res = SnapshotManifest::from_json_str(json);
+    match res {
+        Err(Error::Json(err)) => {
+            assert!(err.to_string().contains("unknown field `unknown_field`"));
+        }
+        _ => panic!("Expected Error::Json for unknown field, got {res:?}"),
+    }
 }
 
 #[test]
@@ -214,14 +242,13 @@ fn test_reject_parent_path() {
 fn test_verify_integrity() {
     let content = b"hello world";
     let size = content.len() as u64;
-    // sha256 of "hello world"
     let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
 
     let manifest = SnapshotManifest {
         format_version: 1,
         lab_spec: valid_lab_spec(),
         vms: {
-            let mut vms = HashMap::new();
+            let mut vms = BTreeMap::new();
             vms.insert(
                 "router".to_string(),
                 VmManifest {
@@ -252,11 +279,9 @@ fn test_verify_integrity() {
         },
     };
 
-    // 1. Success
     let res = manifest.verify(|_| Ok(Cursor::new(content.to_vec())));
     assert!(res.is_ok());
 
-    // 2. Mismatch size
     let res_size_err = manifest.verify(|_| Ok(Cursor::new(b"hello".to_vec())));
     match res_size_err {
         Err(Error::IntegrityMismatch { actual_size, .. }) => {
@@ -265,12 +290,10 @@ fn test_verify_integrity() {
         _ => panic!("Expected IntegrityMismatch, got {res_size_err:?}"),
     }
 
-    // 3. Mismatch content
     let content_bad = b"hello w0rld";
     let res_sha_err = manifest.verify(|_| Ok(Cursor::new(content_bad.to_vec())));
     match res_sha_err {
         Err(Error::IntegrityMismatch { actual_sha256, .. }) => {
-            // we just check that it failed
             assert_ne!(actual_sha256, sha256);
         }
         _ => panic!("Expected IntegrityMismatch, got {res_sha_err:?}"),

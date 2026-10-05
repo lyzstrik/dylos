@@ -1,15 +1,16 @@
 use crate::{Error, LabSpec};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SnapshotManifest {
     pub format_version: u32,
     pub lab_spec: LabSpec,
-    pub vms: HashMap<String, VmManifest>,
+    pub vms: BTreeMap<String, VmManifest>,
     pub firecracker_version: String,
     pub host_cpu_model: String,
     pub created_at_unix_ms: u64,
@@ -17,6 +18,7 @@ pub struct SnapshotManifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct StepDurations {
     pub freeze: u64,
     pub pause: u64,
@@ -26,13 +28,23 @@ pub struct StepDurations {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct VmManifest {
     pub state_file: FileMeta,
     pub memory_file: FileMeta,
     pub disks: Vec<FileMeta>,
 }
 
+impl VmManifest {
+    fn files(&self) -> impl Iterator<Item = &FileMeta> {
+        std::iter::once(&self.state_file)
+            .chain(std::iter::once(&self.memory_file))
+            .chain(&self.disks)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct FileMeta {
     pub path: PathBuf,
     pub sha256: String,
@@ -45,8 +57,16 @@ struct VersionCheck {
 }
 
 impl SnapshotManifest {
-    #[allow(clippy::missing_errors_doc)]
+    /// Deserializes and validates a [`SnapshotManifest`] from a JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Json`] if JSON parsing fails,
+    /// [`Error::UnsupportedManifestVersion`] if `format_version` is not 1, or
+    /// [`Error::InvalidPath`] if any VM file path is absolute or contains parent components.
     pub fn from_json_str(json: &str) -> Result<Self, Error> {
+        // Read format_version before the full parse so an unknown version gives
+        // UnsupportedManifestVersion instead of a field error.
         let check: VersionCheck = serde_json::from_str(json)?;
         if check.format_version != 1 {
             return Err(Error::UnsupportedManifestVersion {
@@ -55,31 +75,41 @@ impl SnapshotManifest {
             });
         }
 
-        let manifest: SnapshotManifest = serde_json::from_str(json)?;
+        let manifest: Self = serde_json::from_str(json)?;
         manifest.validate_paths()?;
         Ok(manifest)
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    /// Serializes the [`SnapshotManifest`] to a compact JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPath`] if any VM file path is absolute or contains parent components,
+    /// or [`Error::Json`] if serialization fails.
     pub fn to_json_string(&self) -> Result<String, Error> {
         self.validate_paths()?;
         Ok(serde_json::to_string(self)?)
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    /// Serializes the [`SnapshotManifest`] to a pretty-printed JSON string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPath`] if any VM file path is absolute or contains parent components,
+    /// or [`Error::Json`] if serialization fails.
     pub fn to_json_string_pretty(&self) -> Result<String, Error> {
         self.validate_paths()?;
         Ok(serde_json::to_string_pretty(self)?)
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    /// Validates that all file paths in all VM manifests are safe relative paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidPath`] if any file path is absolute or contains parent components.
     pub fn validate_paths(&self) -> Result<(), Error> {
         for (vm_name, vm_manifest) in &self.vms {
-            let files = std::iter::once(&vm_manifest.state_file)
-                .chain(std::iter::once(&vm_manifest.memory_file))
-                .chain(vm_manifest.disks.iter());
-
-            for file in files {
+            for file in vm_manifest.files() {
                 Self::validate_single_path(vm_name, &file.path)?;
             }
         }
@@ -87,6 +117,7 @@ impl SnapshotManifest {
     }
 
     fn validate_single_path(vm_name: &str, path: &Path) -> Result<(), Error> {
+        // Paths are relative to the snapshot directory.
         if path.is_absolute() {
             return Err(Error::InvalidPath {
                 vm: vm_name.to_string(),
@@ -107,17 +138,19 @@ impl SnapshotManifest {
         Ok(())
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    /// Verifies the integrity of all VM files against their expected size and SHA-256 hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if opening or reading a file fails, or
+    /// [`Error::IntegrityMismatch`] if a file's size or SHA-256 checksum does not match.
     pub fn verify<R: Read>(
         &self,
         mut open: impl FnMut(&Path) -> std::io::Result<R>,
     ) -> Result<(), Error> {
+        // The reader is supplied by the caller to keep dylos-core free of file system access.
         for (vm_name, vm_manifest) in &self.vms {
-            let files = std::iter::once(&vm_manifest.state_file)
-                .chain(std::iter::once(&vm_manifest.memory_file))
-                .chain(vm_manifest.disks.iter());
-
-            for file in files {
+            for file in vm_manifest.files() {
                 let mut reader = open(&file.path).map_err(|e| Error::Io {
                     vm: vm_name.clone(),
                     path: file.path.clone(),
