@@ -249,6 +249,36 @@ fn test_net_setup_swapped_macs_on_declared_names() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn test_net_setup_declared_name_equal_to_a_parking_name() -> Result<(), Box<dyn Error>> {
+    if !can_unshare() {
+        return Ok(());
+    }
+    // `dytmp1` is a valid declared name: parking names must avoid it, or the final
+    // rename of the first NIC hits "File exists".
+    let cmdline = "dylos.if=dytmp1,02:00:00:00:00:01,fd00:1::1/64,10.0.1.1/24 \
+                   dylos.if=eth0,02:00:00:00:00:02,fd00:2::1/64,10.0.2.1/24";
+    let output = run_net_setup(
+        cmdline,
+        &[("eth0", "02:00:00:00:00:01"), ("eth1", "02:00:00:00:00:02")],
+    )?;
+    assert!(
+        output.status.success(),
+        "net-setup failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let addrs_json = stdout
+        .split("===ADDR===")
+        .nth(1)
+        .and_then(|s| s.split("===").next())
+        .ok_or("no addrs")?;
+    let addrs: Value = serde_json::from_str(addrs_json.trim())?;
+    assert_addrs(&addrs, "dytmp1", &["fd00:1::1/64", "10.0.1.1/24"])?;
+    assert_addrs(&addrs, "eth0", &["fd00:2::1/64", "10.0.2.1/24"])?;
+    Ok(())
+}
+
+#[test]
 fn test_net_setup_node_a() -> Result<(), Box<dyn Error>> {
     if !can_unshare() {
         return Ok(());

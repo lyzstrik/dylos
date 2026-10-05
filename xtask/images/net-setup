@@ -20,7 +20,22 @@ sysctl -qw net.ipv6.conf.default.autoconf=0
 
 # Renaming straight to the declared name fails when another NIC already owns it
 # (e.g. eth0/eth1 with swapped MACs), so park every matched NIC on a free name first.
+# A parking name must be neither an existing interface nor a declared name.
+DECLARED=" "
+for arg in $CMDLINE; do
+    case "$arg" in
+        dylos.if=*) val="${arg#dylos.if=}"; DECLARED="$DECLARED${val%%,*} " ;;
+    esac
+done
 N=0
+next_free_name() {
+    while :; do
+        CANDIDATE="dytmp$N"
+        N=$((N + 1))
+        case "$DECLARED" in *" $CANDIDATE "*) continue ;; esac
+        [ -e "/sys/class/net/$CANDIDATE" ] || return 0
+    done
+}
 for arg in $CMDLINE; do
     case "$arg" in
         dylos.if=*)
@@ -29,8 +44,8 @@ for arg in $CMDLINE; do
             MAC="${rest1%%,*}"
             for dir in /sys/class/net/*; do
                 if [ -f "$dir/address" ] && [ "$(cat "$dir/address")" = "$MAC" ]; then
-                    ip link set dev "${dir##*/}" name "dytmp$N"
-                    N=$((N + 1))
+                    next_free_name
+                    ip link set dev "${dir##*/}" name "$CANDIDATE"
                     break
                 fi
             done
