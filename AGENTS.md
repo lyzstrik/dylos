@@ -123,6 +123,7 @@ CI runs `just check`, so local and CI results must match.
 
 - Each acceptance criterion maps to at least one test, or the PR explains why not.
 - Tests in `crates/<crate>/tests/*.rs` through the public API (section 5); property tests (`proptest`) for pure logic in `dylos-core`.
+- Test data longer than a few lines (YAML lab specs, JSON, shell scripts) goes in `crates/<crate>/tests/fixtures/` as real files, loaded with `include_str!` or run by path. Only one-line snippets stay inline.
 - KVM/privileged tests are e2e tests (`just e2e`), skipped with an explicit message when `/dev/kvm` is missing.
 - **Never delete, weaken or `#[ignore]` a test to make a check pass.** If a test seems wrong, stop and ask.
 - No sleeps as synchronization: wait on a condition with a timeout.
