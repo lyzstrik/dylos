@@ -489,3 +489,88 @@ fn test_verify_interrupted() {
 
     assert!(res.is_ok(), "Expected OK despite Interrupted error");
 }
+
+/// A complete manifest with the given `format_version` text and `vms` body.
+fn manifest_json(version: &str, vms: &str) -> String {
+    format!(
+        r#"{{ {version}, "lab_spec": {{ "nodes": [], "segments": [] }}, "vms": {{ {vms} }},
+        "firecracker_version": "1.17.0", "host_cpu_model": "Intel", "created_at_unix_ms": 1,
+        "step_durations_ms": {{ "freeze": 1, "pause": 2, "snapshot": 3, "resume": 4, "thaw": 5 }} }}"#
+    )
+}
+
+fn vm_json(state_path: &str, extra_state_field: &str) -> String {
+    format!(
+        r#"{{ "state_file": {{ "path": {state_path:?}, "sha256": "a", "size": 1 {extra_state_field} }},
+        "memory_file": {{ "path": "mem", "sha256": "b", "size": 2 }}, "disks": [] }}"#
+    )
+}
+
+#[test]
+fn test_duplicate_version_key_is_rejected() {
+    let json = manifest_json(r#""format_version": 2, "format_version": 1"#, "");
+    assert!(matches!(
+        SnapshotManifest::from_json_str(&json),
+        Err(Error::Json(_))
+    ));
+    assert!(serde_json::from_str::<SnapshotManifest>(&json).is_err());
+}
+
+#[test]
+fn test_duplicate_nested_field_is_rejected() {
+    let vms = format!(r#""router": {}"#, vm_json("state", r#", "size": 3"#));
+    let json = manifest_json(r#""format_version": 1"#, &vms);
+    assert!(matches!(
+        SnapshotManifest::from_json_str(&json),
+        Err(Error::Json(_))
+    ));
+    assert!(serde_json::from_str::<SnapshotManifest>(&json).is_err());
+}
+
+#[test]
+fn test_duplicate_vm_name_is_rejected() {
+    let vm = vm_json("state", "");
+    let json = manifest_json(
+        r#""format_version": 1"#,
+        &format!(r#""a": {vm}, "a": {vm}"#),
+    );
+    let err = SnapshotManifest::from_json_str(&json).unwrap_err();
+    assert!(err.to_string().contains("duplicate VM `a`"), "{err}");
+    assert!(serde_json::from_str::<SnapshotManifest>(&json).is_err());
+}
+
+#[test]
+fn test_invalid_path_error_keeps_exact_vm_and_path() {
+    for (vm, path) in [
+        ("router", "../bad (must be.txt"),
+        ("router west", "../x"),
+        ("router:1", "/abs: y"),
+    ] {
+        let json = manifest_json(
+            r#""format_version": 1"#,
+            &format!("{vm:?}: {}", vm_json(path, "")),
+        );
+        match SnapshotManifest::from_json_str(&json) {
+            Err(Error::InvalidPath {
+                vm: got_vm,
+                path: got_path,
+            }) => {
+                assert_eq!(got_vm, vm);
+                assert_eq!(got_path, PathBuf::from(path));
+            }
+            other => panic!("expected InvalidPath for {vm:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn test_unknown_version_with_other_schema_is_reported_as_version() {
+    let json = r#"{ "format_version": 7, "something_else": true }"#;
+    assert!(matches!(
+        SnapshotManifest::from_json_str(json),
+        Err(Error::UnsupportedManifestVersion {
+            found: 7,
+            supported: 1
+        })
+    ));
+}

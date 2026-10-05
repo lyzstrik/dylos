@@ -50,11 +50,22 @@ pub struct FileMeta {
     pub size: u64,
 }
 
+const FORMAT_VERSION: u32 = 1;
+
+/// Reads only `format_version`, so an unknown version is reported as such even when the
+/// rest of the document follows another schema. Other fields are ignored here, but a
+/// duplicated `format_version` is still rejected.
+#[derive(Deserialize)]
+struct VersionProbe {
+    format_version: u32,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSnapshotManifest {
     format_version: u32,
     lab_spec: LabSpec,
+    #[serde(deserialize_with = "unique_keys")]
     vms: BTreeMap<String, VmManifest>,
     firecracker_version: String,
     host_cpu_model: String,
@@ -62,41 +73,72 @@ struct RawSnapshotManifest {
     step_durations_ms: StepDurations,
 }
 
+/// A JSON object with a repeated VM name must be rejected: a plain `BTreeMap` would keep
+/// the last entry silently.
+fn unique_keys<'de, D>(deserializer: D) -> Result<BTreeMap<String, VmManifest>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct UniqueKeys;
+
+    impl<'de> serde::de::Visitor<'de> for UniqueKeys {
+        type Value = BTreeMap<String, VmManifest>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of VM names to VM manifests")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((name, vm)) = map.next_entry::<String, VmManifest>()? {
+                if out.contains_key(&name) {
+                    return Err(serde::de::Error::custom(format!("duplicate VM `{name}`")));
+                }
+                out.insert(name, vm);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(UniqueKeys)
+}
+
+impl RawSnapshotManifest {
+    fn into_checked(self) -> Result<SnapshotManifest, Error> {
+        if self.format_version != FORMAT_VERSION {
+            return Err(Error::UnsupportedManifestVersion {
+                found: self.format_version,
+                supported: FORMAT_VERSION,
+            });
+        }
+        let manifest = SnapshotManifest {
+            format_version: self.format_version,
+            lab_spec: self.lab_spec,
+            vms: self.vms,
+            firecracker_version: self.firecracker_version,
+            host_cpu_model: self.host_cpu_model,
+            created_at_unix_ms: self.created_at_unix_ms,
+            step_durations_ms: self.step_durations_ms,
+        };
+        manifest.validate_paths()?;
+        Ok(manifest)
+    }
+}
+
+/// Direct serde deserialization applies the same version and path checks, but in a single
+/// pass: an unknown version with an incompatible schema surfaces as a schema error. Use
+/// [`SnapshotManifest::from_json_str`] to get the typed errors.
 impl<'de> Deserialize<'de> for SnapshotManifest {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
-        let version = value
-            .get("format_version")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| serde::de::Error::missing_field("format_version"))?;
-
-        if version != 1 {
-            return Err(serde::de::Error::custom(format!(
-                "unsupported manifest version {version}, only version 1 is supported"
-            )));
-        }
-
-        let raw: RawSnapshotManifest =
-            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-
-        let manifest = SnapshotManifest {
-            format_version: raw.format_version,
-            lab_spec: raw.lab_spec,
-            vms: raw.vms,
-            firecracker_version: raw.firecracker_version,
-            host_cpu_model: raw.host_cpu_model,
-            created_at_unix_ms: raw.created_at_unix_ms,
-            step_durations_ms: raw.step_durations_ms,
-        };
-
-        manifest
-            .validate_paths()
-            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
-
-        Ok(manifest)
+        RawSnapshotManifest::deserialize(deserializer)?
+            .into_checked()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -105,45 +147,20 @@ impl SnapshotManifest {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Json`] if JSON parsing fails,
-    /// [`Error::UnsupportedManifestVersion`] if `format_version` is not 1, or
-    /// [`Error::InvalidPath`] if any VM file path is absolute or contains parent components.
+    /// Returns [`Error::UnsupportedManifestVersion`] if `format_version` is not 1 (checked
+    /// before the rest of the schema), [`Error::Json`] if the JSON is malformed or does not
+    /// match the schema (including duplicate fields or VM names), or [`Error::InvalidPath`]
+    /// if any VM file path is absolute or contains parent components.
     pub fn from_json_str(json: &str) -> Result<Self, Error> {
-        let manifest: Self = serde_json::from_str(json).map_err(|e| {
-            let msg = e.to_string();
-
-            let found_opt = msg
-                .starts_with("unsupported manifest version ")
-                .then(|| msg.split_whitespace().nth(3))
-                .flatten()
-                .and_then(|s| s.replace(',', "").parse::<u32>().ok());
-
-            if let Some(found) = found_opt {
-                return Error::UnsupportedManifestVersion {
-                    found,
-                    supported: 1,
-                };
-            }
-
-            let path_err_opt = msg
-                .starts_with("invalid path in VM ")
-                .then(|| msg.split_whitespace().nth(4))
-                .flatten()
-                .map(|s| s.replace(':', ""))
-                .and_then(|vm| msg.find(&format!("{vm}: ")).map(|p| (vm, p)));
-
-            if let Some((vm, path_start)) = path_err_opt {
-                let path_str = &msg[path_start + vm.len() + 2..];
-                let path_str = path_str.split(" (must be").next().unwrap_or(path_str);
-                return Error::InvalidPath {
-                    vm,
-                    path: std::path::PathBuf::from(path_str),
-                };
-            }
-
-            Error::Json(e)
-        })?;
-        Ok(manifest)
+        let probe: VersionProbe = serde_json::from_str(json)?;
+        if probe.format_version != FORMAT_VERSION {
+            return Err(Error::UnsupportedManifestVersion {
+                found: probe.format_version,
+                supported: FORMAT_VERSION,
+            });
+        }
+        let raw: RawSnapshotManifest = serde_json::from_str(json)?;
+        raw.into_checked()
     }
 
     /// Serializes the [`SnapshotManifest`] to a compact JSON string.
@@ -153,10 +170,10 @@ impl SnapshotManifest {
     /// Returns [`Error::InvalidPath`] if any VM file path is absolute or contains parent components,
     /// or [`Error::Json`] if serialization fails.
     pub fn to_json_string(&self) -> Result<String, Error> {
-        if self.format_version != 1 {
+        if self.format_version != FORMAT_VERSION {
             return Err(Error::UnsupportedManifestVersion {
                 found: self.format_version,
-                supported: 1,
+                supported: FORMAT_VERSION,
             });
         }
         self.validate_paths()?;
@@ -170,10 +187,10 @@ impl SnapshotManifest {
     /// Returns [`Error::InvalidPath`] if any VM file path is absolute or contains parent components,
     /// or [`Error::Json`] if serialization fails.
     pub fn to_json_string_pretty(&self) -> Result<String, Error> {
-        if self.format_version != 1 {
+        if self.format_version != FORMAT_VERSION {
             return Err(Error::UnsupportedManifestVersion {
                 found: self.format_version,
-                supported: 1,
+                supported: FORMAT_VERSION,
             });
         }
         self.validate_paths()?;
