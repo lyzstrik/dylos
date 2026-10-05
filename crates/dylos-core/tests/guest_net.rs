@@ -95,12 +95,12 @@ fn test_length_budget() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_mac_collision_validation() -> Result<(), Box<dyn Error>> {
-    // We found a hash collision on the first 5 bytes for these two inputs:
-    let node1 = "n235507";
-    let node2 = "n1056408";
+    // Found by brute force: these names collide on the 40 hash bits used for the MAC.
+    let node1 = "n34737";
+    let node2 = "n405021";
 
-    let mac1 = dylos_core::guest_net::mac_from_hash_input(format!("{node1}:eth0").as_bytes());
-    let mac2 = dylos_core::guest_net::mac_from_hash_input(format!("{node2}:eth0").as_bytes());
+    let mac1 = dylos_core::guest_net::mac_for_interface(node1, "eth0");
+    let mac2 = dylos_core::guest_net::mac_for_interface(node2, "eth0");
     assert_eq!(mac1, mac2);
 
     let yaml = format!(

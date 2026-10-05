@@ -12,9 +12,9 @@ use std::process::{Command, Output};
 
 type TestResult = Result<(), Box<dyn StdError>>;
 
-// Two node names whose "<node>:eth0" MACs collide (found by search, 40 bits of hash).
-const COLLIDING_A: &str = "n235507";
-const COLLIDING_B: &str = "n1056408";
+// Two node names whose eth0 MACs collide (found by brute force over the 40 hash bits).
+const COLLIDING_A: &str = "n34737";
+const COLLIDING_B: &str = "n405021";
 
 fn abc() -> Result<LabSpec, Box<dyn StdError>> {
     let yaml = std::fs::read_to_string(format!(

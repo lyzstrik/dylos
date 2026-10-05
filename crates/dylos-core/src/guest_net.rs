@@ -7,10 +7,7 @@ use std::fmt::Write;
 /// (`x86_64` has a 4096-byte limit for the entire command line)
 pub const BOOT_ARGS_BUDGET: usize = 2048;
 
-/// Internal helper to generate a MAC from raw hash bytes, exposed for testing.
-#[doc(hidden)]
-#[must_use]
-pub fn mac_from_hash_input(input: &[u8]) -> String {
+fn mac_from_hash_input(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input);
     let result = hasher.finalize();
@@ -23,12 +20,16 @@ pub fn mac_from_hash_input(input: &[u8]) -> String {
 }
 
 /// Derives a deterministic, locally administered unicast MAC address.
+///
+/// Each name is length-prefixed before hashing: with a plain separator, node `a:b` with
+/// interface `c` and node `a` with interface `b:c` would hash the same bytes.
 #[must_use]
 pub fn mac_for_interface(node_name: &str, iface_name: &str) -> String {
     let mut input = Vec::new();
-    input.extend_from_slice(node_name.as_bytes());
-    input.push(b':');
-    input.extend_from_slice(iface_name.as_bytes());
+    for name in [node_name, iface_name] {
+        input.extend_from_slice(&(name.len() as u64).to_le_bytes());
+        input.extend_from_slice(name.as_bytes());
+    }
     mac_from_hash_input(&input)
 }
 
