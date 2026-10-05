@@ -1,9 +1,22 @@
 use ipnet::IpNet;
 
+#[derive(Debug)]
+pub struct MacCollisionInfo {
+    pub segment: String,
+    pub node1: String,
+    pub iface1: String,
+    pub node2: String,
+    pub iface2: String,
+    pub mac: String,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("parse error: {0}")]
     Parse(#[from] serde_saphyr::Error),
+
+    #[error("formatting error: {0}")]
+    Format(#[from] std::fmt::Error),
 
     #[error("{path}: duplicate node name {name:?}")]
     DuplicateNodeName { path: String, name: String },
@@ -51,6 +64,9 @@ pub enum Error {
 
     #[error("{path}: route destination and gateway families do not match")]
     FamilyMismatch { path: String },
+
+    #[error("MAC collision in segment {0:?}")]
+    MacCollision(Box<MacCollisionInfo>),
 
     #[error(
         "boot parameters for node {node:?} exceed the {budget} bytes budget (actual: {actual})"
