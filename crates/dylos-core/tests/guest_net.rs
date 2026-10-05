@@ -103,30 +103,9 @@ fn test_mac_collision_validation() -> Result<(), Box<dyn Error>> {
     let mac2 = dylos_core::guest_net::mac_for_interface(node2, "eth0");
     assert_eq!(mac1, mac2);
 
-    let yaml = format!(
-        "
-nodes:
-  - name: {node1}
-    image: dummy
-    vcpus: 1
-    memory: 256
-    interfaces:
-      - name: eth0
-        segment: test
-        ipv6: fd00::1/64
-  - name: {node2}
-    image: dummy
-    vcpus: 1
-    memory: 256
-    interfaces:
-      - name: eth0
-        segment: test
-        ipv6: fd00::2/64
-segments:
-  - name: test
-    ipv6: fd00::/64
-"
-    );
+    let yaml = include_str!("fixtures/mac_collision.yaml")
+        .replace("NODE1", node1)
+        .replace("NODE2", node2);
 
     let spec = LabSpec::from_yaml_str(&yaml)?;
     let result = dylos_core::guest_net::validate_macs(&spec);

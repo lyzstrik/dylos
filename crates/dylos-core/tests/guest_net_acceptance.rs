@@ -46,32 +46,13 @@ fn rt_args(args: &str) -> Vec<&str> {
 fn collision_lab(seg_a: &str, seg_b: &str) -> Result<LabSpec, Box<dyn StdError>> {
     let ip = |seg: &str, host: u8| format!("fd00:{}::{host}/64", &seg[1..]);
     let (ip_a, ip_b) = (ip(seg_a, 1), ip(seg_b, 2));
-    let yaml = format!(
-        "
-segments:
-  - name: s1
-    ipv6: fd00:1::/64
-  - name: s2
-    ipv6: fd00:2::/64
-nodes:
-  - name: {COLLIDING_A}
-    image: x
-    vcpus: 1
-    memory: 128
-    interfaces:
-      - name: eth0
-        segment: {seg_a}
-        ipv6: {ip_a}
-  - name: {COLLIDING_B}
-    image: x
-    vcpus: 1
-    memory: 128
-    interfaces:
-      - name: eth0
-        segment: {seg_b}
-        ipv6: {ip_b}
-"
-    );
+    let yaml = include_str!("fixtures/collision_lab.yaml")
+        .replace("NODE_A", COLLIDING_A)
+        .replace("NODE_B", COLLIDING_B)
+        .replace("SEG_A", seg_a)
+        .replace("SEG_B", seg_b)
+        .replace("IP_A", &ip_a)
+        .replace("IP_B", &ip_b);
     Ok(LabSpec::from_yaml_str(&yaml)?)
 }
 

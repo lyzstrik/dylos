@@ -3,7 +3,6 @@ use dylos_core::guest_net::{boot_args, mac_for_interface};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::error::Error;
-use std::fmt::Write;
 use std::process::Command;
 
 fn run_net_setup(
@@ -14,51 +13,22 @@ fn run_net_setup(
     let cmdline_path = temp_dir.path().join("cmdline");
     std::fs::write(&cmdline_path, cmdline)?;
 
-    let mut script = String::from("#!/bin/sh\nset -e\nmount -t sysfs none /sys\n");
-    for (name, mac) in interfaces {
-        writeln!(&mut script, "ip link add {name} type dummy")?;
-        writeln!(&mut script, "ip link set {name} address {mac}")?;
-    }
-
+    let script_path = format!(
+        "{}/tests/fixtures/net_setup_run.sh",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let net_setup_path = format!(
         "{}/../../xtask/images/net-setup",
         env!("CARGO_MANIFEST_DIR")
     );
-    writeln!(
-        &mut script,
-        "$(realpath {net_setup_path}) {}",
-        cmdline_path.display()
-    )?;
-
-    script.push_str(
-        r#"
-echo "===ADDR==="
-ip -j addr show
-echo "===ROUTE4==="
-ip -j -4 route show
-echo "===ROUTE6==="
-ip -j -6 route show
-echo "===SYSCTL==="
-sysctl -n net.ipv6.conf.all.accept_dad
-sysctl -n net.ipv6.conf.eth0.accept_dad
-sysctl -n net.ipv6.conf.all.accept_ra
-sysctl -n net.ipv6.conf.eth0.accept_ra
-sysctl -n net.ipv6.conf.all.autoconf
-sysctl -n net.ipv6.conf.eth0.autoconf
-sysctl -n net.ipv6.conf.all.forwarding
-sysctl -n net.ipv4.ip_forward
-"#,
-    );
-
-    let script_path = temp_dir.path().join("test_run.sh");
-    std::fs::write(&script_path, &script)?;
-    Command::new("chmod")
-        .args(["+x", script_path.to_str().ok_or("invalid path")?])
-        .status()?;
-
-    Ok(Command::new("unshare")
-        .args(["-Urnm", script_path.to_str().ok_or("invalid path")?])
-        .output()?)
+    let mut command = Command::new("unshare");
+    command
+        .args(["-Urnm", "sh", &script_path, &net_setup_path])
+        .arg(&cmdline_path);
+    for (name, mac) in interfaces {
+        command.args([name, mac]);
+    }
+    Ok(command.output()?)
 }
 
 fn can_unshare() -> bool {
