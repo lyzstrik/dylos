@@ -1,0 +1,21 @@
+{
+    "format_version": 1,
+    "lab_spec": { "nodes": [], "segments": [] },
+    "vms": {
+        "router": {
+            "state_file": { "path": "/absolute/path", "sha256": "abc", "size": 123 },
+            "memory_file": { "path": "mem", "sha256": "def", "size": 456 },
+            "disks": []
+        }
+    },
+    "firecracker_version": "1.17.0",
+    "host_cpu_model": "Intel",
+    "created_at_unix_ms": 123456789,
+    "step_durations_ms": {
+        "freeze": 1,
+        "pause": 2,
+        "snapshot": 3,
+        "resume": 4,
+        "thaw": 5
+    }
+}
