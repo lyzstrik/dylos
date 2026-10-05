@@ -76,4 +76,35 @@ pub enum Error {
         budget: usize,
         actual: usize,
     },
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("unsupported manifest version {found}, only version {supported} is supported")]
+    UnsupportedManifestVersion { found: u32, supported: u32 },
+
+    #[error("invalid path in VM {vm}: {path} (must be relative and have no parent components)")]
+    InvalidPath {
+        vm: String,
+        path: std::path::PathBuf,
+    },
+
+    #[error(
+        "integrity mismatch for VM {vm} file {path}: size expected {expected_size}, actual {actual_size}, sha256 expected {expected_sha256}, actual {actual_sha256}"
+    )]
+    IntegrityMismatch {
+        vm: String,
+        path: std::path::PathBuf,
+        expected_size: u64,
+        actual_size: u64,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+
+    #[error("io error for VM {vm} file {path}: {source}")]
+    Io {
+        vm: String,
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }

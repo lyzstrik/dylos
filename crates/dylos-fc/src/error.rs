@@ -78,6 +78,8 @@ pub enum Error {
         #[source]
         source: hyper::http::uri::InvalidUri,
     },
+    #[error("invalid id {id:?}: must be non-empty and contain only [A-Za-z0-9_-]")]
+    InvalidId { id: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
