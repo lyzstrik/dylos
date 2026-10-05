@@ -8,8 +8,8 @@ fn test_mac_determinism() {
     let mac1 = mac_for_interface("A", "eth0");
     let mac2 = mac_for_interface("A", "eth0");
     assert_eq!(mac1, mac2);
-    assert_eq!(mac1.len(), 17);
-    assert!(mac1.starts_with("02:"));
+    assert_eq!(mac1.to_string().len(), 17);
+    assert!(mac1.to_string().starts_with("02:"));
 
     let mac3 = mac_for_interface("B", "eth0");
     let mac4 = mac_for_interface("A", "eth1");
@@ -112,7 +112,7 @@ fn test_mac_collision_validation() -> Result<(), Box<dyn Error>> {
     assert!(result.is_err());
     if let Err(dylos_core::Error::MacCollision(info)) = result {
         assert_eq!(info.segment, "test");
-        assert_eq!(info.mac, mac1);
+        assert_eq!(info.mac, mac1.to_string());
         assert_eq!(info.iface1, "eth0");
         assert_eq!(info.iface2, "eth0");
         assert!(

@@ -63,7 +63,7 @@ fn mac_is_locally_administered_unicast_lowercase_and_well_formed() {
         ("B", "eth1"),
         ("node-with-long-name", "wan0"),
     ] {
-        let mac = mac_for_interface(n, i);
+        let mac = mac_for_interface(n, i).to_string();
         let octets: Vec<&str> = mac.split(':').collect();
         assert_eq!(octets.len(), 6, "{mac}");
         assert!(
@@ -80,14 +80,20 @@ fn mac_is_locally_administered_unicast_lowercase_and_well_formed() {
 
 #[test]
 fn mac_depends_on_node_and_interface_roles_and_boundaries() {
-    assert_ne!(mac_for_interface("A", "B"), mac_for_interface("B", "A"));
+    assert_ne!(
+        mac_for_interface("A", "B").to_string(),
+        mac_for_interface("B", "A").to_string()
+    );
     // A plain "<node>:<iface>" concatenation maps both pairs to the same string.
     assert_ne!(
-        mac_for_interface("a:b", "c"),
-        mac_for_interface("a", "b:c"),
+        mac_for_interface("a:b", "c").to_string(),
+        mac_for_interface("a", "b:c").to_string(),
         "node/interface boundary is ambiguous"
     );
-    assert_ne!(mac_for_interface("ab", "c0"), mac_for_interface("abc", "0"));
+    assert_ne!(
+        mac_for_interface("ab", "c0").to_string(),
+        mac_for_interface("abc", "0").to_string()
+    );
 }
 
 #[test]
@@ -96,7 +102,7 @@ fn macs_of_abc_are_distinct_and_independent_of_lab_content() -> TestResult {
     let mut seen = HashSet::new();
     for n in &lab.nodes {
         for i in &n.interfaces {
-            assert!(seen.insert(mac_for_interface(&n.name, &i.name)));
+            assert!(seen.insert(mac_for_interface(&n.name, &i.name).to_string()));
         }
     }
     assert_eq!(seen.len(), 4);
@@ -106,7 +112,7 @@ fn macs_of_abc_are_distinct_and_independent_of_lab_content() -> TestResult {
     for n in &reordered.nodes {
         let args = boot_args(&reordered, n)?;
         for i in &n.interfaces {
-            assert!(args.contains(&mac_for_interface(&n.name, &i.name)));
+            assert!(args.contains(&mac_for_interface(&n.name, &i.name).to_string()));
         }
         assert_eq!(args, boot_args(&lab, node(&lab, &n.name)?)?);
     }
@@ -125,7 +131,7 @@ fn boot_args_are_deterministic() -> TestResult {
 #[test]
 fn boot_args_exact_for_node_a() -> TestResult {
     let lab = abc()?;
-    let mac = mac_for_interface("A", "eth0");
+    let mac = mac_for_interface("A", "eth0").to_string();
     assert_eq!(
         boot_args(&lab, node(&lab, "A")?)?,
         format!(
@@ -140,8 +146,8 @@ fn boot_args_exact_for_node_a() -> TestResult {
 #[test]
 fn boot_args_exact_for_router_b_keeps_interface_order() -> TestResult {
     let lab = abc()?;
-    let m0 = mac_for_interface("B", "eth0");
-    let m1 = mac_for_interface("B", "eth1");
+    let m0 = mac_for_interface("B", "eth0").to_string();
+    let m1 = mac_for_interface("B", "eth1").to_string();
     assert_eq!(
         boot_args(&lab, node(&lab, "B")?)?,
         format!(
@@ -300,8 +306,8 @@ fn boot_args_budget_is_inclusive_and_error_reports_sizes() -> TestResult {
 #[test]
 fn mac_collision_in_one_segment_is_rejected_by_validate_and_boot_args() -> TestResult {
     assert_eq!(
-        mac_for_interface(COLLIDING_A, "eth0"),
-        mac_for_interface(COLLIDING_B, "eth0")
+        mac_for_interface(COLLIDING_A, "eth0").to_string(),
+        mac_for_interface(COLLIDING_B, "eth0").to_string()
     );
     let lab = collision_lab("s1", "s1")?;
     match validate_macs(&lab) {
@@ -480,7 +486,7 @@ fn script_configures_each_abc_node_with_exactly_the_declared_addresses() -> Test
         let macs: Vec<String> = n
             .interfaces
             .iter()
-            .map(|i| mac_for_interface(&n.name, &i.name))
+            .map(|i| mac_for_interface(&n.name, &i.name).to_string())
             .collect();
         let mac_refs: Vec<&str> = macs.iter().map(String::as_str).collect();
         let run = run_net_setup(&boot_args(&lab, n)?, &mac_refs, &[])?;
@@ -519,8 +525,8 @@ fn script_matches_interfaces_by_mac_not_by_enumeration_order() -> TestResult {
     }
     let lab = abc()?;
     let b = node(&lab, "B")?;
-    let m0 = mac_for_interface("B", "eth0");
-    let m1 = mac_for_interface("B", "eth1");
+    let m0 = mac_for_interface("B", "eth0").to_string();
+    let m1 = mac_for_interface("B", "eth1").to_string();
     // dummy0 carries eth1's MAC, so an implementation assigning by index swaps the networks.
     let run = run_net_setup(&boot_args(&lab, b)?, &[&m1, &m0], &[])?;
     assert_eq!(run.rc()?, 0, "{}", run.stderr());
@@ -543,8 +549,8 @@ fn script_static_ipv6_has_no_dad_and_link_local_is_eui64() -> TestResult {
     }
     let lab = abc()?;
     let b = node(&lab, "B")?;
-    let m0 = mac_for_interface("B", "eth0");
-    let m1 = mac_for_interface("B", "eth1");
+    let m0 = mac_for_interface("B", "eth0").to_string();
+    let m1 = mac_for_interface("B", "eth1").to_string();
     let run = run_net_setup(&boot_args(&lab, b)?, &[&m0, &m1], &SYSCTL_KEYS)?;
     assert_eq!(run.rc()?, 0, "{}", run.stderr());
     let addrs = run.json("ADDR")?;
@@ -591,7 +597,7 @@ fn script_installs_exactly_the_declared_gateway_routes_per_family() -> TestResul
         ),
     ] {
         let n = node(&lab, name)?;
-        let mac = mac_for_interface(name, "eth0");
+        let mac = mac_for_interface(name, "eth0").to_string();
         let run = run_net_setup(&boot_args(&lab, n)?, &[&mac], &[])?;
         assert_eq!(run.rc()?, 0, "{name}: {}", run.stderr());
         for (sec, dst, gw) in [("R6", dst6, gw6), ("R4", dst4, gw4)] {
@@ -623,7 +629,7 @@ fn script_forwarding_follows_the_fwd_flag_for_both_families() -> TestResult {
         let macs: Vec<String> = n
             .interfaces
             .iter()
-            .map(|i| mac_for_interface(name, &i.name))
+            .map(|i| mac_for_interface(name, &i.name).to_string())
             .collect();
         let refs: Vec<&str> = macs.iter().map(String::as_str).collect();
         let run = run_net_setup(&boot_args(&lab, n)?, &refs, &keys)?;
@@ -658,7 +664,7 @@ fn script_ignores_foreign_arguments_and_trailing_newline() -> TestResult {
     }
     let lab = abc()?;
     let a = node(&lab, "A")?;
-    let mac = mac_for_interface("A", "eth0");
+    let mac = mac_for_interface("A", "eth0").to_string();
     let cmdline = format!(
         "console=ttyS0 reboot=k panic=1 root=/dev/vda {} quiet\n",
         boot_args(&lab, a)?

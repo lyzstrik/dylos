@@ -72,7 +72,7 @@ fn run_node(
     let declared: Vec<String> = n.interfaces.iter().map(|i| i.name.clone()).collect();
     let macs: Vec<String> = declared
         .iter()
-        .map(|i| mac_for_interface(node, i))
+        .map(|i| mac_for_interface(node, i).to_string())
         .collect();
     let mut interfaces: Vec<(&str, &str)> = initial_names
         .iter()

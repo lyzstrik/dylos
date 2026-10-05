@@ -1,5 +1,5 @@
+use crate::MacAddr;
 use crate::{Error, LabSpec, Node};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt::Write;
 
@@ -7,30 +7,18 @@ use std::fmt::Write;
 /// (`x86_64` has a 4096-byte limit for the entire command line)
 pub const BOOT_ARGS_BUDGET: usize = 2048;
 
-fn mac_from_hash_input(input: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input);
-    let result = hasher.finalize();
-
-    // 02 is locally administered unicast
-    format!(
-        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        result[0], result[1], result[2], result[3], result[4]
-    )
-}
-
 /// Derives a deterministic, locally administered unicast MAC address.
 ///
 /// Each name is length-prefixed before hashing: with a plain separator, node `a:b` with
 /// interface `c` and node `a` with interface `b:c` would hash the same bytes.
 #[must_use]
-pub fn mac_for_interface(node_name: &str, iface_name: &str) -> String {
+pub fn mac_for_interface(node_name: &str, iface_name: &str) -> MacAddr {
     let mut input = Vec::new();
     for name in [node_name, iface_name] {
         input.extend_from_slice(&(name.len() as u64).to_le_bytes());
         input.extend_from_slice(name.as_bytes());
     }
-    mac_from_hash_input(&input)
+    MacAddr::from_seed(&input)
 }
 
 /// Validates that MAC addresses are unique within each segment.
@@ -38,7 +26,7 @@ pub fn mac_for_interface(node_name: &str, iface_name: &str) -> String {
 /// # Errors
 /// Returns an error if two interfaces on the same segment generate the same MAC address.
 pub fn validate_macs(lab: &LabSpec) -> Result<(), Error> {
-    let mut segments: HashMap<&str, HashMap<String, (String, String)>> = HashMap::new();
+    let mut segments: HashMap<&str, HashMap<MacAddr, (String, String)>> = HashMap::new();
 
     for node in &lab.nodes {
         for iface in &node.interfaces {
@@ -53,7 +41,7 @@ pub fn validate_macs(lab: &LabSpec) -> Result<(), Error> {
                         iface1: existing.1.clone(),
                         node2: node.name.clone(),
                         iface2: iface.name.clone(),
-                        mac,
+                        mac: mac.to_string(),
                     },
                 )));
             }
