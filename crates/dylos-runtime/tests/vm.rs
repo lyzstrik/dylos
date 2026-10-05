@@ -7,7 +7,7 @@ use std::time::Duration;
 use dylos_fc::config::{ActionType, InstanceActionInfo};
 use dylos_runtime::jailer::ChrootFile;
 use dylos_runtime::{Error, ProcessState, Timeouts, Vm, VmSpec};
-use support::{Captured, Mode, Sandbox};
+use support::{Captured, Mode, Sandbox, wait_until};
 
 #[test]
 fn fake_jailer_entry() {
@@ -62,6 +62,7 @@ async fn launch_waits_for_api_and_shutdown_is_graceful_and_idempotent() {
     let root = vm.paths().root.clone();
     assert!(root.join("vmlinux.bin").exists());
     assert!(vm.paths().api_socket().exists());
+    assert!(vm.paths().cgroup_dir.is_dir());
 
     vm.shutdown().await.unwrap();
     assert_eq!(exit_state(&vm).await, exited(0));
@@ -154,18 +155,116 @@ async fn second_launch_of_same_vm_is_refused_and_first_is_untouched() {
 }
 
 #[tokio::test]
-async fn drop_without_shutdown_kills_and_removes_the_jail() {
+async fn drop_without_shutdown_kills_reaps_and_removes_jail_and_cgroup() {
     let sandbox = Sandbox::new(Mode::IgnoreTerm);
     let vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
-    let proc_stat = format!("/proc/{}/stat", vm.pid().unwrap());
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{}", vm.pid().unwrap()));
+    let paths = vm.paths().clone();
+    assert!(paths.cgroup_dir.is_dir());
     drop(vm);
+    // A zombie still has its /proc entry, so this also requires the process to be reaped.
+    wait_until(
+        "the dropped VM is reaped and its jail and cgroup removed",
+        Duration::from_secs(5),
+        || !proc_dir.exists() && !paths.jail_dir.exists() && !paths.cgroup_dir.exists(),
+    )
+    .await;
     sandbox.assert_no_jail_left();
-    // SIGKILL lands once the runtime drops the aborted supervisor and its child.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while std::fs::read_to_string(&proc_stat).is_ok_and(|s| !s.contains(") Z ")) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("process still running after drop");
+}
+
+#[tokio::test]
+async fn stalled_ctrl_alt_del_does_not_block_shutdown() {
+    let sandbox = Sandbox::new(Mode::StallActions);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), vm.shutdown())
+        .await
+        .expect("shutdown blocked on an unanswered SendCtrlAltDel")
+        .unwrap();
+    assert_eq!(exit_state(&vm).await, killed_by(15));
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn shutdown_of_a_cleaned_handle_leaves_its_replacement_intact() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut first = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    first.shutdown().await.unwrap();
+    let mut second = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+
+    first.shutdown().await.unwrap();
+    assert!(second.paths().api_socket().exists());
+    assert!(second.paths().cgroup_dir.is_dir());
+    let _: Option<serde_json::Value> = second.client().get("/").await.unwrap();
+    second.shutdown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn concurrent_launches_of_same_vm_have_one_winner() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let spec = spec(&sandbox);
+    let (a, b) = tokio::join!(
+        Vm::launch(&sandbox.config, &spec),
+        Vm::launch(&sandbox.config, &spec)
+    );
+    let (wins, losses): (Vec<_>, Vec<_>) = [a, b].into_iter().partition(Result::is_ok);
+    assert_eq!((wins.len(), losses.len()), (1, 1));
+    let mut winner = wins.into_iter().next().unwrap().unwrap();
+    let err = losses.into_iter().next().unwrap().err().unwrap();
+    assert!(matches!(err, Error::JailExists { .. }), "{err}");
+    assert!(winner.paths().root.join("vmlinux.bin").exists());
+    let _: Option<serde_json::Value> = winner.client().get("/").await.unwrap();
+    winner.shutdown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn cancelled_launch_leaves_no_jail_and_retry_works() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let spec = spec(&sandbox);
+    let jail = sandbox.jail_dir("lab1-web");
+    // Polled first, so the launch is dropped as soon as the jail directory appears, while the
+    // chroot is still being prepared.
+    let cancelled = tokio::select! {
+        biased;
+        () = wait_until("the jail is claimed", Duration::from_secs(5), || jail.exists()) => true,
+        _ = Vm::launch(&sandbox.config, &spec) => false,
+    };
+    assert!(cancelled, "launch completed before cancellation");
+    wait_until(
+        "the cancelled launch is rolled back",
+        Duration::from_secs(5),
+        || !jail.exists(),
+    )
+    .await;
+    let mut vm = Vm::launch(&sandbox.config, &spec).await.unwrap();
+    vm.shutdown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn exit_with_readiness_request_in_flight_is_reported_at_once() {
+    let sandbox = Sandbox::new(Mode::StallReadyThenExit);
+    let mut spec = spec(&sandbox);
+    spec.timeouts.ready = Duration::from_secs(30);
+    let err = tokio::time::timeout(Duration::from_secs(10), Vm::launch(&sandbox.config, &spec))
+        .await
+        .expect("exit not noticed while the readiness request was in flight")
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, Error::ExitedDuringStart { state, .. } if *state == exited(5)),
+        "{err}"
+    );
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn zero_metrics_poll_is_refused_before_spawning() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut spec = spec(&sandbox);
+    spec.timeouts.metrics_poll = Duration::ZERO;
+    let err = Vm::launch(&sandbox.config, &spec).await.err().unwrap();
+    assert!(matches!(err, Error::ZeroMetricsPoll { .. }), "{err}");
+    sandbox.assert_no_jail_left();
 }

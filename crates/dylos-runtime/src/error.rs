@@ -35,6 +35,15 @@ pub enum Error {
         socket: PathBuf,
         timeout: Duration,
     },
+    #[error("VM {id}: {task} task failed")]
+    Task {
+        id: String,
+        task: &'static str,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("VM {id}: metrics_poll must not be zero")]
+    ZeroMetricsPoll { id: String },
     #[error("VM {id}: process still alive {timeout:?} after SIGKILL")]
     KillTimeout { id: String, timeout: Duration },
 }

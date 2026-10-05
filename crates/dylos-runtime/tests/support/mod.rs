@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use dylos_runtime::jailer::JailerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,6 +30,11 @@ pub enum Mode {
     NoSocket,
     /// Exits with status 3 at once.
     ExitAtOnce,
+    /// Answers `GET /` but never answers `PUT /actions`; dies on SIGTERM.
+    StallActions,
+    /// Hands the first API connection to a `cat` that never answers, then exits with status 5,
+    /// so the readiness request is still in flight after the exit.
+    StallReadyThenExit,
 }
 
 pub struct Sandbox {
@@ -43,6 +49,7 @@ impl Sandbox {
         let exec = dir.path().join("firecracker");
         std::fs::write(&exec, format!("{mode:?}")).unwrap();
         let mut config = JailerConfig::new(dir.path().join("jails"), meta.uid(), meta.gid());
+        config.cgroup_root = dir.path().join("cgroup");
         config.jailer = std::env::current_exe().unwrap();
         config.firecracker = exec;
         config.launcher_args = [ENTRY, "--exact", "--nocapture", "--"]
@@ -59,7 +66,28 @@ impl Sandbox {
             Err(_) => Vec::new(),
         };
         assert_eq!(left, Vec::<PathBuf>::new());
+        let cgroups = self.dir.path().join("cgroup/firecracker");
+        let left: Vec<PathBuf> = match std::fs::read_dir(cgroups) {
+            Ok(entries) => entries.map(|e| e.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        };
+        assert_eq!(left, Vec::<PathBuf>::new(), "cgroups left behind");
     }
+
+    pub fn jail_dir(&self, id: &str) -> PathBuf {
+        self.dir.path().join("jails/firecracker").join(id)
+    }
+}
+
+/// Polls `condition` until it holds; panics after `timeout`.
+pub async fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
+    let res = tokio::time::timeout(timeout, async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(res.is_ok(), "timed out waiting until {what}");
 }
 
 /// Runs the fake jailer if this process was launched as one; returns otherwise.
@@ -82,7 +110,14 @@ pub fn run_fake_jailer_if_requested() {
     ) else {
         return;
     };
-    let root = Path::new(&base).join("firecracker").join(id).join("root");
+    let root = Path::new(&base).join("firecracker").join(&id).join("root");
+    // Like the real jailer, which creates `<cgroup root>/<parent>/<id>` when given a `--cgroup`.
+    // The sandbox mounts its fake cgroup root next to the chroot base.
+    if args.iter().any(|a| a == "--cgroup") {
+        let parent = flag("--parent-cgroup").unwrap_or_else(|| "firecracker".into());
+        let cgroup = Path::new(&base).parent().unwrap().join("cgroup");
+        std::fs::create_dir_all(cgroup.join(parent).join(&id)).unwrap();
+    }
     let mode = std::fs::read_to_string(&exec).unwrap();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -109,9 +144,28 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
         None
     };
     let listener = UnixListener::bind(sock).unwrap();
+    let mut stalled = Vec::new();
     loop {
         let (mut stream, _) = listener.accept().await.unwrap();
+        if mode == "StallReadyThenExit" {
+            // A blocking fd: `cat` would fail on EAGAIN and close the connection.
+            let stream = stream.into_std().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            // Backgrounded by `sh` so that it outlives this process; an asynchronous list gets
+            // /dev/null as stdin unless redirected, hence fd 3.
+            let status = std::process::Command::new("sh")
+                .args(["-c", "exec 3<&0; cat <&3 >/dev/null 2>&1 &"])
+                .stdin(std::os::fd::OwnedFd::from(stream))
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return 5;
+        }
         let request = read_request(&mut stream).await;
+        if mode == "StallActions" && request.starts_with("PUT /actions ") {
+            stalled.push(stream);
+            continue;
+        }
         let reply = if request.starts_with("GET / ") {
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
         } else {

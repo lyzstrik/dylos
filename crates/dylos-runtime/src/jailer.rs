@@ -9,7 +9,10 @@ use crate::error::{Error, Result};
 pub const API_SOCKET: &str = "/run/firecracker.socket";
 pub const METRICS_FILE: &str = "/run/metrics.json";
 
-const CGROUP_V2_ROOT: &str = "/sys/fs/cgroup";
+/// Jailer v1.17.0 creates and joins `<parent>/<id>` only when at least one `--cgroup` property
+/// is given; without one it merely joins the parent. `pids.max=max` is the kernel default, so it
+/// requests the per-VM cgroup without limiting anything.
+const DEFAULT_CGROUP: &str = "pids.max=max";
 
 /// How to start the jailer. Shared by every VM of a host.
 #[derive(Debug, Clone)]
@@ -23,8 +26,12 @@ pub struct JailerConfig {
     pub gid: u32,
     /// Passed as `--parent-cgroup`; the jailer defaults it to the Firecracker file name.
     pub parent_cgroup: Option<String>,
-    /// `<cgroup_file>=<value>` entries, each passed as `--cgroup` (cgroup v2).
+    /// `<cgroup_file>=<value>` entries, each passed as `--cgroup` (cgroup v2). When empty,
+    /// `pids.max=max` is passed so that the VM still gets its own cgroup.
     pub cgroups: Vec<String>,
+    /// Mount point of the cgroup v2 hierarchy. The jailer finds it in `/proc/mounts`; this must
+    /// match, since the VM cgroup is removed from here.
+    pub cgroup_root: PathBuf,
     /// Arguments inserted before the jailer flags. Empty for the real jailer; lets tests run a
     /// fake launcher that needs its own leading arguments.
     pub launcher_args: Vec<OsString>,
@@ -41,6 +48,7 @@ impl JailerConfig {
             gid,
             parent_cgroup: None,
             cgroups: Vec::new(),
+            cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             launcher_args: Vec::new(),
         }
     }
@@ -105,7 +113,7 @@ impl JailPaths {
             .map_or(exec_name, AsRef::as_ref);
         Ok(Self {
             root: jail_dir.join("root"),
-            cgroup_dir: Path::new(CGROUP_V2_ROOT).join(parent_cgroup).join(&id),
+            cgroup_dir: config.cgroup_root.join(parent_cgroup).join(&id),
             jail_dir,
             id,
         })
@@ -140,6 +148,9 @@ pub fn jailer_args(
     if let Some(parent) = &config.parent_cgroup {
         flags.push(("--parent-cgroup", parent.into()));
     }
+    if config.cgroups.is_empty() {
+        flags.push(("--cgroup", DEFAULT_CGROUP.into()));
+    }
     flags.extend(config.cgroups.iter().map(|c| ("--cgroup", c.into())));
     if let Some(netns) = netns {
         flags.push(("--netns", netns.into()));
@@ -156,18 +167,66 @@ pub fn jailer_args(
     args
 }
 
-/// Creates the jail directory and places `files`, the `/run` directory and the metrics file in
-/// it, owned by the jailer uid/gid. Rolls back on error.
+/// Exclusive ownership of one VM's jail directory, which acts as the lock for its id: whoever
+/// created it owns the jail and, once it has spawned the jailer, the VM cgroup.
+///
+/// [`Jail::release`] removes both. Dropping an unreleased `Jail` removes them synchronously; that
+/// blocks, so it is only the fallback for errors and cancelled futures.
+#[derive(Debug)]
+#[must_use = "dropping a Jail removes it"]
+pub struct Jail {
+    paths: JailPaths,
+    owned: bool,
+}
+
+impl Jail {
+    #[must_use]
+    pub fn paths(&self) -> &JailPaths {
+        &self.paths
+    }
+
+    /// Removes the cgroup, then the jail directory. On error the jail stays owned, so a later
+    /// call or the drop can retry.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] on any failure other than "not found".
+    pub async fn release(&mut self) -> Result<()> {
+        remove_jail(&self.paths).await?;
+        self.owned = false;
+        Ok(())
+    }
+}
+
+impl Drop for Jail {
+    fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
+        let res = ignore_missing(std::fs::remove_dir(&self.paths.cgroup_dir))
+            .and_then(|()| ignore_missing(std::fs::remove_dir_all(&self.paths.jail_dir)));
+        if let Err(e) = res {
+            tracing::error!(vm = %self.paths.id, error = %e, "failed to remove the jail");
+        }
+    }
+}
+
+/// Atomically claims the jail directory, then places `files`, the `/run` directory and the
+/// metrics file in it, owned by the jailer uid/gid.
+///
+/// Everything runs in one blocking task that owns the [`Jail`]: if this future is dropped, the
+/// task still finishes and the jail is removed when its unread result is dropped. On error, only
+/// a directory this call created is removed.
 ///
 /// # Errors
 ///
 /// [`Error::JailExists`] if the jail directory is already there, [`Error::InvalidChrootFileName`],
-/// or [`Error::Io`].
+/// [`Error::Io`], or [`Error::Task`].
 pub async fn prepare_chroot(
     config: &JailerConfig,
     paths: &JailPaths,
     files: &[ChrootFile],
-) -> Result<()> {
+) -> Result<Jail> {
     for file in files {
         let name = file.name.as_str();
         if name.is_empty() || name == "." || name == ".." || name == "run" || name.contains('/') {
@@ -177,42 +236,60 @@ pub async fn prepare_chroot(
             });
         }
     }
-    if tokio::fs::try_exists(&paths.jail_dir).await.unwrap_or(true) {
-        return Err(Error::JailExists {
-            id: paths.id.clone(),
-            path: paths.jail_dir.clone(),
-        });
-    }
-    let res = populate(config, paths, files).await;
-    if res.is_err()
-        && let Err(e) = remove_jail(paths).await
-    {
-        tracing::warn!(vm = %paths.id, error = %e, "rollback of the jail directory failed");
-    }
-    res
+    let (paths, files, uid, gid) = (paths.clone(), files.to_vec(), config.uid, config.gid);
+    let id = paths.id.clone();
+    tokio::task::spawn_blocking(move || {
+        let jail = claim(paths)?;
+        populate(&jail.paths, &files, uid, gid)?;
+        Ok(jail)
+    })
+    .await
+    .map_err(|source| Error::Task {
+        id,
+        task: "chroot preparation",
+        source,
+    })?
 }
 
-async fn populate(config: &JailerConfig, paths: &JailPaths, files: &[ChrootFile]) -> Result<()> {
-    let io = |op, path: &Path| {
-        let (id, path) = (paths.id.clone(), path.to_path_buf());
-        move |source| Error::Io {
-            id,
-            op,
-            path,
-            source,
-        }
-    };
+fn io_error(
+    paths: &JailPaths,
+    op: &'static str,
+    path: &Path,
+) -> impl FnOnce(std::io::Error) -> Error + use<> {
+    let (id, path) = (paths.id.clone(), path.to_path_buf());
+    move |source| Error::Io {
+        id,
+        op,
+        path,
+        source,
+    }
+}
+
+fn claim(paths: JailPaths) -> Result<Jail> {
+    let jail_dir = &paths.jail_dir;
+    if let Some(parent) = jail_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(io_error(&paths, "create dir", parent))?;
+    }
+    match std::fs::create_dir(jail_dir) {
+        Ok(()) => Ok(Jail { paths, owned: true }),
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(Error::JailExists {
+            path: jail_dir.clone(),
+            id: paths.id,
+        }),
+        Err(e) => Err(io_error(&paths, "create dir", jail_dir)(e)),
+    }
+}
+
+fn populate(paths: &JailPaths, files: &[ChrootFile], uid: u32, gid: u32) -> Result<()> {
+    let io = |op, path: &Path| io_error(paths, op, path);
     let run = paths.host_path("/run");
-    tokio::fs::create_dir_all(&run)
-        .await
-        .map_err(io("create dir", &run))?;
+    std::fs::create_dir_all(&run).map_err(io("create dir", &run))?;
     let mut owned = vec![run];
     for file in files {
         let dest = paths.host_path(&file.jailed_path());
-        match tokio::fs::hard_link(&file.source, &dest).await {
+        match std::fs::hard_link(&file.source, &dest) {
             Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-                tokio::fs::copy(&file.source, &dest)
-                    .await
+                std::fs::copy(&file.source, &dest)
                     .map(drop)
                     .map_err(io("copy", &file.source))?;
             }
@@ -221,40 +298,31 @@ async fn populate(config: &JailerConfig, paths: &JailPaths, files: &[ChrootFile]
         owned.push(dest);
     }
     let metrics = paths.host_path(METRICS_FILE);
-    tokio::fs::File::create(&metrics)
-        .await
-        .map_err(io("create", &metrics))?;
+    std::fs::File::create(&metrics).map_err(io("create", &metrics))?;
     owned.push(metrics);
-    let (uid, gid) = (config.uid, config.gid);
     for path in owned {
-        let p = path.clone();
-        tokio::task::spawn_blocking(move || std::os::unix::fs::chown(&p, Some(uid), Some(gid)))
-            .await
-            .map_err(std::io::Error::other)
-            .flatten()
-            .map_err(io("chown", &path))?;
+        std::os::unix::fs::chown(&path, Some(uid), Some(gid)).map_err(io("chown", &path))?;
     }
     Ok(())
 }
 
-/// Removes the jail directory and the VM cgroup. Succeeds if they are already gone. The cgroup
-/// can only be removed once the process has been reaped.
+fn ignore_missing(res: std::io::Result<()>) -> std::io::Result<()> {
+    match res {
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        res => res,
+    }
+}
+
+/// Removes the VM cgroup, then the jail directory, so the directory, which is the lock for the
+/// id, goes last. Succeeds if they are already gone. The cgroup can only be removed once the
+/// process has been reaped.
 ///
 /// # Errors
 ///
 /// [`Error::Io`] on any failure other than "not found".
 pub async fn remove_jail(paths: &JailPaths) -> Result<()> {
-    let ignore_missing = |res: std::io::Result<()>, op, path: &Path| match res {
-        Err(e) if e.kind() != ErrorKind::NotFound => Err(Error::Io {
-            id: paths.id.clone(),
-            op,
-            path: path.to_path_buf(),
-            source: e,
-        }),
-        _ => Ok(()),
-    };
-    let res = tokio::fs::remove_dir_all(&paths.jail_dir).await;
-    ignore_missing(res, "remove dir", &paths.jail_dir)?;
     let res = tokio::fs::remove_dir(&paths.cgroup_dir).await;
-    ignore_missing(res, "remove cgroup", &paths.cgroup_dir)
+    ignore_missing(res).map_err(io_error(paths, "remove cgroup", &paths.cgroup_dir))?;
+    let res = tokio::fs::remove_dir_all(&paths.jail_dir).await;
+    ignore_missing(res).map_err(io_error(paths, "remove dir", &paths.jail_dir))
 }

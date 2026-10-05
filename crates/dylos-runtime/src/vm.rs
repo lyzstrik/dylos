@@ -15,7 +15,10 @@ use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 use crate::error::{Error, Result};
-use crate::jailer::{self, ChrootFile, JailPaths, JailerConfig, METRICS_FILE};
+use crate::jailer::{self, ChrootFile, Jail, JailPaths, JailerConfig, METRICS_FILE};
+
+/// Delay between readiness probes while the API socket is not answering yet.
+const READY_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
@@ -27,7 +30,7 @@ pub struct Timeouts {
     pub term: Duration,
     /// After SIGKILL, before giving up.
     pub kill: Duration,
-    /// How often the metrics file is read into `tracing`.
+    /// How often the metrics file is read into `tracing`. Must not be zero.
     pub metrics_poll: Duration,
 }
 
@@ -63,10 +66,12 @@ pub enum ProcessState {
 
 /// A running Firecracker process inside its jail.
 ///
-/// [`Vm::shutdown`] is the normal way to stop it. `Drop` is only a safety net: it cannot wait, so
-/// it aborts the supervisor (the child is spawned with `kill_on_drop`, so it gets SIGKILL and is
-/// reaped by tokio in the background) and removes the jail directory synchronously. The cgroup
-/// is left behind if the process has not been reaped yet.
+/// The supervisor task owns the child and the [`Jail`]: whatever the reason the process exits,
+/// it reaps it, then removes the cgroup and the jail. [`Vm::shutdown`] escalates signals and
+/// waits for that. Dropping a `Vm` without shutdown closes the signal channel, which tells the
+/// supervisor to SIGKILL the process and clean up in the background. If the runtime shuts down
+/// before that, the child gets SIGKILL from `kill_on_drop` and the jail's drop removes what it can
+/// synchronously; a cgroup whose process is not reaped yet stays behind.
 pub struct Vm {
     paths: JailPaths,
     client: FcClient,
@@ -74,36 +79,56 @@ pub struct Vm {
     signals: mpsc::UnboundedSender<Signal>,
     state: watch::Receiver<ProcessState>,
     expected_exit: Arc<AtomicBool>,
+    supervisor: Option<JoinHandle<Result<()>>>,
     tasks: Vec<JoinHandle<()>>,
     pid: Option<u32>,
-    cleaned_up: bool,
 }
 
 impl Vm {
     /// Prepares the chroot, starts the jailer and waits until the Firecracker API answers.
-    /// On any error, the process is killed and the jail removed before returning.
+    /// On any error, the process is killed and the jail removed before returning. Dropping the
+    /// returned future cleans up as well, partly in the background.
     ///
     /// # Errors
     ///
-    /// Any [`Error`] from chroot preparation, [`Error::Spawn`], [`Error::ExitedDuringStart`] or
-    /// [`Error::ReadyTimeout`].
+    /// [`Error::ZeroMetricsPoll`], any [`Error`] from chroot preparation, [`Error::Spawn`],
+    /// [`Error::ExitedDuringStart`] or [`Error::ReadyTimeout`].
     pub async fn launch(config: &JailerConfig, spec: &VmSpec) -> Result<Self> {
         let paths = JailPaths::new(config, &spec.lab_id, &spec.node)?;
+        if spec.timeouts.metrics_poll.is_zero() {
+            return Err(Error::ZeroMetricsPoll { id: paths.id });
+        }
         let span = tracing::info_span!("vm", lab = %spec.lab_id, node = %spec.node);
         async {
             let start = std::time::Instant::now();
-            jailer::prepare_chroot(config, &paths, &spec.files).await?;
-            let mut vm = match Self::spawn(config, spec, paths.clone()) {
-                Ok(vm) => vm,
-                Err(e) => {
-                    if let Err(cleanup) = jailer::remove_jail(&paths).await {
-                        tracing::error!(error = %cleanup, "cleanup after failed spawn");
+            let mut jail = jailer::prepare_chroot(config, &paths, &spec.files).await?;
+            let child = Command::new(&config.jailer)
+                .args(jailer::jailer_args(config, &paths, spec.netns.as_deref()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(source) => {
+                    if let Err(e) = jail.release().await {
+                        tracing::error!(error = %e, "cleanup after failed spawn");
                     }
-                    return Err(e);
+                    return Err(Error::Spawn {
+                        id: paths.id.clone(),
+                        program: config.jailer.clone(),
+                        source,
+                    });
                 }
             };
+            let mut vm = Self::start(child, jail, spec.timeouts);
             if let Err(e) = vm.wait_ready().await {
-                vm.kill_and_clean_up().await;
+                vm.expected_exit.store(true, Ordering::SeqCst);
+                let _ = vm.signals.send(Signal::SIGKILL);
+                if let Err(cleanup) = vm.finish(vm.timeouts.kill).await {
+                    tracing::error!(error = %cleanup, "cleanup after failed start");
+                }
                 return Err(e);
             }
             tracing::info!(duration_ms = start.elapsed().as_millis(), "VM API ready");
@@ -113,19 +138,8 @@ impl Vm {
         .await
     }
 
-    fn spawn(config: &JailerConfig, spec: &VmSpec, paths: JailPaths) -> Result<Self> {
-        let mut child = Command::new(&config.jailer)
-            .args(jailer::jailer_args(config, &paths, spec.netns.as_deref()))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|source| Error::Spawn {
-                id: paths.id.clone(),
-                program: config.jailer.clone(),
-                source,
-            })?;
+    fn start(mut child: Child, jail: Jail, timeouts: Timeouts) -> Self {
+        let paths = jail.paths().clone();
         let pid = child.id();
         let mut tasks = Vec::new();
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
@@ -139,25 +153,25 @@ impl Vm {
         let (signals, signal_rx) = mpsc::unbounded_channel();
         let (state_tx, state) = watch::channel(ProcessState::Running);
         let expected_exit = Arc::new(AtomicBool::new(false));
-        let supervisor = supervise(child, signal_rx, state_tx, Arc::clone(&expected_exit));
-        tasks.push(tokio::spawn(supervisor.in_current_span()));
+        let supervisor = supervise(child, jail, signal_rx, state_tx, Arc::clone(&expected_exit));
+        let supervisor = tokio::spawn(supervisor.in_current_span());
         let metrics = tail_metrics(
             paths.host_path(METRICS_FILE),
             state.clone(),
-            spec.timeouts.metrics_poll,
+            timeouts.metrics_poll,
         );
         tasks.push(tokio::spawn(metrics.in_current_span()));
-        Ok(Self {
+        Self {
             client: FcClient::new(paths.api_socket()),
             paths,
-            timeouts: spec.timeouts,
+            timeouts,
             signals,
             state,
             expected_exit,
+            supervisor: Some(supervisor),
             tasks,
             pid,
-            cleaned_up: false,
-        })
+        }
     }
 
     #[must_use]
@@ -183,26 +197,33 @@ impl Vm {
         self.state.clone()
     }
 
-    async fn wait_ready(&mut self) -> Result<()> {
+    /// Resolves with the exit state; `Lost` if the supervisor is gone without publishing one.
+    async fn exited(&self) -> ProcessState {
+        let mut state = self.state.clone();
+        state
+            .wait_for(|s| *s != ProcessState::Running)
+            .await
+            .map_or(ProcessState::Lost, |s| s.clone())
+    }
+
+    async fn wait_ready(&self) -> Result<()> {
+        // GET / returns the instance info once the API thread serves requests. A request can
+        // stall, so the whole poll is raced against the exit.
         let poll = async {
-            let mut state = self.state.clone();
-            loop {
-                let current = state.borrow_and_update().clone();
-                if current != ProcessState::Running {
-                    return Err(Error::ExitedDuringStart {
-                        id: self.paths.id.clone(),
-                        state: current,
-                    });
-                }
-                // GET / returns the instance info once the API thread serves requests.
-                if self.client.get::<serde_json::Value>("/").await.is_ok() {
-                    return Ok(());
-                }
-                // Not a fixed delay: retry soon, or at once if the process exits.
-                let _ = tokio::time::timeout(Duration::from_millis(10), state.changed()).await;
+            while self.client.get::<serde_json::Value>("/").await.is_err() {
+                tokio::time::sleep(READY_RETRY).await;
             }
         };
-        tokio::time::timeout(self.timeouts.ready, poll)
+        let ready = async {
+            tokio::select! {
+                () = poll => Ok(()),
+                state = self.exited() => Err(Error::ExitedDuringStart {
+                    id: self.paths.id.clone(),
+                    state,
+                }),
+            }
+        };
+        tokio::time::timeout(self.timeouts.ready, ready)
             .await
             .unwrap_or_else(|_| {
                 Err(Error::ReadyTimeout {
@@ -214,55 +235,66 @@ impl Vm {
     }
 
     async fn wait_exit(&self, timeout: Duration) -> bool {
-        let mut state = self.state.clone();
-        tokio::time::timeout(timeout, state.wait_for(|s| *s != ProcessState::Running))
+        tokio::time::timeout(timeout, self.exited()).await.is_ok()
+    }
+
+    /// `SendCtrlAltDel` and the exit that should follow, both within `graceful`. Returns false
+    /// if the API refuses the action (the VM is not started) or does not answer in time.
+    async fn ctrl_alt_del(&self) -> bool {
+        let ctrl_alt_del = InstanceActionInfo::new(ActionType::SendCtrlAltDel);
+        let request = async {
+            match self
+                .client
+                .put::<_, serde_json::Value>("/actions", &ctrl_alt_del)
+                .await
+            {
+                Ok(_) => {
+                    self.exited().await;
+                    true
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "SendCtrlAltDel refused, skipping to SIGTERM");
+                    false
+                }
+            }
+        };
+        let graceful = async {
+            tokio::select! {
+                stopped = request => stopped,
+                _ = self.exited() => true,
+            }
+        };
+        tokio::time::timeout(self.timeouts.graceful, graceful)
             .await
-            .is_ok()
+            .unwrap_or(false)
     }
 
     /// Stops the VM: `SendCtrlAltDel`, then SIGTERM, then SIGKILL, each after its timeout, then
-    /// removes the jail. Idempotent.
+    /// removes the jail and the cgroup. Returns at once if a previous call completed, so it never
+    /// touches a VM launched later with the same id.
     ///
     /// # Errors
     ///
-    /// [`Error::KillTimeout`] if the process survives SIGKILL (the jail is kept, since the
-    /// process may still use it), or [`Error::Io`] if cleanup fails.
+    /// [`Error::KillTimeout`] if the process survives SIGKILL (the supervisor keeps the jail and
+    /// removes it once the process is reaped), [`Error::Io`] if cleanup fails, or
+    /// [`Error::Task`].
     pub async fn shutdown(&mut self) -> Result<()> {
+        if self.supervisor.is_none() {
+            return Ok(());
+        }
         let span = tracing::info_span!("vm_shutdown", vm = %self.paths.id);
         async {
             let start = std::time::Instant::now();
             self.expected_exit.store(true, Ordering::SeqCst);
-            let ctrl_alt_del = InstanceActionInfo::new(ActionType::SendCtrlAltDel);
-            let graceful = *self.state.borrow() == ProcessState::Running
-                && match self
-                    .client
-                    .put::<_, serde_json::Value>("/actions", &ctrl_alt_del)
-                    .await
-                {
-                    Ok(_) => true,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "SendCtrlAltDel refused, skipping to SIGTERM");
-                        false
-                    }
-                };
-            if !(graceful && self.wait_exit(self.timeouts.graceful).await) {
+            let running = *self.state.borrow() == ProcessState::Running;
+            if running && !self.ctrl_alt_del().await {
                 let _ = self.signals.send(Signal::SIGTERM);
                 if !self.wait_exit(self.timeouts.term).await {
                     tracing::warn!("Firecracker ignored SIGTERM, sending SIGKILL");
                     let _ = self.signals.send(Signal::SIGKILL);
-                    if !self.wait_exit(self.timeouts.kill).await {
-                        return Err(Error::KillTimeout {
-                            id: self.paths.id.clone(),
-                            timeout: self.timeouts.kill,
-                        });
-                    }
                 }
             }
-            for task in self.tasks.drain(..) {
-                let _ = task.await;
-            }
-            jailer::remove_jail(&self.paths).await?;
-            self.cleaned_up = true;
+            self.finish(self.timeouts.kill).await?;
             tracing::info!(
                 duration_ms = start.elapsed().as_millis(),
                 "VM stopped and cleaned up"
@@ -273,76 +305,77 @@ impl Vm {
         .await
     }
 
-    async fn kill_and_clean_up(&mut self) {
-        self.expected_exit.store(true, Ordering::SeqCst);
-        let _ = self.signals.send(Signal::SIGKILL);
-        if !self.wait_exit(self.timeouts.kill).await {
-            tracing::error!(vm = %self.paths.id, "process survived SIGKILL during failed start");
-            return;
+    /// Waits up to `timeout` for the exit, then joins the supervisor (which has released the
+    /// jail by then) and the forwarding tasks.
+    async fn finish(&mut self, timeout: Duration) -> Result<()> {
+        if !self.wait_exit(timeout).await {
+            return Err(Error::KillTimeout {
+                id: self.paths.id.clone(),
+                timeout,
+            });
         }
+        let Some(supervisor) = self.supervisor.take() else {
+            return Ok(());
+        };
         for task in self.tasks.drain(..) {
-            let _ = task.await;
-        }
-        match jailer::remove_jail(&self.paths).await {
-            Ok(()) => self.cleaned_up = true,
-            Err(e) => {
-                tracing::error!(vm = %self.paths.id, error = %e, "cleanup after failed start");
+            if let Err(e) = task.await {
+                tracing::error!(error = %e, "VM output or metrics task failed");
             }
         }
+        supervisor.await.map_err(|source| Error::Task {
+            id: self.paths.id.clone(),
+            task: "supervisor",
+            source,
+        })?
     }
 }
 
 impl Drop for Vm {
     fn drop(&mut self) {
-        if self.cleaned_up {
-            return;
-        }
-        tracing::warn!(vm = %self.paths.id, "Vm dropped without shutdown, killing it");
-        self.expected_exit.store(true, Ordering::SeqCst);
-        for task in &self.tasks {
-            task.abort();
-        }
-        // Blocking, but only on this fallback path. Unlinking is safe even if Firecracker is
-        // still running: it keeps its open files until SIGKILL lands.
-        if let Err(e) = std::fs::remove_dir_all(&self.paths.jail_dir)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::error!(vm = %self.paths.id, error = %e, "failed to remove jail directory");
+        if self.supervisor.is_some() {
+            tracing::warn!(vm = %self.paths.id, "Vm dropped without shutdown, killing it");
+            self.expected_exit.store(true, Ordering::SeqCst);
         }
     }
 }
 
-/// Owns the child: it is the only place that waits on (reaps) it, so a signal sent from here can
-/// never reach a recycled pid.
+/// Owns the child and its jail. It is the only place that waits on (reaps) the child, so a signal
+/// sent from here can never reach a recycled pid. When the signal channel closes (the `Vm` was
+/// dropped), nobody else can stop the process, so it is killed.
 async fn supervise(
     mut child: Child,
+    mut jail: Jail,
     mut signals: mpsc::UnboundedReceiver<Signal>,
     state: watch::Sender<ProcessState>,
     expected_exit: Arc<AtomicBool>,
-) {
+) -> Result<()> {
     let pid = child
         .id()
         .and_then(|p| i32::try_from(p).ok())
         .map(Pid::from_raw);
-    let new_state = loop {
+    let res = loop {
         tokio::select! {
-            res = child.wait() => break match res {
-                Ok(status) => ProcessState::Exited(status),
-                Err(e) => {
-                    tracing::error!(error = %e, "waiting on Firecracker failed, killing it");
-                    let _ = child.start_kill();
-                    ProcessState::Lost
-                }
-            },
-            Some(signal) = signals.recv() => {
+            res = child.wait() => break res,
+            signal = signals.recv() => {
                 let res = match (signal, pid) {
-                    (Signal::SIGKILL, _) | (_, None) => child.start_kill(),
-                    (signal, Some(pid)) => kill(pid, signal).map_err(std::io::Error::from),
+                    (Some(Signal::SIGKILL) | None, _) | (_, None) => child.start_kill(),
+                    (Some(signal), Some(pid)) => kill(pid, signal).map_err(std::io::Error::from),
                 };
                 if let Err(e) = res {
-                    tracing::warn!(%signal, error = %e, "failed to signal Firecracker");
+                    tracing::warn!(?signal, error = %e, "failed to signal Firecracker");
+                }
+                if signal.is_none() {
+                    break child.wait().await;
                 }
             }
+        }
+    };
+    let new_state = match res {
+        Ok(status) => ProcessState::Exited(status),
+        Err(e) => {
+            tracing::error!(error = %e, "waiting on Firecracker failed, killing it");
+            let _ = child.start_kill();
+            ProcessState::Lost
         }
     };
     if expected_exit.load(Ordering::SeqCst) {
@@ -351,6 +384,11 @@ async fn supervise(
         tracing::error!(state = ?new_state, "Firecracker exited unexpectedly");
     }
     state.send_replace(new_state);
+    let res = jail.release().await;
+    if let Err(e) = &res {
+        tracing::error!(error = %e, "failed to remove the jail after exit");
+    }
+    res
 }
 
 async fn forward_lines(stream: impl AsyncRead + Unpin, source: &'static str) {

@@ -117,7 +117,7 @@ async fn chroot_is_populated_then_removed_idempotently() {
     let source = dir.path().join("vmlinux.bin");
     std::fs::write(&source, b"kernel").unwrap();
     let paths = JailPaths::new(&config, "lab", "web").unwrap();
-    prepare_chroot(&config, &paths, &[ChrootFile::new(&source, "vmlinux.bin")])
+    let mut jail = prepare_chroot(&config, &paths, &[ChrootFile::new(&source, "vmlinux.bin")])
         .await
         .unwrap();
     assert_eq!(
@@ -127,10 +127,59 @@ async fn chroot_is_populated_then_removed_idempotently() {
     assert!(paths.root.join("run").is_dir());
     assert!(paths.root.join("run/metrics.json").is_file());
 
-    remove_jail(&paths).await.unwrap();
+    jail.release().await.unwrap();
     remove_jail(&paths).await.unwrap();
     assert!(!paths.jail_dir.exists());
     assert!(source.exists());
+}
+
+#[test]
+fn per_vm_cgroup_is_requested_even_without_properties() {
+    let config = JailerConfig::new("/srv/dylos", 1234, 5678);
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    let args = jailer_args(&config, &paths, None);
+    let cgroups: Vec<&str> = strings(&args)
+        .windows(2)
+        .filter(|w| w[0] == "--cgroup")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(cgroups, ["pids.max=max"]);
+    assert_eq!(
+        strings(&jailer_args(&self::config(), &paths, None))
+            .iter()
+            .filter(|a| **a == "--cgroup")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn concurrent_claims_have_one_winner_and_losers_touch_nothing() {
+    // Each preparation runs on its own blocking thread, so the claims really race.
+    let dir = tempfile::tempdir().unwrap();
+    let config = local_config(dir.path());
+    let source = dir.path().join("vmlinux.bin");
+    std::fs::write(&source, b"kernel").unwrap();
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    let files = [ChrootFile::new(&source, "vmlinux.bin")];
+    let attempts: Vec<_> = (0..8)
+        .map(|_| {
+            let (config, paths, files) = (config.clone(), paths.clone(), files.clone());
+            tokio::spawn(async move { prepare_chroot(&config, &paths, &files).await })
+        })
+        .collect();
+    let mut winners = Vec::new();
+    for attempt in attempts {
+        match attempt.await.unwrap() {
+            Ok(jail) => winners.push(jail),
+            Err(err) => assert!(matches!(err, Error::JailExists { .. }), "{err}"),
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    assert!(paths.root.join("vmlinux.bin").is_file());
+    assert!(paths.root.join("run/metrics.json").is_file());
+    winners[0].release().await.unwrap();
+    assert!(!paths.jail_dir.exists());
 }
 
 #[tokio::test]
