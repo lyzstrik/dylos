@@ -299,3 +299,193 @@ fn test_verify_integrity() {
         _ => panic!("Expected IntegrityMismatch, got {res_sha_err:?}"),
     }
 }
+
+#[test]
+fn test_serde_boundary_rejects_unsupported_version() {
+    let json = r#"{
+        "format_version": 2,
+        "lab_spec": { "nodes": [], "segments": [] },
+        "vms": {},
+        "firecracker_version": "1.17.0",
+        "host_cpu_model": "Intel",
+        "created_at_unix_ms": 123456789,
+        "step_durations_ms": {
+            "freeze": 1,
+            "pause": 2,
+            "snapshot": 3,
+            "resume": 4,
+            "thaw": 5
+        }
+    }"#;
+
+    let res = serde_json::from_str::<SnapshotManifest>(json);
+    match res {
+        Err(e) => {
+            assert!(
+                e.to_string()
+                    .contains("unsupported manifest version 2, only version 1 is supported"),
+                "{}",
+                e
+            );
+        }
+        _ => panic!("Expected serde_json::Error"),
+    }
+}
+
+#[test]
+fn test_verify_validates_paths_first() {
+    let content = b"hello world";
+    let size = content.len() as u64;
+    let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
+
+    let mut manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: valid_lab_spec(),
+        vms: std::collections::BTreeMap::new(),
+        firecracker_version: "1.17.0".to_string(),
+        host_cpu_model: "Intel".to_string(),
+        created_at_unix_ms: 123_456_789,
+        step_durations_ms: StepDurations {
+            freeze: 1,
+            pause: 2,
+            snapshot: 3,
+            resume: 4,
+            thaw: 5,
+        },
+    };
+
+    // Add a valid VM first
+    manifest.vms.insert(
+        "vm1".to_string(),
+        VmManifest {
+            state_file: FileMeta {
+                path: PathBuf::from("state1"),
+                sha256: sha256.clone(),
+                size,
+            },
+            memory_file: FileMeta {
+                path: PathBuf::from("mem1"),
+                sha256: sha256.clone(),
+                size,
+            },
+            disks: vec![],
+        },
+    );
+
+    // Add an invalid VM later
+    manifest.vms.insert(
+        "vm2".to_string(),
+        VmManifest {
+            state_file: FileMeta {
+                path: PathBuf::from("../outside"),
+                sha256: sha256.clone(),
+                size,
+            },
+            memory_file: FileMeta {
+                path: PathBuf::from("mem2"),
+                sha256: sha256.clone(),
+                size,
+            },
+            disks: vec![],
+        },
+    );
+
+    let mut openers = 0;
+    let res = manifest.verify(|_| {
+        openers += 1;
+        Ok(Cursor::new(content.to_vec()))
+    });
+
+    match res {
+        Err(Error::InvalidPath { vm, path }) => {
+            assert_eq!(vm, "vm2");
+            assert_eq!(path, PathBuf::from("../outside"));
+        }
+        _ => panic!("Expected InvalidPath, got {res:?}"),
+    }
+    assert_eq!(openers, 0, "Expected zero openers called");
+}
+
+struct InterruptedReader {
+    data: Vec<u8>,
+    interrupted_yielded: bool,
+    pos: usize,
+}
+
+impl std::io::Read for InterruptedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if !self.interrupted_yielded && self.pos > 0 {
+            self.interrupted_yielded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "interrupted",
+            ));
+        }
+
+        let remaining = self.data.len() - self.pos;
+        if remaining == 0 {
+            return Ok(0);
+        }
+
+        let to_read = std::cmp::min(buf.len(), remaining);
+        // read a small chunk to force multiple reads
+        let to_read = std::cmp::min(to_read, 5);
+
+        buf[..to_read].copy_from_slice(&self.data[self.pos..self.pos + to_read]);
+        self.pos += to_read;
+
+        Ok(to_read)
+    }
+}
+
+#[test]
+fn test_verify_interrupted() {
+    let content = b"hello world";
+    let size = content.len() as u64;
+    let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
+
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: valid_lab_spec(),
+        vms: {
+            let mut vms = std::collections::BTreeMap::new();
+            vms.insert(
+                "router".to_string(),
+                VmManifest {
+                    state_file: FileMeta {
+                        path: PathBuf::from("state"),
+                        sha256: sha256.clone(),
+                        size,
+                    },
+                    memory_file: FileMeta {
+                        path: PathBuf::from("mem"),
+                        sha256: sha256.clone(),
+                        size,
+                    },
+                    disks: vec![],
+                },
+            );
+            vms
+        },
+        firecracker_version: "1.17.0".to_string(),
+        host_cpu_model: "Intel".to_string(),
+        created_at_unix_ms: 123_456_789,
+        step_durations_ms: StepDurations {
+            freeze: 1,
+            pause: 2,
+            snapshot: 3,
+            resume: 4,
+            thaw: 5,
+        },
+    };
+
+    let res = manifest.verify(|_| {
+        Ok(InterruptedReader {
+            data: content.to_vec(),
+            interrupted_yielded: false,
+            pos: 0,
+        })
+    });
+
+    assert!(res.is_ok(), "Expected OK despite Interrupted error");
+}
