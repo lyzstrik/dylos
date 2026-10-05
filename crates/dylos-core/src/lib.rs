@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod guest_net;
+pub mod mac;
 pub mod manifest;
 pub mod model;
 
 pub use error::Error;
+pub use mac::MacAddr;
 pub use model::{Interface, LabSpec, Node, Segment, StaticRoute};
 
 use std::collections::{HashMap, HashSet};

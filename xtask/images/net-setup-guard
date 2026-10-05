@@ -1,0 +1,11 @@
+#!/bin/sh
+# A failed network setup must not look like a configured guest: readiness checks
+# read the marker file. Always exits 0 so init still reaches the debug shell.
+NET_SETUP="${DYLOS_NET_SETUP:-/sbin/net-setup}"
+MARKER="${DYLOS_NET_MARKER:-/run/dylos-net-failed}"
+
+if ! "$NET_SETUP"; then
+    echo "dylos: network setup failed" >&2
+    mkdir -p "$(dirname "$MARKER")"
+    : > "$MARKER"
+fi
