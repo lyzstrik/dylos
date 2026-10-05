@@ -133,6 +133,27 @@ async fn chroot_is_populated_then_removed_idempotently() {
     assert!(source.exists());
 }
 
+#[tokio::test]
+async fn releasing_a_released_jail_leaves_its_replacement_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = local_config(dir.path());
+    let source = dir.path().join("vmlinux.bin");
+    std::fs::write(&source, b"kernel").unwrap();
+    let files = [ChrootFile::new(&source, "vmlinux.bin")];
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+
+    let mut first = prepare_chroot(&config, &paths, &files).await.unwrap();
+    first.release().await.unwrap();
+    let mut second = prepare_chroot(&config, &paths, &files).await.unwrap();
+
+    first.release().await.unwrap();
+    assert!(paths.root.join("vmlinux.bin").is_file());
+    assert!(paths.root.join("run/metrics.json").is_file());
+
+    second.release().await.unwrap();
+    assert!(!paths.jail_dir.exists());
+}
+
 #[test]
 fn per_vm_cgroup_is_requested_even_without_properties() {
     let config = JailerConfig::new("/srv/dylos", 1234, 5678);

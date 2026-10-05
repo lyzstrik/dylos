@@ -186,12 +186,16 @@ impl Jail {
     }
 
     /// Removes the cgroup, then the jail directory. On error the jail stays owned, so a later
-    /// call or the drop can retry.
+    /// call or the drop can retry. Once released it is a no-op: the same paths may already
+    /// belong to a new jail for the same VM.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] on any failure other than "not found".
     pub async fn release(&mut self) -> Result<()> {
+        if !self.owned {
+            return Ok(());
+        }
         remove_jail(&self.paths).await?;
         self.owned = false;
         Ok(())
