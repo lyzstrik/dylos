@@ -51,4 +51,13 @@ pub enum Error {
 
     #[error("{path}: route destination and gateway families do not match")]
     FamilyMismatch { path: String },
+
+    #[error(
+        "boot parameters for node {node:?} exceed the {budget} bytes budget (actual: {actual})"
+    )]
+    BootArgsTooLong {
+        node: String,
+        budget: usize,
+        actual: usize,
+    },
 }

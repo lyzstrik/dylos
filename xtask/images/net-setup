@@ -1,0 +1,97 @@
+#!/bin/sh
+set -e
+
+CMDLINE_FILE="${1:-/proc/cmdline}"
+if [ ! -f "$CMDLINE_FILE" ]; then
+    echo "net-setup: error: $CMDLINE_FILE not found" >&2
+    exit 1
+fi
+
+CMDLINE=$(cat "$CMDLINE_FILE")
+
+# Disable DAD, RA, autoconf globally and for default before interfaces are brought up
+sysctl -qw net.ipv6.conf.all.accept_dad=0
+sysctl -qw net.ipv6.conf.default.accept_dad=0
+sysctl -qw net.ipv6.conf.all.accept_ra=0
+sysctl -qw net.ipv6.conf.default.accept_ra=0
+sysctl -qw net.ipv6.conf.all.autoconf=0
+sysctl -qw net.ipv6.conf.default.autoconf=0
+
+FWD=0
+
+# First pass: rename interfaces and configure IPs
+for arg in $CMDLINE; do
+    case "$arg" in
+        dylos.if=*)
+            val="${arg#dylos.if=}"
+            IF_NAME="${val%%,*}"
+            rest="${val#*,}"
+            MAC="${rest%%,*}"
+            rest="${rest#*,}"
+            IPV6="${rest%%,*}"
+            IPV4=""
+            case "$rest" in
+                *,*)
+                    IPV4="${rest#*,}"
+                    ;;
+            esac
+
+            ACTUAL_IF=""
+            for dir in /sys/class/net/*; do
+                if [ -f "$dir/address" ]; then
+                    addr=$(cat "$dir/address")
+                    if [ "$addr" = "$MAC" ]; then
+                        ACTUAL_IF="${dir##*/}"
+                        break
+                    fi
+                fi
+            done
+            
+            if [ -z "$ACTUAL_IF" ]; then
+                echo "net-setup: error: no interface found with MAC $MAC" >&2
+                exit 1
+            fi
+            
+            if [ "$ACTUAL_IF" != "$IF_NAME" ]; then
+                ip link set dev "$ACTUAL_IF" name "$IF_NAME"
+            fi
+            
+            sysctl -qw "net.ipv6.conf.$IF_NAME.accept_dad=0"
+            sysctl -qw "net.ipv6.conf.$IF_NAME.accept_ra=0"
+            sysctl -qw "net.ipv6.conf.$IF_NAME.autoconf=0"
+            
+            ip -6 addr add "$IPV6" nodad dev "$IF_NAME"
+            if [ -n "$IPV4" ]; then
+                ip -4 addr add "$IPV4" dev "$IF_NAME"
+            fi
+            ip link set dev "$IF_NAME" up
+            ;;
+        dylos.fwd=1)
+            FWD=1
+            ;;
+    esac
+done
+
+# Second pass: routes (needs interfaces to be up)
+for arg in $CMDLINE; do
+    case "$arg" in
+        dylos.rt=*)
+            val="${arg#dylos.rt=}"
+            DST="${val%%,*}"
+            GW="${val#*,}"
+            case "$DST" in
+                *:*)
+                    ip -6 route add "$DST" via "$GW"
+                    ;;
+                *)
+                    ip -4 route add "$DST" via "$GW"
+                    ;;
+            esac
+            ;;
+    esac
+done
+
+if [ "$FWD" = "1" ]; then
+    sysctl -qw net.ipv6.conf.all.forwarding=1
+    sysctl -qw net.ipv4.ip_forward=1
+fi

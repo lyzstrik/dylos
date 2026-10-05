@@ -13,8 +13,9 @@ RUN apk add --no-cache e2fsprogs \
     && : > /rootfs/var/log/apk.log
 
 COPY init /rootfs/sbin/init
+COPY net-setup /rootfs/sbin/net-setup
 
-RUN chmod 0755 /rootfs/sbin/init \
+RUN chmod 0755 /rootfs/sbin/init /rootfs/sbin/net-setup \
     && find /rootfs -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
     && mkdir -p /out \
     && E2FSPROGS_FAKE_TIME="${SOURCE_DATE_EPOCH}" mkfs.ext4 -F -q -d /rootfs \
