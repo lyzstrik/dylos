@@ -1,3 +1,14 @@
+FROM --platform=linux/amd64 docker.io/library/rust:1.99-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS agent
+
+RUN apk add --no-cache musl-dev
+COPY --from=workspace Cargo.toml Cargo.lock rust-toolchain.toml /src/
+COPY --from=workspace crates /src/crates
+COPY --from=workspace xtask/Cargo.toml /src/xtask/Cargo.toml
+WORKDIR /src
+RUN mkdir -p xtask/src && touch xtask/src/main.rs \
+    && RUSTFLAGS="--remap-path-prefix=/src=/build --remap-path-prefix=/usr/local/cargo=/cargo" \
+        cargo build --release --locked -p dylos-agent --target x86_64-unknown-linux-musl
+
 FROM --platform=linux/amd64 docker.io/library/alpine@sha256:1f3591b8a02ea153f41c5bba878ad477f63ab3d19349762cb77504db02a23e15 AS build
 
 ARG SOURCE_DATE_EPOCH=1700000000
@@ -13,8 +24,9 @@ RUN apk add --no-cache e2fsprogs \
     && : > /rootfs/var/log/apk.log
 
 COPY init /rootfs/sbin/init
+COPY --from=agent /src/target/x86_64-unknown-linux-musl/release/dylos-agent /rootfs/usr/sbin/dylos-agent
 
-RUN chmod 0755 /rootfs/sbin/init \
+RUN chmod 0755 /rootfs/sbin/init /rootfs/usr/sbin/dylos-agent \
     && find /rootfs -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
     && mkdir -p /out \
     && E2FSPROGS_FAKE_TIME="${SOURCE_DATE_EPOCH}" mkfs.ext4 -F -q -d /rootfs \
