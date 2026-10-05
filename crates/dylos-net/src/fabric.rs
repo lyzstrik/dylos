@@ -1,11 +1,13 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use futures_util::TryStreamExt;
 use rtnetlink::{Handle, LinkBridge, LinkUnspec};
 use tracing::{Instrument, info, info_span, warn};
 
-use crate::netns::{self, io_err, on_fresh_thread, on_fresh_thread_blocking};
+use crate::netns::{self, blocking, io_err, on_fresh_thread, on_fresh_thread_blocking};
 use crate::{Error, FabricPlan, tap};
 
 /// A lab's netns with its bridges and TAPs, torn down on drop if [`LabNetwork::teardown`] was
@@ -14,7 +16,8 @@ use crate::{Error, FabricPlan, tap};
 pub struct LabNetwork {
     plan: FabricPlan,
     netns_path: PathBuf,
-    live: bool,
+    /// The netns this handle created, held open until torn down. `None` once torn down.
+    ns: Option<Arc<File>>,
 }
 
 impl LabNetwork {
@@ -22,7 +25,9 @@ impl LabNetwork {
     /// persistent TAP per VM interface inside it, all up.
     ///
     /// On failure everything created so far is removed before returning, except when the netns
-    /// already existed: it may belong to a running lab, so it is left untouched.
+    /// already existed: it may belong to a running lab, so it is left untouched. Cancel-safe:
+    /// the worker owns both the rollback and the result, so if this future is dropped the
+    /// abandoned network is torn down as if it had been dropped.
     ///
     /// # Errors
     ///
@@ -31,28 +36,20 @@ impl LabNetwork {
         let span = info_span!("lab_network", lab = plan.lab_id());
         let netns_path = netns_dir.join(plan.netns_name());
         let started = Instant::now();
-        let (p, path) = (plan.clone(), netns_path.clone());
-        let created = on_fresh_thread(plan.lab_id(), move || create_blocking(&p, &path))
-            .instrument(span.clone())
-            .await;
-        match created {
-            Ok(()) => {
-                let elapsed_ms = started.elapsed().as_millis();
-                span.in_scope(|| info!(elapsed_ms, "lab network created"));
-                Ok(Self {
-                    plan,
-                    netns_path,
-                    live: true,
-                })
-            }
-            Err(e @ Error::NetnsExists { .. }) => Err(e),
-            Err(e) => {
-                if let Err(rollback) = teardown(&plan, netns_dir).instrument(span.clone()).await {
-                    span.in_scope(|| warn!(error = %rollback, "rollback after failed create"));
-                }
-                Err(e)
-            }
-        }
+        let lab = plan.lab_id().to_owned();
+        let net = blocking(&lab, move || {
+            let ns = create_blocking(&plan, &netns_path)?;
+            Ok(Self {
+                plan,
+                netns_path,
+                ns: Some(Arc::new(ns)),
+            })
+        })
+        .instrument(span.clone())
+        .await?;
+        let elapsed_ms = started.elapsed().as_millis();
+        span.in_scope(|| info!(elapsed_ms, "lab network created"));
+        Ok(net)
     }
 
     #[must_use]
@@ -66,30 +63,41 @@ impl LabNetwork {
         &self.netns_path
     }
 
-    /// Same as [`teardown`]; safe to call again.
+    /// Same as [`teardown`], restricted to the netns this handle created: if the path was
+    /// already torn down and now pins another netns (a new lab with the same id), that one is
+    /// left alone. Safe to call again.
     ///
     /// # Errors
     ///
     /// The system or netlink call that failed; the network is then still considered live.
     pub async fn teardown(&mut self) -> Result<(), Error> {
-        teardown_at(&self.plan, &self.netns_path).await?;
-        self.live = false;
+        let Some(ns) = self.ns.clone() else {
+            return Ok(());
+        };
+        teardown_at(&self.plan, &self.netns_path, Some(ns)).await?;
+        self.ns = None;
         Ok(())
     }
 }
 
 impl Drop for LabNetwork {
-    // Blocks for the few milliseconds teardown takes: a deterministic cleanup is worth more here
-    // than not blocking, and this path only runs when the owner forgot `teardown` or unwound.
+    // Never joins: a drop can happen on a tokio worker (a forgotten handle, a cancelled
+    // `create`), where waiting for netlink would block the executor. The cleanup thread is
+    // detached, so it is lost if the process exits first; explicit `teardown` is the normal path.
     fn drop(&mut self) {
-        if !self.live {
+        let Some(ns) = self.ns.take() else {
             return;
-        }
+        };
         let (plan, path) = (self.plan.clone(), self.netns_path.clone());
-        let lab = plan.lab_id().to_owned();
-        if let Err(error) = on_fresh_thread_blocking(&lab, move || teardown_blocking(&plan, &path))
-        {
-            warn!(lab, %error, "lab network teardown on drop failed");
+        let spawned = std::thread::Builder::new()
+            .name("dylos-netns".into())
+            .spawn(move || {
+                if let Err(error) = teardown_blocking(&plan, &path, Some(&ns)) {
+                    warn!(lab = plan.lab_id(), %error, "lab network teardown on drop failed");
+                }
+            });
+        if let Err(error) = spawned {
+            warn!(lab = self.plan.lab_id(), %error, "lab network teardown on drop not started");
         }
     }
 }
@@ -104,13 +112,20 @@ impl Drop for LabNetwork {
 ///
 /// The system or netlink call that failed.
 pub async fn teardown(plan: &FabricPlan, netns_dir: &Path) -> Result<(), Error> {
-    teardown_at(plan, &netns_dir.join(plan.netns_name())).await
+    teardown_at(plan, &netns_dir.join(plan.netns_name()), None).await
 }
 
-async fn teardown_at(plan: &FabricPlan, netns_path: &Path) -> Result<(), Error> {
+async fn teardown_at(
+    plan: &FabricPlan,
+    netns_path: &Path,
+    owned: Option<Arc<File>>,
+) -> Result<(), Error> {
     let (p, path) = (plan.clone(), netns_path.to_owned());
     let started = Instant::now();
-    on_fresh_thread(plan.lab_id(), move || teardown_blocking(&p, &path)).await?;
+    on_fresh_thread(plan.lab_id(), move || {
+        teardown_blocking(&p, &path, owned.as_deref())
+    })
+    .await?;
     info!(
         lab = plan.lab_id(),
         elapsed_ms = started.elapsed().as_millis(),
@@ -119,9 +134,32 @@ async fn teardown_at(plan: &FabricPlan, netns_path: &Path) -> Result<(), Error> 
     Ok(())
 }
 
-fn create_blocking(plan: &FabricPlan, path: &Path) -> Result<(), Error> {
+/// Builds the fabric on a fresh thread, which moves into the new netns; on failure, rolls back
+/// before returning.
+fn create_blocking(plan: &FabricPlan, path: &Path) -> Result<File, Error> {
     let lab = plan.lab_id();
-    netns::create_and_enter(lab, path)?;
+    let created = on_fresh_thread_blocking(lab, {
+        let (plan, path) = (plan.clone(), path.to_owned());
+        move || create_fabric(&plan, &path)
+    });
+    match created {
+        Err(e) if !matches!(e, Error::NetnsExists { .. }) => {
+            let rollback = {
+                let (plan, path) = (plan.clone(), path.to_owned());
+                move || teardown_blocking(&plan, &path, None)
+            };
+            if let Err(error) = on_fresh_thread_blocking(lab, rollback) {
+                warn!(lab, %error, "rollback after failed create");
+            }
+            Err(e)
+        }
+        other => other,
+    }
+}
+
+fn create_fabric(plan: &FabricPlan, path: &Path) -> Result<File, Error> {
+    let lab = plan.lab_id();
+    let ns = netns::create_and_enter(lab, path)?;
     with_netlink(lab, async |handle| {
         for bridge in plan.bridges() {
             // ADR-0002: a restored bridge has forgotten the guests' multicast memberships, so
@@ -149,12 +187,18 @@ fn create_blocking(plan: &FabricPlan, path: &Path) -> Result<(), Error> {
             res.map_err(nl_err(lab, "attach tap", &tap.name))?;
         }
         Ok(())
-    })
+    })?;
+    Ok(ns)
 }
 
-fn teardown_blocking(plan: &FabricPlan, path: &Path) -> Result<(), Error> {
+/// With `owned`, deletes the devices in that netns, and unpins `path` only if it still pins it.
+fn teardown_blocking(plan: &FabricPlan, path: &Path, owned: Option<&File>) -> Result<(), Error> {
     let lab = plan.lab_id();
-    if netns::enter(lab, path)? {
+    let entered = match owned {
+        Some(ns) => netns::enter_file(lab, ns, path)?,
+        None => netns::enter(lab, path)?,
+    };
+    if entered {
         with_netlink(lab, async |handle| {
             let taps = plan.taps().iter().map(|t| &t.name);
             for name in taps.chain(plan.bridges().iter().map(|b| &b.name)) {
@@ -169,7 +213,10 @@ fn teardown_blocking(plan: &FabricPlan, path: &Path) -> Result<(), Error> {
             Ok(())
         })?;
     }
-    netns::remove(lab, path)
+    match owned {
+        Some(ns) if !netns::pins(path, ns).map_err(io_err(lab, "stat netns", path))? => Ok(()),
+        _ => netns::remove(lab, path),
+    }
 }
 
 /// Runs `f` with a netlink socket opened in the calling thread's netns, on a runtime private to

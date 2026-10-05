@@ -5,7 +5,9 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
+use std::pin::pin;
 use std::process::{Command, Stdio};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use dylos_core::LabSpec;
@@ -84,11 +86,30 @@ fn fabric_links(netns: &Path) -> Vec<String> {
     links
 }
 
-fn assert_netns_gone(path: &Path) {
-    assert!(!path.exists(), "{} still exists", path.display());
+fn netns_gone(path: &Path) -> bool {
     let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-    let path = path.to_str().unwrap();
-    assert!(!mounts.contains(path), "{path} still mounted");
+    !path.exists() && !mounts.contains(path.to_str().unwrap())
+}
+
+fn assert_netns_gone(path: &Path) {
+    assert!(
+        netns_gone(path),
+        "{} still exists or is mounted",
+        path.display()
+    );
+}
+
+/// For cleanups that run on a detached thread (`Drop`).
+fn wait_until_netns_gone(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !netns_gone(path) {
+        assert!(
+            Instant::now() < deadline,
+            "{} never removed",
+            path.display()
+        );
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -196,14 +217,70 @@ fn teardown_deletes_devices_even_if_a_process_still_holds_the_netns() {
 }
 
 #[test]
-fn dropping_a_lab_network_tears_it_down() {
-    if !sandboxed("dropping_a_lab_network_tears_it_down") {
+fn dropping_a_live_lab_network_on_the_executor_tears_it_down() {
+    if !sandboxed("dropping_a_live_lab_network_on_the_executor_tears_it_down") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let path = block_on(async {
         let net = LabNetwork::create(plan(), dir.path()).await.unwrap();
-        net.netns_path().to_owned()
+        let path = net.netns_path().to_owned();
+        drop(net);
+        path
     });
-    assert_netns_gone(&path);
+    wait_until_netns_gone(&path);
+    assert_eq!(fabric_links(Path::new("/proc/self/ns/net")), NO_LINKS);
+}
+
+#[test]
+fn cancelled_create_leaves_nothing() {
+    if !sandboxed("cancelled_create_leaves_nothing") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(plan().netns_name());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        // The first poll hands the work to the blocking pool; the future is then dropped.
+        let mut create = pin!(LabNetwork::create(plan(), dir.path()));
+        std::future::poll_fn(|cx| {
+            let _ = create.as_mut().poll(cx);
+            Poll::Ready(())
+        })
+        .await;
+    });
+    // Dropping the runtime waits for the blocking pool, so the worker has finished: the netns
+    // exists now only if its cleanup is still pending, and must disappear on its own.
+    drop(runtime);
+    wait_until_netns_gone(&path);
+    assert_eq!(fabric_links(Path::new("/proc/self/ns/net")), NO_LINKS);
+}
+
+#[test]
+fn a_stale_handle_never_tears_down_a_newer_network_with_the_same_name() {
+    if !sandboxed("a_stale_handle_never_tears_down_a_newer_network_with_the_same_name") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    block_on(async {
+        let mut first = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        first.teardown().await.unwrap();
+        let mut second = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        first.teardown().await.unwrap();
+        drop(first);
+        assert_eq!(fabric_links(second.netns_path()), REFERENCE_LINKS);
+
+        // Crash recovery by name while `second` is still live, then a new lab with the same id.
+        teardown(&plan(), dir.path()).await.unwrap();
+        let mut third = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        second.teardown().await.unwrap();
+        drop(second);
+        assert_eq!(fabric_links(third.netns_path()), REFERENCE_LINKS);
+
+        third.teardown().await.unwrap();
+        assert_netns_gone(third.netns_path());
+    });
 }

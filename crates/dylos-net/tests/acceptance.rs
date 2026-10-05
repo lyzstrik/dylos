@@ -4,9 +4,10 @@ use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use dylos_core::LabSpec;
-use dylos_net::{FabricPlan, LabNetwork, teardown};
+use dylos_net::{Error, FabricPlan, LabNetwork, teardown};
 
 const SANDBOX_ENV: &str = "DYLOS_NET_TEST_SANDBOX";
 
@@ -16,6 +17,7 @@ fn sandboxed(test: &str) -> bool {
     }
     let probe = Command::new("unshare").args(["-Urmn", "true"]).status();
     if !probe.is_ok_and(|s| s.success()) {
+        eprintln!("SKIPPED {test}: unprivileged user namespaces (`unshare -Urmn`) unavailable");
         return false;
     }
     let status = Command::new("unshare")
@@ -92,85 +94,109 @@ fn test_all_devices_are_up_and_configured() {
 }
 
 #[test]
-fn test_teardown_after_midway_failure_and_double_teardown() {
-    if !sandboxed("test_teardown_after_midway_failure_and_double_teardown") {
+fn test_failed_create_rolls_back_then_teardown_is_idempotent() {
+    if !sandboxed("test_failed_create_rolls_back_then_teardown_is_idempotent") {
         return;
     }
+    // Only this sandbox's mount namespace sees it: opening the TUN device yields /dev/null, so
+    // TUNSETIFF fails after the netns and both bridges exist.
+    let hidden = Command::new("mount")
+        .args(["--bind", "/dev/null", "/dev/net/tun"])
+        .status()
+        .unwrap();
+    assert!(hidden.success(), "mount over /dev/net/tun failed: {hidden}");
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
         let p = plan();
         let path = dir.path().join(p.netns_name());
 
-        // Inject failure midway: we manually create the netns and ONE bridge,
-        // simulating a crash before the rest could be created.
-        std::fs::File::create(&path).unwrap();
-        Command::new("unshare")
-            .args([
-                "-n",
-                "mount",
-                "--bind",
-                "/proc/self/ns/net",
-                path.to_str().unwrap(),
-            ])
-            .status()
-            .unwrap();
-
-        // Create the bridge inside the netns
-        let out = Command::new("nsenter")
-            .arg(format!("--net={}", path.display()))
-            .args(["ip", "link", "add", "br-left", "type", "bridge"])
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-
-        // Now we call teardown. It should clean up the partial state.
-        teardown(&p, dir.path()).await.unwrap();
-
-        // Assert netns is gone.
+        let err = LabNetwork::create(p.clone(), dir.path()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Io {
+                    op: "create tap",
+                    ..
+                }
+            ),
+            "{err}"
+        );
         assert_netns_gone(&path);
+        assert_eq!(caller_fabric_links(), "");
 
-        // Double teardown
         teardown(&p, dir.path()).await.unwrap();
+        teardown(&p, dir.path()).await.unwrap();
+        assert_netns_gone(&path);
     });
+}
+
+fn netns_gone(path: &Path) -> bool {
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    !path.exists() && !mounts.contains(path.to_str().unwrap())
 }
 
 fn assert_netns_gone(path: &Path) {
-    assert!(!path.exists(), "{} still exists", path.display());
-    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-    let path_str = path.to_str().unwrap();
-    assert!(!mounts.contains(path_str), "{path_str} still mounted");
+    assert!(
+        netns_gone(path),
+        "{} still exists or is mounted",
+        path.display()
+    );
+}
+
+fn caller_fabric_links() -> String {
+    ip_link(Path::new("/proc/thread-self/ns/net"), &[])
+        .lines()
+        .filter(|l| l.contains(": br-") || l.contains(": tap-"))
+        .collect()
+}
+
+fn thread_netns() -> u64 {
+    std::fs::metadata("/proc/thread-self/ns/net").unwrap().ino()
 }
 
 #[test]
-fn test_caller_thread_is_not_moved_to_lab_netns() {
-    if !sandboxed("test_caller_thread_is_not_moved_to_lab_netns") {
+fn test_caller_and_pool_threads_are_not_moved_to_lab_netns() {
+    if !sandboxed("test_caller_and_pool_threads_are_not_moved_to_lab_netns") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let original_ns = std::fs::metadata("/proc/self/ns/net").unwrap().ino();
+    let original_ns = thread_netns();
+    // A single blocking thread: the one that waited on the namespace workers is the one reused.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    let pool_ns = || async { tokio::task::spawn_blocking(thread_netns).await.unwrap() };
 
-    block_on(async {
+    runtime.block_on(async {
         let mut net = LabNetwork::create(plan(), dir.path()).await.unwrap();
-        let after_create_ns = std::fs::metadata("/proc/self/ns/net").unwrap().ino();
-        assert_eq!(
-            original_ns, after_create_ns,
-            "Caller thread was moved to a different netns during create"
-        );
-
+        assert_eq!(original_ns, thread_netns(), "caller moved by create");
+        assert_eq!(original_ns, pool_ns().await, "pool thread moved by create");
         let lab_ns = std::fs::metadata(net.netns_path()).unwrap().ino();
-        assert_ne!(original_ns, lab_ns, "Caller thread is in the lab netns");
+        assert_ne!(original_ns, lab_ns, "the lab netns is the caller's");
 
         net.teardown().await.unwrap();
-        let after_teardown_ns = std::fs::metadata("/proc/self/ns/net").unwrap().ino();
+        assert_eq!(original_ns, thread_netns(), "caller moved by teardown");
         assert_eq!(
-            original_ns, after_teardown_ns,
-            "Caller thread was moved to a different netns during teardown"
+            original_ns,
+            pool_ns().await,
+            "pool thread moved by teardown"
         );
-    });
 
-    let after_drop_ns = std::fs::metadata("/proc/self/ns/net").unwrap().ino();
-    assert_eq!(
-        original_ns, after_drop_ns,
-        "Caller thread was moved to a different netns during drop"
-    );
+        let live = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let path = live.netns_path().to_owned();
+        drop(live);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !netns_gone(&path) {
+            assert!(
+                Instant::now() < deadline,
+                "drop never removed {}",
+                path.display()
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(original_ns, thread_netns(), "caller moved by drop");
+        assert_eq!(original_ns, pool_ns().await, "pool thread moved by drop");
+    });
 }

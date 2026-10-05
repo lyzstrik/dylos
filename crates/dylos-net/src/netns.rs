@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use nix::errno::Errno;
@@ -36,7 +37,17 @@ where
     F: FnOnce() -> Result<T, Error> + Send + 'static,
 {
     let owned = lab.to_owned();
-    tokio::task::spawn_blocking(move || on_fresh_thread_blocking(&owned, f))
+    blocking(lab, move || on_fresh_thread_blocking(&owned, f)).await
+}
+
+/// `spawn_blocking` for `f`, which must not change the netns of its thread. If the returned
+/// future is dropped, `f` still runs to completion and its result is dropped on the pool thread.
+pub(crate) async fn blocking<T, F>(lab: &str, f: F) -> Result<T, Error>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
         .await
         .map_err(|_| Error::WorkerPanicked {
             lab: lab.to_owned(),
@@ -59,8 +70,9 @@ where
 }
 
 /// Creates a new netns, moves the calling thread into it and pins it at `path` with a bind
-/// mount, like `ip netns add`. The netns then outlives the thread until [`remove`].
-pub(crate) fn create_and_enter(lab: &str, path: &Path) -> Result<(), Error> {
+/// mount, like `ip netns add`. The netns then outlives the thread until [`remove`]. Returns the
+/// pinned netns, opened.
+pub(crate) fn create_and_enter(lab: &str, path: &Path) -> Result<File, Error> {
     File::options()
         .write(true)
         .create_new(true)
@@ -80,21 +92,36 @@ pub(crate) fn create_and_enter(lab: &str, path: &Path) -> Result<(), Error> {
         MsFlags::MS_BIND,
         None::<&str>,
     )
-    .map_err(|e| io_err(lab, "bind-mount netns", path)(e.into()))
+    .map_err(|e| io_err(lab, "bind-mount netns", path)(e.into()))?;
+    File::open(path).map_err(io_err(lab, "open netns", path))
 }
 
 /// Moves the calling thread into the netns pinned at `path`. Returns `false` when there is
 /// nothing to enter: no file, or a file left by a creation that failed before the bind mount.
 pub(crate) fn enter(lab: &str, path: &Path) -> Result<bool, Error> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(io_err(lab, "open netns", path)(e)),
-    };
-    match setns(&file, CloneFlags::CLONE_NEWNET) {
+    match File::open(path) {
+        Ok(file) => enter_file(lab, &file, path),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_err(lab, "open netns", path)(e)),
+    }
+}
+
+pub(crate) fn enter_file(lab: &str, file: &File, path: &Path) -> Result<bool, Error> {
+    match setns(file, CloneFlags::CLONE_NEWNET) {
         Ok(()) => Ok(true),
         Err(Errno::EINVAL) => Ok(false),
         Err(e) => Err(io_err(lab, "enter netns", path)(e.into())),
+    }
+}
+
+/// Whether `path` still pins the netns `ns` refers to. Comparing namespace inodes is only sound
+/// because `ns` is held open: a destroyed netns frees its inode number for reuse.
+pub(crate) fn pins(path: &Path, ns: &File) -> Result<bool, io::Error> {
+    let held = ns.metadata()?;
+    match std::fs::metadata(path) {
+        Ok(m) => Ok((m.dev(), m.ino()) == (held.dev(), held.ino())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
