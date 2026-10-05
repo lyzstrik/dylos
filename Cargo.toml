@@ -27,11 +27,15 @@ undocumented_unsafe_blocks = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+futures-util = { version = "0.3.34", default-features = false }
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["client", "client-legacy", "tokio"] }
 ipnet = "2.9"
+libc = "0.2.190"
+nix = { version = "0.30.1", features = ["ioctl", "mount", "sched"] }
 proptest = "1.4"
+rtnetlink = "0.23.0"
 serde = { version = "1.0", features = ["derive"] }
 serde-saphyr = "1.3"
 serde_json = "1.0"
