@@ -19,7 +19,8 @@ pub trait GuestClock {
     /// Fails if the clock cannot be read.
     fn now_unix_ns(&self) -> Result<u64, ClockError>;
 
-    /// Time since boot, including time the guest was paused.
+    /// Time since boot as read from `CLOCK_BOOTTIME`. Whether this advances while
+    /// a Firecracker guest is paused or restored is not established here (LYZ-37).
     ///
     /// # Errors
     /// Fails if the clock cannot be read.

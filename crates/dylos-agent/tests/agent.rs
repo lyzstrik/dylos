@@ -212,3 +212,48 @@ async fn reconnects_after_the_peer_drops_the_stream() {
     assert!(connect_count.load(Ordering::SeqCst) >= 3);
     agent.abort();
 }
+
+#[tokio::test(start_paused = true)]
+async fn retry_delay_doubles_up_to_the_cap_and_resets_after_a_connection() {
+    let backoff = Backoff {
+        initial: Duration::from_millis(100),
+        max: Duration::from_millis(500),
+    };
+    let mut script: std::collections::VecDeque<std::io::Result<DuplexStream>> =
+        std::iter::repeat_with(|| Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)))
+            .take(6)
+            .collect();
+    let (agent_side, host_side) = tokio::io::duplex(64);
+    drop(host_side);
+    script.push_back(Ok(agent_side));
+    let script = std::sync::Arc::new(Mutex::new(script));
+    let (instants_tx, mut instants_rx) = mpsc::unbounded_channel();
+    let agent = tokio::spawn(async move {
+        let clock = FakeClock::default();
+        run(
+            || {
+                instants_tx.send(tokio::time::Instant::now()).unwrap();
+                let next = script.lock().unwrap().pop_front().unwrap_or_else(|| {
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                });
+                async move { next }
+            },
+            &clock,
+            backoff,
+        )
+        .await
+    });
+
+    let mut instants = Vec::new();
+    for _ in 0..10 {
+        instants.push(instants_rx.recv().await.unwrap());
+    }
+    agent.abort();
+    let gaps: Vec<u64> = instants
+        .windows(2)
+        .map(|pair| u64::try_from((pair[1] - pair[0]).as_millis()).unwrap())
+        .collect();
+    // Failures wait 100, 200, 400, then the 500 cap; the connection that
+    // succeeds and then drops resets the delay to the initial 100.
+    assert_eq!(gaps, [100, 200, 400, 500, 500, 500, 100, 100, 200]);
+}

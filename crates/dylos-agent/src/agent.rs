@@ -139,7 +139,9 @@ where
             }
             Err(error) => {
                 debug!(%error, retry_in = ?delay, "cannot connect to host");
+                tokio::time::sleep(delay).await;
                 delay = backoff.next(delay);
+                continue;
             }
         }
         tokio::time::sleep(delay).await;

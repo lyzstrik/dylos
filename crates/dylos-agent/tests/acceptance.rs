@@ -205,61 +205,94 @@ async fn test_resync_failure() {
     server.await.unwrap().unwrap();
 }
 
-#[tokio::test]
-async fn test_reconnection_loop_after_disconnect() {
-    let clock = Arc::new(MockClock::default());
-    let (tx, rx) = mpsc::unbounded_channel::<DuplexStream>();
-    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+type Dial = std::io::Result<DuplexStream>;
 
-    let connects = Arc::new(AtomicU32::new(0));
-    let connects_clone = connects.clone();
+/// Runs the agent against a scripted host: every connection attempt is
+/// announced on the returned channel, then answered by the next queued `Dial`.
+fn spawn_agent(
+    clock: Arc<MockClock>,
+    backoff: Backoff,
+) -> (
+    mpsc::UnboundedSender<Dial>,
+    mpsc::UnboundedReceiver<u32>,
+    tokio::task::JoinHandle<std::convert::Infallible>,
+) {
+    let (dials_tx, dials_rx) = mpsc::unbounded_channel::<Dial>();
+    let (attempts_tx, attempts_rx) = mpsc::unbounded_channel::<u32>();
+    let dials_rx = Arc::new(tokio::sync::Mutex::new(dials_rx));
+    let attempts = Arc::new(AtomicU32::new(0));
+    let agent = tokio::spawn(async move {
+        run(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                attempts_tx.send(attempt).unwrap();
+                let dials_rx = dials_rx.clone();
+                async move {
+                    dials_rx.lock().await.recv().await.unwrap_or_else(|| {
+                        Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                    })
+                }
+            },
+            clock.as_ref(),
+            backoff,
+        )
+        .await
+    });
+    (dials_tx, attempts_rx, agent)
+}
 
-    let backoff = Backoff {
+async fn attempt(attempts: &mut mpsc::UnboundedReceiver<u32>) -> u32 {
+    timeout(TIMEOUT, attempts.recv()).await.unwrap().unwrap()
+}
+
+fn fast_backoff() -> Backoff {
+    Backoff {
         initial: Duration::from_millis(1),
         max: Duration::from_millis(5),
-    };
+    }
+}
 
-    let agent =
-        tokio::spawn(async move {
-            run(
-                || {
-                    connects_clone.fetch_add(1, Ordering::SeqCst);
-                    let rx_clone = rx.clone();
-                    async move {
-                        rx_clone.lock().await.recv().await.ok_or_else(|| {
-                            std::io::Error::from(std::io::ErrorKind::ConnectionRefused)
-                        })
-                    }
-                },
-                clock.as_ref(),
-                backoff,
-            )
-            .await
-        });
+#[tokio::test]
+async fn test_reconnection_loop_after_disconnect() {
+    let (dials, mut attempts, agent) = spawn_agent(Arc::new(MockClock::default()), fast_backoff());
 
+    for expected in 1..=2 {
+        assert_eq!(attempt(&mut attempts).await, expected);
+        let (agent_stream, host_stream) = tokio::io::duplex(1024);
+        dials.send(Ok(agent_stream)).unwrap();
+        let mut client = TestClient::new(host_stream);
+        assert!(matches!(
+            client.call(RequestBody::Health).await,
+            ReplyBody::Health { .. }
+        ));
+        drop(client);
+    }
+
+    assert_eq!(attempt(&mut attempts).await, 3);
+    agent.abort();
+}
+
+#[tokio::test]
+async fn test_serves_after_connection_refusals() {
+    let (dials, mut attempts, agent) = spawn_agent(Arc::new(MockClock::default()), fast_backoff());
+
+    for expected in 1..=3 {
+        assert_eq!(attempt(&mut attempts).await, expected);
+        dials
+            .send(Err(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+            .unwrap();
+    }
+
+    assert_eq!(attempt(&mut attempts).await, 4);
     let (agent_stream, host_stream) = tokio::io::duplex(1024);
-    tx.send(agent_stream).unwrap();
+    dials.send(Ok(agent_stream)).unwrap();
     let mut client = TestClient::new(host_stream);
     assert!(matches!(
         client.call(RequestBody::Health).await,
         ReplyBody::Health { .. }
     ));
-    drop(client);
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let (agent_stream, host_stream) = tokio::io::duplex(1024);
-    tx.send(agent_stream).unwrap();
-    let mut client = TestClient::new(host_stream);
-    assert!(matches!(
-        client.call(RequestBody::Health).await,
-        ReplyBody::Health { .. }
-    ));
-    drop(client);
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    assert!(connects.load(Ordering::SeqCst) >= 3);
     agent.abort();
 }
 
