@@ -1,6 +1,6 @@
 # ADR-0004: Privilege model
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-10-05
 - Issue: LYZ-39
 
