@@ -15,15 +15,29 @@ use tokio::process::{Child, Command};
 
 const NOBODY: u32 = 65534;
 
+/// The upstream static binaries from `docs/host.md`. Not derived from `$HOME`: under `sudo` it
+/// is root's home, so the directory is passed explicitly.
+fn binaries_dir() -> Option<PathBuf> {
+    std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from)
+}
+
 fn missing_prerequisite(kernel: &Path) -> Option<String> {
     let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
     if !is_root {
         return Some("the jailer must start as root".into());
     }
-    [Path::new("/dev/kvm"), Path::new("/usr/bin/jailer"), kernel]
-        .into_iter()
-        .find(|p| !p.exists())
-        .map(|p| format!("{} is missing", p.display()))
+    let Some(bin) = binaries_dir() else {
+        return Some("DYLOS_FC_BIN_DIR is not set (see docs/host.md)".into());
+    };
+    [
+        Path::new("/dev/kvm"),
+        &bin.join("jailer"),
+        &bin.join("firecracker"),
+        kernel,
+    ]
+    .into_iter()
+    .find(|p| !p.exists())
+    .map(|p| format!("{} is missing", p.display()))
 }
 
 /// A network namespace owned by the test: it lives as long as the holder process, which is
@@ -78,7 +92,10 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
         return;
     }
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let config = JailerConfig::new(dir.path(), NOBODY, NOBODY);
+    let bin = binaries_dir().unwrap();
+    let mut config = JailerConfig::new(dir.path(), NOBODY, NOBODY);
+    config.jailer = bin.join("jailer");
+    config.firecracker = bin.join("firecracker");
     let netns = OwnedNetns::new().await;
 
     let mut vm = Vm::launch(&config, &spec("vm0", &kernel, &netns))
