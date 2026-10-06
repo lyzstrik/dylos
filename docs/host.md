@@ -7,10 +7,23 @@
 
 ## Firecracker
 - Version : v1.17.0
-- Binaries : /usr/bin/firecracker, /usr/bin/jailer
-- SHA-256 firecracker : ca7f76f3df3c8dab47fa9dbdb989fa25341b9c7360813c8f2929b6ea11d6e075
-- SHA-256 jailer : 1aad864ab59a6398a77b213ea982d0a03f9f8ae93c3d62443dd22b642a9f3b90
-- Source : [GitHub](https://github.com/firecracker-microvm/firecracker) | Installation via paru
+- Binaries : `~/.local/share/dylos/bin/firecracker`, `~/.local/share/dylos/bin/jailer` (override the directory with `DYLOS_FC_BIN_DIR`)
+- Source : upstream release [v1.17.0](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.17.0), `firecracker-v1.17.0-x86_64.tgz`
+- SHA-256 archive : 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558 (checked against the published `.sha256.txt`)
+- SHA-256 firecracker : 99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5
+- SHA-256 jailer : 65ef226e96f0ceda55ba643f445801ef2cc0ea667ef67cad8ac4f406c9c8434f
+- Both are static (`static-pie`). Do not use a distribution package: the Arch Linux one is dynamically linked against glibc, and the jailer copies Firecracker into an empty chroot that has no dynamic loader, so exec fails with `No such file or directory`.
+
+Install:
+
+```sh
+D=~/.local/share/dylos; U=https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0
+mkdir -p $D/bin && cd $(mktemp -d)
+curl -fsSLO $U/firecracker-v1.17.0-x86_64.tgz && curl -fsSLO $U/firecracker-v1.17.0-x86_64.tgz.sha256.txt
+sha256sum -c firecracker-v1.17.0-x86_64.tgz.sha256.txt && tar xzf firecracker-v1.17.0-x86_64.tgz
+cp release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64 $D/bin/firecracker
+cp release-v1.17.0-x86_64/jailer-v1.17.0-x86_64 $D/bin/jailer
+```
 
 ## Guest kernel
 - Version : 6.18.51
