@@ -123,6 +123,8 @@ fn build_rootfs(
         .arg(format!("ROOTFS_SIZE={ROOTFS_SIZE}"))
         .arg("--output")
         .arg(output_spec)
+        .arg("--build-context")
+        .arg(format!("workspace={}", workspace.display()))
         .arg("--file")
         .arg(images_dir.join("Dockerfile"))
         .arg(&images_dir)

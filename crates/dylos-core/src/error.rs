@@ -1,9 +1,22 @@
 use ipnet::IpNet;
 
+#[derive(Debug)]
+pub struct MacCollisionInfo {
+    pub segment: String,
+    pub node1: String,
+    pub iface1: String,
+    pub node2: String,
+    pub iface2: String,
+    pub mac: String,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("parse error: {0}")]
     Parse(#[from] serde_saphyr::Error),
+
+    #[error("formatting error: {0}")]
+    Format(#[from] std::fmt::Error),
 
     #[error("{path}: duplicate node name {name:?}")]
     DuplicateNodeName { path: String, name: String },
@@ -51,4 +64,47 @@ pub enum Error {
 
     #[error("{path}: route destination and gateway families do not match")]
     FamilyMismatch { path: String },
+
+    #[error("MAC collision in segment {0:?}")]
+    MacCollision(Box<MacCollisionInfo>),
+
+    #[error(
+        "boot parameters for node {node:?} exceed the {budget} bytes budget (actual: {actual})"
+    )]
+    BootArgsTooLong {
+        node: String,
+        budget: usize,
+        actual: usize,
+    },
+
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("unsupported manifest version {found}, only version {supported} is supported")]
+    UnsupportedManifestVersion { found: u32, supported: u32 },
+
+    #[error("invalid path in VM {vm}: {path} (must be relative and have no parent components)")]
+    InvalidPath {
+        vm: String,
+        path: std::path::PathBuf,
+    },
+
+    #[error(
+        "integrity mismatch for VM {vm} file {path}: size expected {expected_size}, actual {actual_size}, sha256 expected {expected_sha256}, actual {actual_sha256}"
+    )]
+    IntegrityMismatch {
+        vm: String,
+        path: std::path::PathBuf,
+        expected_size: u64,
+        actual_size: u64,
+        expected_sha256: String,
+        actual_sha256: String,
+    },
+
+    #[error("io error for VM {vm} file {path}: {source}")]
+    Io {
+        vm: String,
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
 }
