@@ -2,6 +2,19 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("response too large for {method} {route} on {path:?}: exceeded limit of {limit} bytes")]
+    ResponseTooLarge {
+        path: PathBuf,
+        method: String,
+        route: String,
+        limit: usize,
+    },
+    #[error("request timed out for {method} {route} on {path:?}")]
+    Timeout {
+        path: PathBuf,
+        method: String,
+        route: String,
+    },
     #[error("failed to connect to socket {path:?} for {method} {route}")]
     Connect {
         path: PathBuf,
@@ -60,7 +73,7 @@ pub enum Error {
         route: String,
         status: u16,
         #[source]
-        source: hyper::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("failed to build request for {method} {route} on {path:?}")]
     RequestBuilder {
