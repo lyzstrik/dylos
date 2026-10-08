@@ -61,7 +61,7 @@ fn command_line_uses_jail_relative_paths_and_drops_privileges() {
     let config = config();
     let paths = JailPaths::new(&config, "lab", "web").unwrap();
     let netns = Path::new("/run/netns/dylos-lab");
-    let args = jailer_args(&config, &paths, Some(netns));
+    let args = jailer_args(&config, &paths, Some(netns), 1, 128);
     assert_eq!(
         strings(&args).join(" "),
         "--id lab-web --exec-file /usr/bin/firecracker --uid 1234 --gid 5678 \
@@ -79,11 +79,15 @@ fn command_line_is_identical_for_every_clone_and_has_no_netns_when_none() {
         &config(),
         &JailPaths::new(&config(), "lab", "db").unwrap(),
         None,
+        1,
+        128,
     );
     let b = jailer_args(
         &config(),
         &JailPaths::new(&config(), "lab", "db").unwrap(),
         None,
+        1,
+        128,
     );
     assert_eq!(a, b);
     assert!(!strings(&a).contains(&"--netns"));
@@ -91,6 +95,8 @@ fn command_line_is_identical_for_every_clone_and_has_no_netns_when_none() {
         &other_host,
         &JailPaths::new(&other_host, "lab", "db").unwrap(),
         None,
+        1,
+        128,
     );
     assert!(
         strings(&c)
@@ -155,23 +161,86 @@ async fn releasing_a_released_jail_leaves_its_replacement_intact() {
 }
 
 #[test]
-fn per_vm_cgroup_is_requested_even_without_properties() {
+fn per_vm_cgroup_has_bounded_default_resources() {
     let config = JailerConfig::new("/srv/dylos", 1234, 5678);
     let paths = JailPaths::new(&config, "lab", "web").unwrap();
-    let args = jailer_args(&config, &paths, None);
+    let args = jailer_args(&config, &paths, None, 1, 128);
     let cgroups: Vec<&str> = strings(&args)
         .windows(2)
         .filter(|w| w[0] == "--cgroup")
         .map(|w| w[1])
         .collect();
-    assert_eq!(cgroups, ["pids.max=max"]);
+    assert_eq!(cgroups, ["pids.max=33", "memory.max=268435456"]);
     assert_eq!(
-        strings(&jailer_args(&self::config(), &paths, None))
+        strings(&jailer_args(&self::config(), &paths, None, 1, 128))
             .iter()
             .filter(|a| **a == "--cgroup")
             .count(),
         1
     );
+}
+
+#[test]
+fn default_limits_scale_with_vm_resources_without_overflow() {
+    let config = JailerConfig::new("/srv/dylos", 1234, 5678);
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    for (vcpus, mib, pids, bytes) in [
+        (8, 512, 40, 640 * 1024 * 1024),
+        (
+            u8::MAX,
+            u32::MAX,
+            287,
+            (u64::from(u32::MAX) + 128) * 1024 * 1024,
+        ),
+    ] {
+        let args = jailer_args(&config, &paths, None, vcpus, mib);
+        let args = strings(&args);
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--cgroup", &format!("pids.max={pids}")])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--cgroup", &format!("memory.max={bytes}")])
+        );
+    }
+}
+
+#[test]
+fn limits_are_independently_overridable_and_explicit_cgroups_win() {
+    let mut config = JailerConfig::new("/srv/dylos", 1234, 5678);
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    for (pids, memory, expected) in [
+        (Some(64), None, ["pids.max=64", "memory.max=268435456"]),
+        (
+            None,
+            Some(536_870_912),
+            ["pids.max=33", "memory.max=536870912"],
+        ),
+        (
+            Some(64),
+            Some(536_870_912),
+            ["pids.max=64", "memory.max=536870912"],
+        ),
+    ] {
+        config.pids_max = pids;
+        config.memory_max = memory;
+        let args = jailer_args(&config, &paths, None, 1, 128);
+        let values: Vec<_> = strings(&args)
+            .windows(2)
+            .filter(|w| w[0] == "--cgroup")
+            .map(|w| w[1])
+            .collect();
+        assert_eq!(values, expected);
+    }
+    config.cgroups = vec!["pids.max=99".into(), "memory.max=1073741824".into()];
+    let args = jailer_args(&config, &paths, None, 1, 128);
+    let values: Vec<_> = strings(&args)
+        .windows(2)
+        .filter(|w| w[0] == "--cgroup")
+        .map(|w| w[1])
+        .collect();
+    assert_eq!(values, ["pids.max=99", "memory.max=1073741824"]);
 }
 
 #[tokio::test]

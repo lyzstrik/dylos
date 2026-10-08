@@ -19,6 +19,8 @@ fn spec(sandbox: &Sandbox) -> VmSpec {
     let kernel = sandbox.dir.path().join("vmlinux.bin");
     std::fs::write(&kernel, b"kernel").unwrap();
     VmSpec {
+        vcpu_count: 1,
+        mem_size_mib: 128,
         lab_id: "lab1".into(),
         node: "web".into(),
         netns: None,
@@ -366,5 +368,18 @@ async fn shutdown_retry_preserves_cleanup_failure() {
     std::fs::remove_file(leftover).unwrap();
     std::fs::remove_dir(&vm.paths().cgroup_dir).unwrap();
     std::fs::remove_dir_all(&vm.paths().jail_dir).unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn launch_passes_vm_resources_to_jailer_limits() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut spec = spec(&sandbox);
+    spec.vcpu_count = 8;
+    spec.mem_size_mib = 512;
+    let mut vm = Vm::launch(&sandbox.config, &spec).await.unwrap();
+    let args = std::fs::read_to_string(vm.paths().root.join("cgroup-args")).unwrap();
+    assert_eq!(args, "pids.max=40\nmemory.max=671088640");
+    vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
 }

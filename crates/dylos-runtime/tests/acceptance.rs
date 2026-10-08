@@ -18,6 +18,8 @@ fn spec(sandbox: &Sandbox) -> VmSpec {
     let kernel = sandbox.dir.path().join("vmlinux.bin");
     std::fs::write(&kernel, b"kernel").unwrap();
     VmSpec {
+        vcpu_count: 1,
+        mem_size_mib: 128,
         lab_id: "acpt-lab".into(),
         node: "node1".into(),
         netns: None,

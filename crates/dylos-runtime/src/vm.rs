@@ -50,6 +50,9 @@ impl Default for Timeouts {
 pub struct VmSpec {
     pub lab_id: String,
     pub node: String,
+    pub vcpu_count: u8,
+    /// Guest RAM in MiB; must match the Firecracker machine configuration.
+    pub mem_size_mib: u32,
     /// Network namespace the jailer joins (`--netns`); `None` keeps the caller's.
     pub netns: Option<PathBuf>,
     pub files: Vec<ChrootFile>,
@@ -106,7 +109,13 @@ impl Vm {
             let start = std::time::Instant::now();
             let mut jail = jailer::prepare_chroot(config, &paths, &spec.files).await?;
             let child = Command::new(&config.jailer)
-                .args(jailer::jailer_args(config, &paths, spec.netns.as_deref()))
+                .args(jailer::jailer_args(
+                    config,
+                    &paths,
+                    spec.netns.as_deref(),
+                    spec.vcpu_count,
+                    spec.mem_size_mib,
+                ))
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
