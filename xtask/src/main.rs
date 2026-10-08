@@ -1,3 +1,8 @@
+//! Complex build and test logic in Rust.
+//!
+//! This crate contains build scripts, integration testing setups, and tooling,
+//! called primarily from the `justfile`. It depends on basic utilities but is
+//! not part of the `dylos` dependency tree.
 #![forbid(unsafe_code)]
 
 use anyhow::{Context, bail};

@@ -1,3 +1,10 @@
+//! Pure domain definitions and logic for Dylos.
+//!
+//! This crate contains the structural definition of a lab (`LabSpec`), its validation,
+//! and the snapshot manifest format.
+//! It sits at the bottom of the dependency graph (see `docs/architecture.md`)
+//! and must **never** depend on system-specific or async runtime crates
+//! (like `tokio`, `nix`, `libc`, or `rtnetlink`).
 #![forbid(unsafe_code)]
 
 pub mod error;
@@ -14,14 +21,25 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 impl LabSpec {
-    #[allow(clippy::missing_errors_doc)]
+    /// Parses a YAML string into a validated `LabSpec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the YAML is structurally invalid (malformed or missing required fields)
+    /// or if it fails semantic validation (e.g., overlapping IP prefixes, duplicate names, invalid references).
     pub fn from_yaml_str(yaml: &str) -> Result<Self, Error> {
         let spec: LabSpec = serde_saphyr::from_str(yaml)?;
         spec.validate()?;
         Ok(spec)
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    /// Validates the semantic constraints of the lab spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lab spec contains invalid names, duplicate names,
+    /// duplicate IP addresses, unknown segment references, IPs outside their segment's CIDR block,
+    /// or unreachable static route gateways.
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), Error> {
         let mut node_names = HashSet::new();

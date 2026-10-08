@@ -1,4 +1,8 @@
 //! Network namespaces, bridges, TAP devices, and fabric freeze/thaw.
+//!
+//! This crate manages the host network resources required by a lab.
+//! It depends on `dylos-core` for lab definitions, but must never depend on
+//! higher-level orchestration crates (like `dylos-runtime` or `dylos-cli`).
 
 mod error;
 mod fabric;
