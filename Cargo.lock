@@ -199,8 +199,12 @@ dependencies = [
 name = "dylos-runtime"
 version = "0.1.0"
 dependencies = [
+ "dylos-core",
  "dylos-fc",
+ "dylos-net",
  "dylos-runtime",
+ "dylos-store",
+ "futures-util",
  "nix 0.31.3",
  "serde_json",
  "tempfile",
