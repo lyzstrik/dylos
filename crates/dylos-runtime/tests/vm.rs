@@ -383,3 +383,42 @@ async fn launch_passes_vm_resources_to_jailer_limits() {
     vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
+
+async fn readiness_case(mode: Mode, forwarded: Option<&str>) -> dylos_runtime::Result<Duration> {
+    let sandbox = Sandbox::new(mode);
+    support::readiness_case(&sandbox, &spec(&sandbox), mode, forwarded).await
+}
+
+#[tokio::test]
+async fn readiness_marker_emitted_before_waiting() {
+    assert!(
+        readiness_case(Mode::EarlyReadiness, Some("early marker forwarded"))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn readiness_marker_retained_under_spam() {
+    assert!(
+        readiness_case(Mode::SpamOutput, Some("burst forwarded"))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn readiness_requires_exact_match_and_retains_first_failure() {
+    let result = readiness_case(Mode::FalseReadiness, None).await;
+    assert!(
+        matches!(result, Err(Error::ReadinessFailed { line, .. }) if line == "dylos: network setup failed")
+    );
+}
+
+#[tokio::test]
+async fn readiness_timeout_cleans_up() {
+    assert!(matches!(
+        readiness_case(Mode::Serve, None).await,
+        Err(Error::ReadinessTimeout { .. })
+    ));
+}

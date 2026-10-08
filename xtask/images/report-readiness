@@ -1,0 +1,7 @@
+#!/bin/sh
+MARKER="${DYLOS_NET_MARKER:-/run/dylos-net-failed}"
+if [ -f "$MARKER" ]; then
+    echo 'dylos: network setup failed'
+else
+    echo 'dylos: ready'
+fi

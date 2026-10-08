@@ -26,10 +26,11 @@ RUN apk add --no-cache e2fsprogs \
 COPY init /rootfs/sbin/init
 COPY net-setup /rootfs/sbin/net-setup
 COPY net-setup-guard /rootfs/sbin/net-setup-guard
+COPY report-readiness /rootfs/sbin/report-readiness
 COPY --from=agent /src/target/x86_64-unknown-linux-musl/release/dylos-agent /rootfs/usr/sbin/dylos-agent
 
 RUN chmod 0755 /rootfs/sbin/init /rootfs/sbin/net-setup /rootfs/sbin/net-setup-guard \
-        /rootfs/usr/sbin/dylos-agent \
+        /rootfs/sbin/report-readiness /rootfs/usr/sbin/dylos-agent \
     && find /rootfs -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
     && mkdir -p /out \
     && E2FSPROGS_FAKE_TIME="${SOURCE_DATE_EPOCH}" mkfs.ext4 -F -q -d /rootfs \
