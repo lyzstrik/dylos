@@ -12,12 +12,18 @@ fmt:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run all checks (format, clippy, tests, cargo-deny)
+# Run all checks (format, clippy, doc, tests, cargo-deny)
 check:
     cargo fmt --check
     just clippy
+    just doc
     cargo nextest run --workspace
     cargo deny check
+
+# Generate and verify documentation
+doc:
+    RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
 
 # Run unit and property tests
 test:

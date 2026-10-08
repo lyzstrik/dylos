@@ -1,3 +1,16 @@
+//! Pure domain definitions and logic for Dylos.
+//!
+//! # Current status of the spike
+//!
+//! The core models what exists for the technical spike.
+//!
+//! # Target Design Constraints
+//!
+//! This crate contains the structural definition of a lab (`LabSpec`), its validation,
+//! and the snapshot manifest format.
+//! It sits at the bottom of the dependency graph (see `docs/architecture.md`)
+//! and must **never** depend on system-specific or async runtime crates
+//! (like `tokio`, `nix`, `libc`, or `rtnetlink`).
 #![forbid(unsafe_code)]
 
 pub mod error;
@@ -14,20 +27,34 @@ use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 impl LabSpec {
-    #[allow(clippy::missing_errors_doc)]
+    /// Parses a YAML string into a validated `LabSpec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the YAML is structurally invalid (malformed or missing required fields)
+    /// or if it fails semantic validation. See [`LabSpec::validate`] for examples of semantic errors.
     pub fn from_yaml_str(yaml: &str) -> Result<Self, Error> {
         let spec: LabSpec = serde_saphyr::from_str(yaml)?;
         spec.validate()?;
         Ok(spec)
     }
 
-    #[allow(clippy::missing_errors_doc)]
+    /// Validates the semantic constraints of the lab spec.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if semantic constraints are violated. Examples include:
+    /// - Invalid names (e.g., too long, illegal characters)
+    /// - Duplicate segment or node names
+    /// - Unknown segment references
+    /// - Duplicate IP addresses on the same segment
+    /// - IPs outside their segment's CIDR block
+    /// - Unreachable static route gateways
     #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), Error> {
         let mut node_names = HashSet::new();
         let mut segment_names = HashMap::new();
 
-        // 1. Unique segment names
         for (i, segment) in self.segments.iter().enumerate() {
             if let Err(reason) = validate_name(&segment.name, 32) {
                 return Err(Error::InvalidName {
@@ -46,7 +73,6 @@ impl LabSpec {
 
         let mut segment_ips: HashMap<&String, HashSet<IpAddr>> = HashMap::new();
 
-        // 2. Unique node names
         for (i, node) in self.nodes.iter().enumerate() {
             if let Err(reason) = validate_name(&node.name, 32) {
                 return Err(Error::InvalidName {
@@ -95,7 +121,6 @@ impl LabSpec {
                     });
                 };
 
-                // IPv6 check
                 if !segment.ipv6.contains(&iface.ipv6.addr()) {
                     return Err(Error::IpOutsideSegment {
                         path: format!("nodes[{i}].interfaces[{j}].ipv6"),
@@ -125,7 +150,6 @@ impl LabSpec {
                 node_iface_prefixes.push(ipnet::IpNet::V6(iface.ipv6));
                 node_own_addresses.insert(IpAddr::V6(iface.ipv6.addr()));
 
-                // IPv4 check
                 match (segment.ipv4, iface.ipv4) {
                     (Some(seg_v4), Some(iface_v4)) => {
                         if !seg_v4.contains(&iface_v4.addr()) {
