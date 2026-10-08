@@ -48,4 +48,17 @@ pub enum Error {
 
     #[error("lab {lab}: namespace worker thread panicked")]
     WorkerPanicked { lab: String },
+
+    #[error("lab {lab}: network has been removed")]
+    NetworkRemoved { lab: String },
+
+    #[error(
+        "lab {lab}: fabric {step} failed: {failures:?}; rollback failures: {rollback_failures:?}"
+    )]
+    FabricTransition {
+        lab: String,
+        step: &'static str,
+        failures: Vec<String>,
+        rollback_failures: Vec<String>,
+    },
 }

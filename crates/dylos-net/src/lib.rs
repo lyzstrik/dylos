@@ -2,7 +2,12 @@
 //!
 //! # Current status of the spike
 //!
-//! Fabric features such as fabric freeze/thaw do not exist yet (LYZ-24).
+//! Freeze takes every TAP down. Frames sent after freeze completes are rejected, including
+//! across thaw; earlier queued frames may still be read. Their send precedes every snapshot,
+//! so they preserve the consistent cut. Clones have fresh TAPs without those host queues.
+//! This implements the revised invariant authorized for LYZ-19 (ADR revision tracked in LYZ-53).
+//! Firecracker device buffers (including deferred RX in `Net::prepare_save`) and guest/virtio
+//! receive counters remain unverified until the real-VM test after LYZ-52.
 //!
 //! # Target Design Constraints
 //!
@@ -12,6 +17,7 @@
 
 mod error;
 mod fabric;
+mod freeze;
 mod netns;
 mod plan;
 mod tap;
