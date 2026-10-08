@@ -16,11 +16,6 @@ use crate::error::{Error, Result};
 pub const API_SOCKET: &str = "/run/firecracker.socket";
 pub const METRICS_FILE: &str = "/run/metrics.json";
 
-/// Jailer v1.17.0 creates and joins `<parent>/<id>` only when at least one `--cgroup` property
-/// is given; without one it merely joins the parent. `pids.max=max` is the kernel default, so it
-/// requests the per-VM cgroup without limiting anything.
-const DEFAULT_CGROUP: &str = "pids.max=max";
-
 /// How to start the jailer. Shared by every VM of a host.
 #[derive(Debug, Clone)]
 pub struct JailerConfig {
@@ -33,8 +28,14 @@ pub struct JailerConfig {
     pub gid: u32,
     /// Passed as `--parent-cgroup`; the jailer defaults it to the Firecracker file name.
     pub parent_cgroup: Option<String>,
-    /// `<cgroup_file>=<value>` entries, each passed as `--cgroup` (cgroup v2). When empty,
-    /// `pids.max=max` is passed so that the VM still gets its own cgroup.
+    /// Override the derived task limit (threads count as tasks in cgroup v2).
+    pub pids_max: Option<u64>,
+    /// Override the derived memory limit, in bytes.
+    pub memory_max: Option<u64>,
+    /// `<cgroup_file>=<value>` entries, each passed as `--cgroup` (cgroup v2).
+    /// Each entry overrides only its own property, including the numeric overrides above.
+    /// Unrelated entries retain both resource limits. Explicit `pids.max=max` or
+    /// `memory.max=max` opts out of that limit. For repeated properties, the last entry wins.
     pub cgroups: Vec<String>,
     /// Mount point of the cgroup v2 hierarchy. The jailer finds it in `/proc/mounts`; this must
     /// match, since the VM cgroup is removed from here.
@@ -63,6 +64,8 @@ impl JailerConfig {
             gid,
             parent_cgroup: None,
             cgroups: Vec::new(),
+            pids_max: None,
+            memory_max: None,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             launcher_args: Vec::new(),
             #[cfg(feature = "test-hooks")]
@@ -157,6 +160,8 @@ pub fn jailer_args(
     config: &JailerConfig,
     paths: &JailPaths,
     netns: Option<&Path>,
+    vcpu_count: u8,
+    mem_size_mib: u32,
 ) -> Vec<OsString> {
     let mut flags: Vec<(&str, OsString)> = vec![
         ("--id", paths.id.clone().into()),
@@ -169,10 +174,32 @@ pub fn jailer_args(
     if let Some(parent) = &config.parent_cgroup {
         flags.push(("--parent-cgroup", parent.into()));
     }
-    if config.cgroups.is_empty() {
-        flags.push(("--cgroup", DEFAULT_CGROUP.into()));
+    if !config.cgroups.iter().any(|c| c.starts_with("pids.max=")) {
+        // One task per vCPU plus 32 for the API, VMM and I/O threads and startup headroom.
+        let pids = config.pids_max.unwrap_or(u64::from(vcpu_count) + 32);
+        flags.push(("--cgroup", format!("pids.max={pids}").into()));
     }
-    flags.extend(config.cgroups.iter().map(|c| ("--cgroup", c.into())));
+    if !config.cgroups.iter().any(|c| c.starts_with("memory.max=")) {
+        // Guest RAM plus 128 MiB for Firecracker's heap, stacks, mappings and I/O buffers.
+        // Promote before arithmetic so even the largest u32 MiB value cannot overflow.
+        let memory = config
+            .memory_max
+            .unwrap_or((u64::from(mem_size_mib) + 128) * 1024 * 1024);
+        flags.push(("--cgroup", format!("memory.max={memory}").into()));
+    }
+    for (index, entry) in config.cgroups.iter().enumerate() {
+        let property = entry.split_once('=').map(|(property, _)| property);
+        if property.is_some_and(|property| {
+            config.cgroups[index + 1..].iter().any(|later| {
+                later
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key == property)
+            })
+        }) {
+            continue;
+        }
+        flags.push(("--cgroup", entry.into()));
+    }
     if let Some(netns) = netns {
         flags.push(("--netns", netns.into()));
     }

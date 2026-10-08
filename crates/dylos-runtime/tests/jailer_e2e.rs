@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use dylos_fc::config::{BootSource, MachineConfiguration};
+use dylos_fc::config::{BootSource, InstanceActionInfo, MachineConfiguration};
 use dylos_runtime::jailer::{ChrootFile, JailerConfig};
 use dylos_runtime::{Timeouts, Vm, VmSpec};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -74,6 +74,8 @@ fn netns_of(pid: u32) -> PathBuf {
 
 fn spec(node: &str, kernel: &Path, netns: &OwnedNetns) -> VmSpec {
     VmSpec {
+        vcpu_count: 1,
+        mem_size_mib: 128,
         lab_id: "e2e".into(),
         node: node.into(),
         netns: Some(netns.path.clone()),
@@ -114,6 +116,19 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
     assert_eq!(cgroup.trim(), format!("0::/firecracker/{}", paths.id));
     assert_eq!(netns_of(pid), netns_of(netns.holder.id().unwrap()));
 
+    assert_eq!(
+        std::fs::read_to_string(paths.cgroup_dir.join("pids.max"))
+            .unwrap()
+            .trim(),
+        "33"
+    );
+    assert_eq!(
+        std::fs::read_to_string(paths.cgroup_dir.join("memory.max"))
+            .unwrap()
+            .trim(),
+        "268435456"
+    );
+
     let client = vm.client();
     client
         .put_machine_config(&MachineConfiguration::new(1, 128))
@@ -123,6 +138,13 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
         .put_boot_source(&BootSource::new("/vmlinux.bin"))
         .await
         .unwrap();
+
+    client
+        .put::<_, serde_json::Value>("/actions", &InstanceActionInfo::instance_start())
+        .await
+        .unwrap();
+    let info: serde_json::Value = client.get("/").await.unwrap().unwrap();
+    assert_eq!(info["state"], "Running");
 
     vm.shutdown().await.unwrap();
     assert!(!paths.jail_dir.exists());
