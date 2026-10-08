@@ -212,6 +212,16 @@ impl Vm {
     }
 
     #[must_use]
+    pub fn output(&self) -> Vec<String> {
+        self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
     pub fn paths(&self) -> &JailPaths {
         &self.paths
     }

@@ -3,5 +3,6 @@ mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 /sbin/net-setup-guard
+echo "dylos-guest-ready"
 dylos-agent &
 exec setsid cttyhack /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1
