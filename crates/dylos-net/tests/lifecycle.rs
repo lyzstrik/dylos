@@ -46,6 +46,37 @@ fn sandboxed(test: &str) -> bool {
     false
 }
 
+fn ownership_sandboxed(test: &str) -> bool {
+    if std::env::var_os(SANDBOX_ENV).is_some() {
+        return true;
+    }
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ownership-sandbox.sh"
+    );
+    let args = ["--map-auto", "--map-root-user", "-n", "-m", "sh", fixture];
+    let probe = Command::new("unshare").args(args).arg("true").output();
+    match probe {
+        Ok(out) if out.status.success() => {}
+        result => {
+            eprintln!(
+                "SKIPPED {test}: subordinate uid/gid mappings for 1000 unavailable \
+                 (`unshare --map-auto --map-root-user -n -m`): {result:?}"
+            );
+            return false;
+        }
+    }
+    let status = Command::new("unshare")
+        .args(args)
+        .arg(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--nocapture"])
+        .env(SANDBOX_ENV, "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "{test} failed inside the sandbox");
+    false
+}
+
 fn plan() -> FabricPlan {
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
     FabricPlan::new("lab1", &spec).unwrap()
@@ -289,13 +320,14 @@ fn a_stale_handle_never_tears_down_a_newer_network_with_the_same_name() {
 
 #[test]
 fn taps_are_owned_by_the_requested_uid_and_gid() {
-    if !sandboxed("taps_are_owned_by_the_requested_uid_and_gid") {
+    if !ownership_sandboxed("taps_are_owned_by_the_requested_uid_and_gid") {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
-        // The unshare harness maps only uid/gid 0; other owners are invalid in this user namespace.
-        let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
+        let mut net = LabNetwork::create(plan(), dir.path(), 1000, 1000)
+            .await
+            .unwrap();
         for tap in net.plan().taps() {
             let out = Command::new("nsenter")
                 .arg(format!("--net={}", net.netns_path().display()))
@@ -314,7 +346,7 @@ fn taps_are_owned_by_the_requested_uid_and_gid() {
             );
             assert_eq!(
                 String::from_utf8(out.stdout).unwrap(),
-                "0\n0\n",
+                "1000\n1000\n",
                 "{}",
                 tap.name
             );
