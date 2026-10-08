@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use futures_util::TryStreamExt;
 use rtnetlink::{Handle, LinkBridge, LinkUnspec};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::netns::{self, blocking, io_err, on_fresh_thread, on_fresh_thread_blocking};
@@ -18,6 +19,7 @@ pub struct LabNetwork {
     netns_path: PathBuf,
     /// The netns this handle created, held open until torn down. `None` once torn down.
     ns: Option<Arc<File>>,
+    fabric_state: Arc<Mutex<crate::freeze::State>>,
 }
 
 impl LabNetwork {
@@ -48,6 +50,7 @@ impl LabNetwork {
                 plan,
                 netns_path,
                 ns: Some(Arc::new(ns)),
+                fabric_state: Arc::default(),
             })
         })
         .instrument(span.clone())
@@ -68,6 +71,64 @@ impl LabNetwork {
         &self.netns_path
     }
 
+    /// Rejects frames sent after completion; pre-existing TAP reader queues remain readable.
+    /// See the crate's freeze limitations.
+    /// Idempotent. A cancelled call still completes on its namespace worker.
+    ///
+    /// # Errors
+    /// Reports every failed interface and any failed rollback. Retry `thaw` to recover.
+    pub async fn freeze(&mut self) -> Result<(), Error> {
+        self.transition(true).await
+    }
+
+    /// Restores pre-freeze TAP administrative states; also safe before freeze.
+    ///
+    /// # Errors
+    /// Reports failed interfaces and rollback failures; retains recovery state for a retry.
+    pub async fn thaw(&mut self) -> Result<(), Error> {
+        self.transition(false).await
+    }
+
+    async fn transition(&self, frozen: bool) -> Result<(), Error> {
+        let ns = self.ns.clone().ok_or_else(|| Error::NetworkRemoved {
+            lab: self.plan.lab_id().to_owned(),
+        })?;
+        let (plan, path, state) = (
+            self.plan.clone(),
+            self.netns_path.clone(),
+            self.fabric_state.clone(),
+        );
+        let span = info_span!(
+            "fabric_step",
+            lab = plan.lab_id(),
+            step = if frozen { "freeze" } else { "thaw" }
+        );
+        // Acquire before dispatch: cancellation cannot let a subsequent thaw overtake freeze.
+        let mut state = state.lock_owned().await;
+        on_fresh_thread(self.plan.lab_id(), move || {
+            let started = Instant::now();
+            let result = span.in_scope(|| {
+                if !netns::enter_file(plan.lab_id(), &ns, &path)? {
+                    return Err(Error::NetworkRemoved {
+                        lab: plan.lab_id().to_owned(),
+                    });
+                }
+                with_netlink(plan.lab_id(), async |handle| {
+                    crate::freeze::transition(&plan, handle, &mut state, frozen).await
+                })
+            });
+            span.in_scope(|| {
+                info!(
+                    elapsed_us = started.elapsed().as_micros(),
+                    success = result.is_ok(),
+                    "fabric step completed"
+                );
+            });
+            result
+        })
+        .await
+    }
+
     /// Same as [`teardown`], restricted to the netns this handle created: if the path was
     /// already torn down and now pins another netns (a new lab with the same id), that one is
     /// left alone. Safe to call again.
@@ -79,7 +140,8 @@ impl LabNetwork {
         let Some(ns) = self.ns.clone() else {
             return Ok(());
         };
-        teardown_at(&self.plan, &self.netns_path, Some(ns)).await?;
+        let state = self.fabric_state.clone().lock_owned().await;
+        teardown_at(&self.plan, &self.netns_path, Some(ns), Some(state)).await?;
         self.ns = None;
         Ok(())
     }
@@ -94,9 +156,11 @@ impl Drop for LabNetwork {
             return;
         };
         let (plan, path) = (self.plan.clone(), self.netns_path.clone());
+        let state = self.fabric_state.clone();
         let spawned = std::thread::Builder::new()
             .name("dylos-netns".into())
             .spawn(move || {
+                let _state = state.blocking_lock();
                 if let Err(error) = teardown_blocking(&plan, &path, Some(&ns)) {
                     warn!(lab = plan.lab_id(), %error, "lab network teardown on drop failed");
                 }
@@ -117,17 +181,19 @@ impl Drop for LabNetwork {
 ///
 /// The system or netlink call that failed.
 pub async fn teardown(plan: &FabricPlan, netns_dir: &Path) -> Result<(), Error> {
-    teardown_at(plan, &netns_dir.join(plan.netns_name()), None).await
+    teardown_at(plan, &netns_dir.join(plan.netns_name()), None, None).await
 }
 
 async fn teardown_at(
     plan: &FabricPlan,
     netns_path: &Path,
     owned: Option<Arc<File>>,
+    state: Option<OwnedMutexGuard<crate::freeze::State>>,
 ) -> Result<(), Error> {
     let (p, path) = (plan.clone(), netns_path.to_owned());
     let started = Instant::now();
     on_fresh_thread(plan.lab_id(), move || {
+        let _state = state;
         teardown_blocking(&p, &path, owned.as_deref())
     })
     .await?;
