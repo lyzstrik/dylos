@@ -384,40 +384,41 @@ async fn launch_passes_vm_resources_to_jailer_limits() {
     sandbox.assert_no_jail_left();
 }
 
+async fn readiness_case(mode: Mode, forwarded: Option<&str>) -> dylos_runtime::Result<Duration> {
+    let sandbox = Sandbox::new(mode);
+    support::readiness_case(&sandbox, &spec(&sandbox), mode, forwarded).await
+}
+
 #[tokio::test]
-async fn readiness_marker_retained_under_spam() {
-    let sandbox = Sandbox::new(Mode::SpamOutput);
-    let vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
-    // Firecracker output might take a moment to be forwarded.
-    let res = vm
-        .wait_for_line(
-            "dylos: ready",
-            "dylos: network setup failed",
-            std::time::Duration::from_secs(3),
-        )
-        .await;
+async fn readiness_marker_emitted_before_waiting() {
     assert!(
-        res.is_ok(),
-        "Readiness should be detected even if 30 lines follow it immediately"
+        readiness_case(Mode::EarlyReadiness, Some("early marker forwarded"))
+            .await
+            .is_ok()
     );
 }
 
 #[tokio::test]
-#[allow(clippy::panic)]
-async fn readiness_requires_exact_match() {
-    let sandbox = Sandbox::new(Mode::FalseReadiness);
-    let vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
-    let res = vm
-        .wait_for_line(
-            "dylos: ready",
-            "dylos: network setup failed",
-            std::time::Duration::from_secs(3),
-        )
-        .await;
-    match res {
-        Err(dylos_runtime::Error::ReadinessFailed { line, .. }) => {
-            assert_eq!(line, "dylos: network setup failed");
-        }
-        other => panic!("expected ReadinessFailed, got {other:?}"),
-    }
+async fn readiness_marker_retained_under_spam() {
+    assert!(
+        readiness_case(Mode::SpamOutput, Some("burst forwarded"))
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn readiness_requires_exact_match_and_retains_first_failure() {
+    let result = readiness_case(Mode::FalseReadiness, None).await;
+    assert!(
+        matches!(result, Err(Error::ReadinessFailed { line, .. }) if line == "dylos: network setup failed")
+    );
+}
+
+#[tokio::test]
+async fn readiness_timeout_cleans_up() {
+    assert!(matches!(
+        readiness_case(Mode::Serve, None).await,
+        Err(Error::ReadinessTimeout { .. })
+    ));
 }

@@ -6,6 +6,9 @@ use dylos_runtime::{Timeouts, Vm, VmSpec};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod support;
+use support::Captured;
+
 const NOBODY: u32 = 65534;
 
 fn binaries_dir() -> Option<PathBuf> {
@@ -68,6 +71,7 @@ async fn vm_boots_and_reaches_readiness() {
     let paths = vm.paths().clone();
 
     let pid = vm.pid().unwrap();
+    let (logs, _guard) = Captured::install();
     let res = async {
         let client = vm.client();
         client
@@ -94,11 +98,7 @@ async fn vm_boots_and_reaches_readiness() {
         // Wait for the guest to respond. We monitor the serial output for the agreed signal.
         // This shows that the guest kernel has booted, user space init has run, and it's ready.
         let boot_time = vm
-            .wait_for_line(
-                "dylos: ready",
-                "dylos: network setup failed",
-                Duration::from_secs(10),
-            )
+            .wait_for_ready(Duration::from_secs(10))
             .await
             .map_err(|e| e.to_string())?;
 
@@ -114,5 +114,7 @@ async fn vm_boots_and_reaches_readiness() {
     assert!(!paths.api_socket().exists());
 
     let boot_time = res.expect("Guest did not reach readiness in time or API failed");
+    assert!(logs.contains("VM boot ready"));
+    assert!(logs.contains("duration_ms="));
     println!("Boot time: {} ms", boot_time.as_millis());
 }
