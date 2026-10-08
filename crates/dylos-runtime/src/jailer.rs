@@ -1,5 +1,12 @@
 use std::ffi::OsString;
+use std::fs::File;
 use std::io::ErrorKind;
+use std::os::unix::fs::MetadataExt;
+use std::path::Component;
+
+use nix::fcntl::{AtFlags, OFlag, openat};
+use nix::sys::stat::{Mode, mkdirat};
+use nix::unistd::{Gid, Uid, fchown, linkat};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
@@ -39,6 +46,9 @@ pub struct JailerConfig {
     /// Two-phase preparation barrier for integration tests.
     pub preparation_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
     #[cfg(feature = "test-hooks")]
+    /// Pauses after path validation and again after opening the source.
+    pub source_validation_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
+    #[cfg(feature = "test-hooks")]
     pub cleanup_barrier: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
 
@@ -57,6 +67,8 @@ impl JailerConfig {
             launcher_args: Vec::new(),
             #[cfg(feature = "test-hooks")]
             preparation_barrier: None,
+            #[cfg(feature = "test-hooks")]
+            source_validation_barrier: None,
             #[cfg(feature = "test-hooks")]
             cleanup_barrier: None,
         }
@@ -186,6 +198,7 @@ pub fn jailer_args(
 pub struct Jail {
     paths: JailPaths,
     owned: bool,
+    directory: File,
     #[cfg(feature = "test-hooks")]
     cleanup_barrier: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
@@ -262,6 +275,8 @@ pub async fn prepare_chroot(
     let cleanup_barrier = config.cleanup_barrier.clone();
     #[cfg(feature = "test-hooks")]
     let barrier = config.preparation_barrier.clone();
+    #[cfg(feature = "test-hooks")]
+    let source_barrier = config.source_validation_barrier.clone();
     tokio::task::spawn_blocking(move || {
         let jail = claim(paths)?;
         #[cfg(feature = "test-hooks")]
@@ -275,7 +290,14 @@ pub async fn prepare_chroot(
             b.wait();
             b.wait();
         }
-        populate(&jail.paths, &files, uid, gid)?;
+        populate(
+            &jail,
+            &files,
+            uid,
+            gid,
+            #[cfg(feature = "test-hooks")]
+            source_barrier.as_deref(),
+        )?;
         Ok(jail)
     })
     .await
@@ -302,48 +324,211 @@ fn io_error(
 
 fn claim(paths: JailPaths) -> Result<Jail> {
     let jail_dir = &paths.jail_dir;
-    if let Some(parent) = jail_dir.parent() {
-        std::fs::create_dir_all(parent).map_err(io_error(&paths, "create dir", parent))?;
-    }
-    match std::fs::create_dir(jail_dir) {
-        Ok(()) => Ok(Jail {
-            paths,
-            owned: true,
-            #[cfg(feature = "test-hooks")]
-            cleanup_barrier: None,
-        }),
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(Error::JailExists {
+    let parent = jail_dir.parent().ok_or_else(|| {
+        io_error(&paths, "open parent", jail_dir)(std::io::Error::from(ErrorKind::InvalidInput))
+    })?;
+    let directory =
+        open_directory(parent, true).map_err(io_error(&paths, "open parent", parent))?;
+    match mkdirat(
+        &directory,
+        paths.id.as_str(),
+        Mode::from_bits_truncate(0o700),
+    ) {
+        Ok(()) => {
+            let mut jail = Jail {
+                paths,
+                directory,
+                owned: true,
+                #[cfg(feature = "test-hooks")]
+                cleanup_barrier: None,
+            };
+            jail.directory = openat(
+                &jail.directory,
+                jail.paths.id.as_str(),
+                directory_flags(),
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|e| io_error(&jail.paths, "open jail", &jail.paths.jail_dir)(e.into()))?;
+            Ok(jail)
+        }
+        Err(nix::errno::Errno::EEXIST) => Err(Error::JailExists {
             path: jail_dir.clone(),
             id: paths.id,
         }),
-        Err(e) => Err(io_error(&paths, "create dir", jail_dir)(e)),
+        Err(e) => Err(io_error(&paths, "create dir", jail_dir)(e.into())),
     }
 }
 
-fn populate(paths: &JailPaths, files: &[ChrootFile], uid: u32, gid: u32) -> Result<()> {
-    let io = |op, path: &Path| io_error(paths, op, path);
-    let run = paths.host_path("/run");
-    std::fs::create_dir_all(&run).map_err(io("create dir", &run))?;
-    let mut owned = vec![run];
-    for file in files {
-        let dest = paths.host_path(&file.jailed_path());
-        match std::fs::hard_link(&file.source, &dest) {
-            Err(e) if e.kind() == ErrorKind::CrossesDevices => {
-                std::fs::copy(&file.source, &dest)
-                    .map(drop)
-                    .map_err(io("copy", &file.source))?;
+fn directory_flags() -> OFlag {
+    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC
+}
+
+// Resolve each component relative to a pinned directory, so replacing any ancestor with a
+// symlink cannot redirect a later open, mkdir, link or ownership change.
+fn open_directory(path: &Path, create: bool) -> std::io::Result<File> {
+    let mut dir = File::open(if path.is_absolute() { "/" } else { "." })?;
+    for component in path.components() {
+        let name = match component {
+            Component::Normal(name) => name,
+            Component::ParentDir => "..".as_ref(),
+            Component::RootDir | Component::CurDir => continue,
+            Component::Prefix(_) => return Err(ErrorKind::InvalidInput.into()),
+        };
+        if create {
+            match mkdirat(&dir, name, Mode::from_bits_truncate(0o755)) {
+                Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+                Err(e) => return Err(e.into()),
             }
-            res => res.map_err(io("hard link", &file.source))?,
         }
-        owned.push(dest);
+        dir = File::from(openat(&dir, name, directory_flags(), Mode::empty())?);
     }
-    let metrics = paths.host_path(METRICS_FILE);
-    std::fs::File::create(&metrics).map_err(io("create", &metrics))?;
-    owned.push(metrics);
-    for path in owned {
-        std::os::unix::fs::chown(&path, Some(uid), Some(gid)).map_err(io("chown", &path))?;
+    Ok(dir)
+}
+
+fn populate(
+    jail: &Jail,
+    files: &[ChrootFile],
+    uid: u32,
+    gid: u32,
+    #[cfg(feature = "test-hooks")] source_barrier: Option<&std::sync::Barrier>,
+) -> Result<()> {
+    let paths = &jail.paths;
+    let io = |op, path: &Path| io_error(paths, op, path);
+    let own = |file: &File, path: &Path| {
+        fchown(file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+            .map_err(|e| io("fchown", path)(e.into()))
+    };
+    let make_dir = |parent: &File, name: &str, path: &Path| -> Result<File> {
+        mkdirat(parent, name, Mode::from_bits_truncate(0o755))
+            .map_err(|e| io("create dir", path)(e.into()))?;
+        openat(parent, name, directory_flags(), Mode::empty())
+            .map(File::from)
+            .map_err(|e| io("open dir", path)(e.into()))
+    };
+    let root = make_dir(&jail.directory, "root", &paths.root)?;
+    let run_path = paths.host_path("/run");
+    let run = make_dir(&root, "run", &run_path)?;
+    for file in files {
+        let placed = place_file(
+            paths,
+            &root,
+            file,
+            #[cfg(feature = "test-hooks")]
+            source_barrier,
+        )?;
+        own(&placed, &paths.host_path(&file.jailed_path()))?;
     }
+    let metrics_path = paths.host_path(METRICS_FILE);
+    let metrics = openat(
+        &run,
+        "metrics.json",
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o644),
+    )
+    .map(File::from)
+    .map_err(|e| io("create metrics", &metrics_path)(e.into()))?;
+    own(&metrics, &metrics_path)?;
+    own(&run, &run_path)?;
+    own(&root, &paths.root)?;
     Ok(())
+}
+
+fn place_file(
+    paths: &JailPaths,
+    root: &File,
+    file: &ChrootFile,
+    #[cfg(feature = "test-hooks")] source_barrier: Option<&std::sync::Barrier>,
+) -> Result<File> {
+    let io = |op, path: &Path| io_error(paths, op, path);
+    let metadata =
+        std::fs::symlink_metadata(&file.source).map_err(io("validate source", &file.source))?;
+    if !metadata.is_file() {
+        return Err(io("validate regular source", &file.source)(
+            ErrorKind::InvalidInput.into(),
+        ));
+    }
+    #[cfg(feature = "test-hooks")]
+    if let Some(barrier) = source_barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+    let parent = file
+        .source
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = file
+        .source
+        .file_name()
+        .ok_or_else(|| io("open source", &file.source)(ErrorKind::InvalidInput.into()))?;
+    let source_dir = open_directory(parent, false).map_err(io("open source parent", parent))?;
+    // NONBLOCK prevents a regular file replaced by a FIFO from hanging preparation.
+    let mut source = openat(
+        &source_dir,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|e| io("open source", &file.source)(e.into()))?;
+    let pinned = source.metadata().map_err(io("stat source", &file.source))?;
+    if !pinned.is_file() || (metadata.dev(), metadata.ino()) != (pinned.dev(), pinned.ino()) {
+        return Err(io("source changed", &file.source)(
+            ErrorKind::InvalidInput.into(),
+        ));
+    }
+    #[cfg(feature = "test-hooks")]
+    if let Some(barrier) = source_barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+    let dest = paths.host_path(&file.jailed_path());
+    let placed = match linkat(
+        &source_dir,
+        name,
+        root,
+        file.name.as_str(),
+        AtFlags::empty(),
+    ) {
+        Err(nix::errno::Errno::EXDEV) => {
+            let mut placed = openat(
+                root,
+                file.name.as_str(),
+                OFlag::O_WRONLY
+                    | OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_CLOEXEC,
+                Mode::from_bits_truncate(pinned.mode() & 0o777),
+            )
+            .map(File::from)
+            .map_err(|e| io("create copy", &dest)(e.into()))?;
+            std::io::copy(&mut source, &mut placed).map_err(io("copy", &file.source))?;
+            placed
+        }
+        result => {
+            result.map_err(|e| io("hard link", &file.source)(e.into()))?;
+            let placed = openat(
+                root,
+                file.name.as_str(),
+                OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map(File::from)
+            .map_err(|e| io("open placed file", &dest)(e.into()))?;
+            let linked = placed.metadata().map_err(io("stat placed file", &dest))?;
+            // linkat does not follow symlinks; verify it linked the inode we validated,
+            // rather than a replacement inserted after opening the source.
+            if !linked.is_file() || (linked.dev(), linked.ino()) != (pinned.dev(), pinned.ino()) {
+                return Err(io("source changed during placement", &file.source)(
+                    ErrorKind::InvalidInput.into(),
+                ));
+            }
+            placed
+        }
+    };
+    Ok(placed)
 }
 
 fn ignore_missing(res: std::io::Result<()>) -> std::io::Result<()> {

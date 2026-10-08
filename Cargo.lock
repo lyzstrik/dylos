@@ -201,7 +201,7 @@ version = "0.1.0"
 dependencies = [
  "dylos-fc",
  "dylos-runtime",
- "nix",
+ "nix 0.31.3",
  "serde_json",
  "tempfile",
  "thiserror",
