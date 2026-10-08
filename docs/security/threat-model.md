@@ -26,15 +26,17 @@ This document outlines the threat model for the Dylos lab engine.
 
 ## Main Threats
 
-| Threat | Mitigation / Status |
-| --- | --- |
-| **Command injection via LabSpec names** | Validated and mitigated (covered by LYZ-41). |
-| **Path traversal via LabSpec or Manifest** | Validated paths; chroot jail isolation. |
-| **Unauthorized privilege escalation** | Unprivileged Firecracker execution via upstream `jailer`, capabilities model target (covered by ADR-0004). |
-| **Malicious guest vsock payloads** | Strict parsing of the agent protocol with size limits (`MAX_LINE_BYTES`). |
-| **Malicious Firecracker stdout/stderr and metrics** | **Not mitigated yet.** Strict parsing and bounded read buffers are needed on the host. |
-| **Host resource exhaustion (DoS from guest)** | Size limits on guest data and vsock payloads. (Guest constrained by Firecracker limits). |
-| **Guest breakout / Host filesystem access** | Chroot jail, seccomp filters, and cgroup isolation via `jailer`. |
+| Threat | Mitigation | Status |
+| --- | --- | --- |
+| Injection through LabSpec names: interface names reach the guest kernel command line (`guest_net::boot_args`) and node names reach host resource names | Restrict names to `[A-Za-z0-9-]` with length limits | **Not mitigated yet**: LabSpec validation only checks uniqueness (LYZ-41) |
+| Path traversal through snapshot manifest paths | Paths must be relative, without `..`, validated before any file is opened (`SnapshotManifest`) | Mitigated (LYZ-21) |
+| Path traversal or unexpected characters in jail ids | Jail ids restricted to the jailer's `[A-Za-z0-9-]` rule | Mitigated in `dylos-runtime` (LYZ-11) |
+| Guest escape to the host | Firecracker run by the upstream jailer: chroot, seccomp, own cgroup, unprivileged uid (ADR-0004) | Mitigated by Firecracker and the jailer; one uid shared by all VMs during the spike (per-VM uids are a follow-up) |
+| Root orchestrator acting on user-controlled data | Validate every name and path before a root operation; run the orchestrator as root only for the spike (ADR-0004) | Partially: depends on LYZ-41; privileged helper split is a follow-up |
+| Malicious data from the guest over vsock | Strict parsing and size limits on the host listener | **Not implemented yet**: the host side of the agent protocol does not exist (LYZ-37). The agent's own `MAX_LINE_BYTES` (4096) only protects the guest |
+| Malicious Firecracker stdout/stderr and metrics | Bounded buffers and line limits when the host reads them | **Not mitigated yet**: start errors keep only the last 20 lines, but lines themselves are not size-limited |
+| Resource exhaustion from a guest | Firecracker machine limits (vCPU, memory); cgroup per VM | Partially: no cgroup limits are set yet beyond the default `pids.max` |
+| Shared kernel file chowned to the jailer uid through hard links | One copy per VM or per-VM uids | **Not mitigated yet** (noted in PR #17) |
 
 ## Follow-ups
 
