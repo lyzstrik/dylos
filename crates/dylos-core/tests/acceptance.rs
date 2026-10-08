@@ -45,6 +45,46 @@ fn validate_err(spec: &LabSpec) -> Error {
 // ---------------------------------------------------------------- 1. format
 
 #[test]
+fn name_injection_attempts_are_rejected() {
+    let base = valid();
+    let bad_names = [
+        " ", "a b", "a=b", "a,b", "a\nb", "a\0b", "a/b", "a..b", "..", "", "-a", "a_",
+        "a_b", // test underscore
+    ];
+    for name in bad_names {
+        // segment name
+        let mut bad = base.clone();
+        bad.segments[0].name = name.into();
+        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+
+        // node name
+        let mut bad = base.clone();
+        bad.nodes[0].name = name.into();
+        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+
+        // interface name
+        let mut bad = base.clone();
+        bad.nodes[0].interfaces[0].name = name.into();
+        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+
+        // image
+        let mut bad = base.clone();
+        bad.nodes[0].image = name.into();
+        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+    }
+
+    // specific length check: interface name > 15
+    let mut bad = base.clone();
+    bad.nodes[0].interfaces[0].name = "a".repeat(16);
+    assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+
+    // specific length check: node name > 32
+    let mut bad = base.clone();
+    bad.nodes[0].name = "a".repeat(33);
+    assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+}
+
+#[test]
 fn yaml_format_parses_all_fields() {
     let spec = valid();
     assert_eq!(spec.segments.len(), 2);
@@ -1015,6 +1055,24 @@ proptest! {
     #[test]
     fn mixed_topologies_validate_and_round_trip(spec in valid_spec_with(Stack::Mixed)) {
         round_trips(&spec)?;
+    }
+
+    #[test]
+    fn boot_args_output_contains_no_spaces(spec in valid_spec()) {
+        for node in &spec.nodes {
+            let args = dylos_core::guest_net::boot_args(&spec, node).unwrap();
+            if args.is_empty() {
+                continue;
+            }
+            for param in args.split(' ') {
+                prop_assert!(
+                    param.starts_with("dylos.if=")
+                        || param.starts_with("dylos.rt=")
+                        || param == "dylos.fwd=1",
+                    "found space inside a parameter value, or invalid param: {param:?} in {args:?}"
+                );
+            }
+        }
     }
 
     #[test]

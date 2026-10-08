@@ -29,6 +29,13 @@ impl LabSpec {
 
         // 1. Unique segment names
         for (i, segment) in self.segments.iter().enumerate() {
+            if let Err(reason) = validate_name(&segment.name, 32) {
+                return Err(Error::InvalidName {
+                    path: format!("segments[{i}].name"),
+                    value: segment.name.clone(),
+                    reason,
+                });
+            }
             if segment_names.insert(&segment.name, segment).is_some() {
                 return Err(Error::DuplicateSegmentName {
                     path: format!("segments[{i}]"),
@@ -41,6 +48,20 @@ impl LabSpec {
 
         // 2. Unique node names
         for (i, node) in self.nodes.iter().enumerate() {
+            if let Err(reason) = validate_name(&node.name, 32) {
+                return Err(Error::InvalidName {
+                    path: format!("nodes[{i}].name"),
+                    value: node.name.clone(),
+                    reason,
+                });
+            }
+            if let Err(reason) = validate_name(&node.image, usize::MAX) {
+                return Err(Error::InvalidName {
+                    path: format!("nodes[{i}].image"),
+                    value: node.image.clone(),
+                    reason,
+                });
+            }
             if !node_names.insert(&node.name) {
                 return Err(Error::DuplicateNodeName {
                     path: format!("nodes[{i}]"),
@@ -53,6 +74,13 @@ impl LabSpec {
             let mut node_own_addresses = HashSet::new();
 
             for (j, iface) in node.interfaces.iter().enumerate() {
+                if let Err(reason) = validate_name(&iface.name, 15) {
+                    return Err(Error::InvalidName {
+                        path: format!("nodes[{i}].interfaces[{j}].name"),
+                        value: iface.name.clone(),
+                        reason,
+                    });
+                }
                 if !iface_names.insert(&iface.name) {
                     return Err(Error::DuplicateInterfaceName {
                         path: format!("nodes[{i}].interfaces[{j}]"),
@@ -171,4 +199,21 @@ impl LabSpec {
 
         Ok(())
     }
+}
+
+fn validate_name(name: &str, max_len: usize) -> Result<(), &'static str> {
+    if name.len() > max_len {
+        return Err("too long");
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err("cannot be empty");
+    };
+    if !first.is_ascii_alphanumeric() {
+        return Err("must start with an alphanumeric character");
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return Err("can only contain alphanumeric characters and '-'");
+    }
+    Ok(())
 }
