@@ -148,16 +148,35 @@ async fn test_client_oversized_body() -> TestResult {
         hyper::StatusCode::OK,
         hyper::StatusCode::INTERNAL_SERVER_ERROR,
     ] {
-        // Exactly at limit accepted
+        let expected = "A".repeat(limit - 2);
+        let body = serde_json::to_vec(&expected)?;
+        assert_eq!(body.len(), limit);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         server.set_reply_stream(status, rx);
-        tx.send(vec![b'A'; limit / 2]).unwrap();
-        tx.send(vec![b'A'; limit / 2]).unwrap();
-        drop(tx); // Close stream
+        tx.send(body[..limit / 2].to_vec())?;
+        tx.send(body[limit / 2..].to_vec())?;
+        drop(tx);
 
         let res = client.get::<serde_json::Value>("/machine-config").await;
-        if let Err(Error::ResponseTooLarge { .. }) = res {
-            return Err(format!("Expected acceptance exactly at limit, got {res:?}").into());
+        if status == hyper::StatusCode::OK {
+            assert_eq!(res?, Some(json!(expected)));
+        } else {
+            match res {
+                Err(Error::Api {
+                    path,
+                    method,
+                    route,
+                    status,
+                    fault_message,
+                }) => {
+                    assert_eq!(path, sock);
+                    assert_eq!(method, "GET");
+                    assert_eq!(route, "/machine-config");
+                    assert_eq!(status, 500);
+                    assert_eq!(fault_message, format!("\"{}...", "A".repeat(1023)));
+                }
+                other => return Err(format!("Expected Api error at limit, got {other:?}").into()),
+            }
         }
 
         // Beyond limit
@@ -275,106 +294,136 @@ async fn test_client_oversized_fault_message() -> TestResult {
     Ok(())
 }
 
-/// Tests snapshot timeout configuration
+/// Both typed snapshot routes use the snapshot budget, including stalled calls.
 #[tokio::test]
 async fn test_snapshot_timeout() -> TestResult {
-    use dylos_fc::snapshot::SnapshotCreateParams;
+    use dylos_fc::snapshot::{SnapshotCreateParams, SnapshotLoadParams};
     use std::time::Duration;
     let dir = tempdir()?;
     let sock = dir.path().join("api.socket");
     let server = FakeServer::new(&sock)?;
 
-    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-    server.set_reply_with_delay(hyper::StatusCode::NO_CONTENT, vec![], notify.clone());
-
-    let client = FcClient::new(&sock)
-        .with_timeout(Duration::from_millis(10))
-        .with_snapshot_timeout(Duration::from_millis(200));
-
-    let params = SnapshotCreateParams::new("/tmp/snap", "/tmp/mem");
-
-    // Should succeed if it completes within snapshot timeout (200ms) but beyond default timeout (10ms)
-    let notify_clone = notify.clone();
-    let handle = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        notify_clone.notify_one();
-    });
-
-    client.create_snapshot(&params).await?;
-    handle.await?;
-
-    // Now test it times out if it takes longer than snapshot timeout
-    server.set_reply_with_delay(hyper::StatusCode::NO_CONTENT, vec![], notify.clone());
-
-    let err_res = client.create_snapshot(&params).await;
-    if let Err(Error::Timeout {
-        path,
-        method,
-        route,
-    }) = err_res
-    {
-        assert_eq!(path, sock);
-        assert_eq!(method, "PUT");
-        assert_eq!(route, "/snapshot/create");
-    } else {
-        return Err(format!("Expected Timeout error, got {err_res:?}").into());
+    for load in [false, true] {
+        for stalled in [false, true] {
+            let release = std::sync::Arc::new(tokio::sync::Notify::new());
+            server.set_reply_with_delay(hyper::StatusCode::NO_CONTENT, vec![], release.clone());
+            let client = FcClient::new(&sock)
+                .with_timeout(Duration::from_secs(10))
+                .with_snapshot_timeout(Duration::from_secs(200));
+            let request = tokio::spawn(async move {
+                if load {
+                    client
+                        .load_snapshot(&SnapshotLoadParams::with_file_backend(
+                            "/tmp/snap",
+                            "/tmp/mem",
+                        ))
+                        .await
+                } else {
+                    client
+                        .create_snapshot(&SnapshotCreateParams::new("/tmp/snap", "/tmp/mem"))
+                        .await
+                }
+            });
+            server.wait_for_request().await?;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(if stalled { 201 } else { 50 })).await;
+            tokio::time::resume();
+            if !stalled {
+                assert!(
+                    !request.is_finished(),
+                    "ordinary deadline used for snapshot"
+                );
+                release.notify_one();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), request).await??;
+            if stalled {
+                match result {
+                    Err(Error::Timeout {
+                        path,
+                        method,
+                        route,
+                    }) => {
+                        assert_eq!(path, sock);
+                        assert_eq!(method, "PUT");
+                        assert_eq!(
+                            route,
+                            if load {
+                                "/snapshot/load"
+                            } else {
+                                "/snapshot/create"
+                            }
+                        );
+                    }
+                    other => return Err(format!("Expected snapshot timeout, got {other:?}").into()),
+                }
+                release.notify_one();
+            } else {
+                result?;
+            }
+            server.wait_for_connections().await?;
+        }
     }
-
-    notify.notify_one(); // unblock server
     server.shutdown().await;
     Ok(())
 }
 
-/// Tests that connection driver tasks and sockets settle after a timeout or oversized response.
+/// Open response streams must lose their peer after timeout or size rejection.
 #[tokio::test]
 async fn test_client_connection_cleanup() -> TestResult {
     use std::time::Duration;
     let dir = tempdir()?;
     let sock = dir.path().join("api.socket");
     let server = FakeServer::new(&sock)?;
+    let limit = 1024 * 1024;
 
-    // We can't clone FcClient, so we create instances
-    let mut tasks = vec![];
-    for _ in 0..10 {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        server.set_reply_stream(hyper::StatusCode::OK, rx);
-        let client = FcClient::new(&sock).with_timeout(Duration::from_millis(10));
-
-        tasks.push(tokio::spawn(async move {
-            tx.send(b"{\"partial\":".to_vec()).unwrap();
-            let _ = client.get::<serde_json::Value>("/machine-config").await;
-        }));
+    for oversized in [false, true] {
+        for _ in 0..10 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            server.set_reply_stream(hyper::StatusCode::OK, rx);
+            tx.send(if oversized {
+                vec![b'A'; limit + 1]
+            } else {
+                b"{\"partial\":".to_vec()
+            })?;
+            let client = FcClient::new(&sock).with_timeout(Duration::from_millis(50));
+            let request =
+                tokio::spawn(
+                    async move { client.get::<serde_json::Value>("/machine-config").await },
+                );
+            server.wait_for_request().await?;
+            let result = tokio::time::timeout(Duration::from_secs(2), request).await??;
+            match result {
+                Err(Error::ResponseTooLarge {
+                    path,
+                    method,
+                    route,
+                    limit: actual,
+                }) if oversized => {
+                    assert_eq!(actual, limit);
+                    assert_eq!(path, sock);
+                    assert_eq!(method, "GET");
+                    assert_eq!(route, "/machine-config");
+                }
+                Err(Error::Timeout {
+                    path,
+                    method,
+                    route,
+                }) if !oversized => {
+                    assert_eq!(path, sock);
+                    assert_eq!(method, "GET");
+                    assert_eq!(route, "/machine-config");
+                }
+                other => return Err(format!("Unexpected cleanup request result: {other:?}").into()),
+            }
+            // Keep the sender open: completion must come from client disconnect,
+            // rather than the server reaching the end of the response body.
+            server.wait_for_connections().await?;
+            assert!(
+                tx.is_closed(),
+                "response body retained by leaked connection"
+            );
+        }
     }
-
-    for task in tasks.drain(..) {
-        let _ = task.await;
-    }
-
-    // Verify oversized body cleanup
-    for _ in 0..10 {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        server.set_reply_stream(hyper::StatusCode::OK, rx);
-        let client = FcClient::new(&sock).with_timeout(Duration::from_millis(50));
-
-        tasks.push(tokio::spawn(async move {
-            let limit = 1024 * 1024;
-            tx.send(vec![b'A'; limit + 1]).unwrap();
-            let _ = client.get::<serde_json::Value>("/machine-config").await;
-        }));
-    }
-
-    for task in tasks.drain(..) {
-        let _ = task.await;
-    }
-
-    // Give the server connection tasks a moment to settle
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Verify we can still make a successful request (no fd exhaustion, server still healthy)
-    server.set_reply(hyper::StatusCode::NO_CONTENT, vec![]);
-    let client = FcClient::new(&sock).with_timeout(Duration::from_millis(100));
-    client.get::<serde_json::Value>("/machine-config").await?;
-
     server.shutdown().await;
     Ok(())
 }

@@ -720,7 +720,15 @@ async fn every_route_is_traced_with_method_and_concrete_path_even_on_failure() -
             );
         }
         for case in cases() {
-            let _ = case.call.run(&client).await;
+            let result = case.call.run(&client).await;
+            if ok {
+                result?;
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Api { status: 400, .. })),
+                    "unexpected route error: {result:?}"
+                );
+            }
             let captured = spans.0.lock().map_err(|e| e.to_string())?.clone();
             assert!(
                 captured

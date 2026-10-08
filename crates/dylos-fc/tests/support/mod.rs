@@ -13,6 +13,7 @@ use tokio::net::UnixListener;
 pub struct FakeServer {
     socket_path: PathBuf,
     history: Arc<Mutex<Vec<RequestRecord>>>,
+    arrived: Arc<tokio::sync::Notify>,
     reply: Arc<Mutex<ReplyConfig>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     server_task: Option<tokio::task::JoinHandle<()>>,
@@ -60,6 +61,8 @@ impl FakeServer {
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let conn_tasks = Arc::new(Mutex::new(Vec::new()));
 
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let a_clone = Arc::clone(&arrived);
         let h_clone = Arc::clone(&history);
         let r_clone = Arc::clone(&reply);
         let c_clone = Arc::clone(&conn_tasks);
@@ -70,12 +73,14 @@ impl FakeServer {
                     _ = shutdown_rx.changed() => break,
                     accept_res = listener.accept() => {
                         if let Ok((stream, _)) = accept_res {
+                            let a = Arc::clone(&a_clone);
                             let h = Arc::clone(&h_clone);
                             let r = Arc::clone(&r_clone);
 
                             let conn_task = tokio::spawn(async move {
                                 let io = hyper_util::rt::TokioIo::new(stream);
                                 let svc = service_fn(move |req: Request<Incoming>| {
+                                    let a = Arc::clone(&a);
                                     let h = Arc::clone(&h);
                                     let r = Arc::clone(&r);
                                     async move {
@@ -107,6 +112,7 @@ impl FakeServer {
                                             rc = reply_lock.clone();
                                         }
 
+                                        a.notify_one();
                                         if let Some(delay) = rc.delay {
                                             delay.notified().await;
                                         }
@@ -143,6 +149,7 @@ impl FakeServer {
         Ok(Self {
             socket_path,
             history,
+            arrived,
             reply,
             shutdown_tx,
             server_task: Some(server_task),
@@ -193,8 +200,34 @@ impl FakeServer {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn wait_for_request(&self) -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.arrived.notified())
+            .await
+            .map_err(|e| format!("request did not arrive: {e}"))?;
+        Ok(())
+    }
+
+    // Await actual connection completion before shutdown can abort any tasks.
+    #[allow(dead_code)]
+    pub async fn wait_for_connections(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let tasks: Vec<_> = self
+            .conn_tasks
+            .lock()
+            .map_err(|e| e.to_string())?
+            .drain(..)
+            .collect();
+        assert!(!tasks.is_empty(), "no connections observed");
+        for task in tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .map_err(|e| format!("connection leaked: {e}"))??;
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         if let Some(task) = self.server_task.take() {
             #[allow(clippy::collapsible_if)]
             if let Err(e) = task.await {
@@ -216,7 +249,7 @@ impl FakeServer {
 
 impl Drop for FakeServer {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         if let Some(task) = self.server_task.take() {
             task.abort();
         }

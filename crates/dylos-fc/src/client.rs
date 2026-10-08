@@ -15,6 +15,25 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::snapshot::{SnapshotCreateParams, SnapshotLoadParams, Vm};
 
+/// Firecracker API client over a Unix socket.
+///
+/// Response bodies are capped at 1 MiB (1,048,576 bytes), for both success and
+/// error responses. Fault messages are capped at 1,024 UTF-8 bytes, truncated at
+/// a character boundary; truncated messages gain an additional `...` suffix
+/// (up to 1,027 bytes total).
+///
+/// The default request deadline is 10 seconds. Only [`Self::create_snapshot`]
+/// and [`Self::load_snapshot`] use the separate 120-second snapshot deadline.
+/// Both deadlines cover connecting, sending the request, and receiving the full
+/// response body. The builders accept [`Duration`] values to override them.
+///
+/// The spike envelope is VMs with up to a few GiB of memory on local SSD storage.
+/// A full snapshot writes all guest memory, so 120 seconds leaves a wide margin
+/// at low disk throughput. LYZ-28 benchmarks will measure actual durations and
+/// inform adjustments to this default.
+///
+/// A timeout leaves the server-side outcome unknown; callers must not assume
+/// rollback or blindly retry.
 pub struct FcClient {
     socket_path: PathBuf,
     timeout: Duration,
@@ -63,7 +82,7 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 impl FcClient {
-    /// Configures the default request deadline.
+    /// Configures the request deadline (default: 10 seconds), excluding snapshot create/load.
     /// The deadline covers the entire operation: connection, sending the request, and receiving the full body.
     ///
     /// On timeout, the server-side outcome is unknown (Firecracker may still complete the operation).
@@ -74,7 +93,8 @@ impl FcClient {
         self
     }
 
-    /// Configures the deadline for snapshot operations (`create_snapshot` and `load_snapshot`).
+    /// Configures the snapshot deadline (default: 120 seconds), used only by
+    /// `create_snapshot` and `load_snapshot`.
     /// The deadline covers the entire operation: connection, sending the request, and receiving the full body.
     ///
     /// On timeout, the server-side outcome is unknown (Firecracker may still complete the operation).
