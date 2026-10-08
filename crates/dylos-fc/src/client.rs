@@ -3,8 +3,12 @@ use hyper::Request;
 use hyper::body::Bytes;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::{Mode, SFlag, fstat};
 use serde::{Deserialize, Serialize};
+use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::path::Component;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -82,6 +86,42 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn pin_socket(path: &std::path::Path) -> std::io::Result<File> {
+    let parent = path.parent().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let name = path.file_name().ok_or(std::io::ErrorKind::InvalidInput)?;
+    let mut directory = File::open(if path.is_absolute() { "/" } else { "." })?;
+    // Every ancestor is pinned before opening the next: even jail-owned run/
+    // must not redirect resolution through a symlink.
+    for component in parent.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => {
+                directory = File::from(openat(
+                    &directory,
+                    name,
+                    OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )?);
+            }
+            _ => return Err(std::io::ErrorKind::InvalidInput.into()),
+        }
+    }
+    let socket = File::from(openat(
+        &directory,
+        name,
+        OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?);
+    let stat = fstat(&socket)?;
+    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFSOCK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "API socket path is not a socket (symlinks are refused)",
+        ));
+    }
+    Ok(socket)
+}
+
 impl FcClient {
     /// Configures the request deadline (default: 10 seconds), excluding snapshot create/load.
     /// The deadline covers the entire operation: connection, sending the request, and receiving the full body.
@@ -148,23 +188,15 @@ impl FcClient {
     }
 
     async fn connect(&self) -> std::io::Result<UnixStream> {
-        if self.socket_path.as_os_str().len() < 108 {
-            return UnixStream::connect(&self.socket_path).await;
-        }
-        // Linux sockaddr_un has only 108 bytes, including the terminator. The jailer
-        // binds a short chroot path; pin its host parent and connect through procfs.
-        let parent = self
-            .socket_path
-            .parent()
-            .ok_or(std::io::ErrorKind::InvalidInput)?;
-        let name = self
-            .socket_path
-            .file_name()
-            .ok_or(std::io::ErrorKind::InvalidInput)?;
-        let directory = tokio::fs::File::open(parent).await?.into_std().await;
-        let alias = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+        let path = self.socket_path.clone();
+        let socket = tokio::task::spawn_blocking(move || pin_socket(&path))
+            .await
+            .map_err(std::io::Error::other)??;
+        // Pin the checked socket inode, not its guest-writable directory entry.
+        // The procfs alias also fits sockaddr_un for arbitrarily long host paths.
+        let alias = format!("/proc/self/fd/{}", socket.as_raw_fd());
         let stream = UnixStream::connect(alias).await;
-        drop(directory);
+        drop(socket);
         stream
     }
 
