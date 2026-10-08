@@ -94,11 +94,14 @@ async fn vm_boots_and_reaches_readiness() {
     let mut ready = false;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if vm
-            .output()
-            .iter()
-            .any(|line| line.contains("dylos-guest-ready"))
-        {
+        assert!(
+            !vm.output()
+                .iter()
+                .any(|line| line.contains("dylos: network setup failed")),
+            "Guest network setup failed. Output: {:?}",
+            vm.output()
+        );
+        if vm.output().iter().any(|line| line.contains("dylos: ready")) {
             ready = true;
             break;
         }
