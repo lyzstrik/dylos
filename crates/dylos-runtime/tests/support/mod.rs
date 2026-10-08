@@ -36,6 +36,8 @@ pub enum Mode {
     /// Hands the first API connection to a `cat` that never answers, then exits with status 5,
     /// so the readiness request is still in flight after the exit.
     StallReadyThenExit,
+    /// Spawns a background process that inherits stdout/stderr, then exits immediately.
+    LeakOutputThenExit,
 }
 
 pub struct Sandbox {
@@ -139,6 +141,14 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
         "FailDuringStart" => {
             eprintln!("fake jailer failed during start");
             return 1;
+        }
+        "LeakOutputThenExit" => {
+            let status = std::process::Command::new("sh")
+                .args(["-c", "sleep 60 >&1 2>&2 &"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return 0;
         }
         "NoSocket" => std::future::pending::<()>().await,
         _ => {}

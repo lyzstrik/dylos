@@ -220,24 +220,41 @@ async fn concurrent_launches_of_same_vm_have_one_winner() {
 
 #[tokio::test]
 async fn cancelled_launch_leaves_no_jail_and_retry_works() {
-    let sandbox = Sandbox::new(Mode::Serve);
-    let spec = spec(&sandbox);
+    let mut sandbox = Sandbox::new(Mode::Serve);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    sandbox.config.preparation_barrier = Some(std::sync::Arc::clone(&barrier));
+    let test_spec = spec(&sandbox);
     let jail = sandbox.jail_dir("lab1-web");
-    // Polled first, so the launch is dropped as soon as the jail directory appears, while the
-    // chroot is still being prepared.
+
+    let barrier_wait = tokio::task::spawn_blocking({
+        let b = std::sync::Arc::clone(&barrier);
+        move || b.wait()
+    });
+
     let cancelled = tokio::select! {
         biased;
-        () = wait_until("the jail is claimed", Duration::from_secs(5), || jail.exists()) => true,
-        _ = Vm::launch(&sandbox.config, &spec) => false,
+        // Wait until `prepare_chroot` claims the jail and hits the barrier.
+        () = async { barrier_wait.await.unwrap(); } => true,
+        _ = Vm::launch(&sandbox.config, &test_spec) => false,
     };
     assert!(cancelled, "launch completed before cancellation");
+    assert!(jail.exists());
+
+    // Release the task so it can observe the cancellation (drop the unread result).
+    tokio::task::spawn_blocking(move || barrier.wait())
+        .await
+        .unwrap();
+
     wait_until(
         "the cancelled launch is rolled back",
         Duration::from_secs(5),
         || !jail.exists(),
     )
     .await;
-    let mut vm = Vm::launch(&sandbox.config, &spec).await.unwrap();
+
+    // Retry works
+    let sandbox = Sandbox::new(Mode::Serve); // fresh config without barrier
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
     vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
 }

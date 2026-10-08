@@ -350,19 +350,34 @@ impl Vm {
                 timeout,
             });
         }
-        let Some(supervisor) = self.supervisor.take() else {
+        let Some(supervisor) = self.supervisor.as_mut() else {
             return Ok(());
         };
-        for task in self.tasks.drain(..) {
-            if let Err(e) = task.await {
-                tracing::error!(error = %e, "VM output or metrics task failed");
+
+        let tasks_fut = async {
+            for task in &mut self.tasks {
+                let _ = (&mut *task).await;
+            }
+        };
+
+        if tokio::time::timeout(timeout, tasks_fut).await.is_err() {
+            tracing::warn!("output/metrics tasks did not finish in time, aborting them");
+            for task in &mut self.tasks {
+                task.abort();
+                let _ = (&mut *task).await;
             }
         }
-        supervisor.await.map_err(|source| Error::Task {
+
+        let res = (&mut *supervisor).await.map_err(|source| Error::Task {
             id: self.paths.id.clone(),
             task: "supervisor",
             source,
-        })?
+        })?;
+
+        self.supervisor = None;
+        self.tasks.clear();
+
+        res
     }
 }
 

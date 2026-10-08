@@ -35,6 +35,8 @@ pub struct JailerConfig {
     /// Arguments inserted before the jailer flags. Empty for the real jailer; lets tests run a
     /// fake launcher that needs its own leading arguments.
     pub launcher_args: Vec<OsString>,
+    #[cfg(debug_assertions)]
+    pub preparation_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
 }
 
 impl JailerConfig {
@@ -50,6 +52,8 @@ impl JailerConfig {
             cgroups: Vec::new(),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             launcher_args: Vec::new(),
+            #[cfg(debug_assertions)]
+            preparation_barrier: None,
         }
     }
 }
@@ -242,8 +246,15 @@ pub async fn prepare_chroot(
     }
     let (paths, files, uid, gid) = (paths.clone(), files.to_vec(), config.uid, config.gid);
     let id = paths.id.clone();
+    #[cfg(debug_assertions)]
+    let barrier = config.preparation_barrier.clone();
     tokio::task::spawn_blocking(move || {
         let jail = claim(paths)?;
+        #[cfg(debug_assertions)]
+        if let Some(b) = barrier {
+            b.wait(); // Wait for test to observe claimed directory
+            b.wait(); // Wait for test to cancel
+        }
         populate(&jail.paths, &files, uid, gid)?;
         Ok(jail)
     })
