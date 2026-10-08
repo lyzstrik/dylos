@@ -34,6 +34,9 @@ cp release-v1.17.0-x86_64/jailer-v1.17.0-x86_64 $D/bin/jailer
 ## Lab volume
 - Path : /home/lyzi/dylos
 - Filesystem : btrfs, reflink verified
+- Lab storage default : `target/labs` relative to the repository working directory; configure `dylos_store::Store::base` to use another directory on this volume.
+- Rootfs source default : `target/images/rootfs.ext4`, built with `just images`; configure `Store::image` if needed. Source and destination must support FICLONE (no full-copy fallback).
+- Storage base and image ancestors must be operator-controlled and not writable by untrusted processes. Directory components and source files are opened without following symlinks; lab directories use mode 0700 and files 0600.
 
 ## Dev tools
 - just : 1.58.0
