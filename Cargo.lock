@@ -219,6 +219,7 @@ name = "dylos-store"
 version = "0.1.0"
 dependencies = [
  "dylos-core",
+ "dylos-store",
  "libc",
  "nix 0.31.3",
  "serde",
