@@ -12,7 +12,7 @@ workspace = true
 
 [dependencies]
 dylos-fc = { path = "../dylos-fc" }
-nix = { workspace = true, features = ["signal"] }
+nix = { workspace = true, features = ["fs", "signal", "user"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "process", "sync", "time"] }
