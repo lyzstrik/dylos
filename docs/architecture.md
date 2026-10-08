@@ -30,7 +30,7 @@ Dependency direction:
 
 ### Lab Sequences
 
-The detailed step-by-step sequences for lab snapshot, restore, and fork operations are defined in [ADR-0001: Consistent Snapshot and Fork](adr/0001-consistency-by-fabric-freeze.md).
+[ADR-0001: Consistent lab snapshots by freezing the network fabric](adr/0001-consistency-by-fabric-freeze.md) fixes the snapshot and restore ordering; a fork is that restore run N times.
 The runtime guarantees that lab-wide steps run concurrently, but each step waits for all VMs in the lab to complete before proceeding to the next step.
 These sequences must never be reordered.
 
