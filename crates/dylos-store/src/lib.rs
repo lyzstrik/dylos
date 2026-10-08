@@ -331,3 +331,142 @@ fn remove_entry(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
     }
     Ok(())
 }
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct open_how {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+/// Descriptor-relative snapshot access under operator-controlled directories.
+/// Ancestors and snapshot trees must not be writable by hostile processes: the
+/// fallback cannot confine directories renamed outside the tree after opening.
+/// Hard links and bind mounts are outside this protection. Consume returned
+/// descriptors rather than reopening joined paths after verification.
+pub struct SnapshotOpener {
+    base: File,
+}
+
+impl SnapshotOpener {
+    /// Creates a new `SnapshotOpener` rooted at the given directory path.
+    ///
+    /// # Errors
+    /// Returns an error if the path cannot be opened safely.
+    pub fn new(path: &Path) -> io::Result<Self> {
+        let base = directory(path, false)?;
+        Ok(Self { base })
+    }
+
+    /// Opens a file relative to the snapshot directory.
+    ///
+    /// # Errors
+    /// Returns an error for absolute or parent paths, symlinks, missing files,
+    /// or non-regular leaves.
+    pub fn open(&self, path: &Path) -> io::Result<File> {
+        self.open_impl(path, None, &mut |_| {})
+    }
+
+    /// Forces a resolver and pauses immediately before each resolution step.
+    ///
+    /// # Errors
+    /// Returns the same errors as `open`, including ENOSYS for forced openat2.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn open_with_test_hook(
+        &self,
+        path: &Path,
+        fallback: bool,
+        mut before_step: impl FnMut(usize),
+    ) -> io::Result<File> {
+        self.open_impl(path, Some(fallback), &mut before_step)
+    }
+
+    fn open_impl(
+        &self,
+        path: &Path,
+        fallback: Option<bool>,
+        before_step: &mut dyn FnMut(usize),
+    ) -> io::Result<File> {
+        if path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+
+        if fallback != Some(true) {
+            before_step(0);
+            let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+            let how = open_how {
+                flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
+                mode: 0,
+                resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+            };
+
+            // SAFETY: The base descriptor, NUL-terminated path, and initialized C-layout
+            // how remain live for this syscall; the supplied size matches how.
+            let fd = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    self.base.as_raw_fd(),
+                    path_c.as_ptr(),
+                    &how,
+                    std::mem::size_of::<open_how>(),
+                )
+            };
+
+            if fd >= 0 {
+                let fd_i32 = i32::try_from(fd)
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
+                // SAFETY: We exclusively own this new descriptor.
+                let file = unsafe { std::fs::File::from_raw_fd(fd_i32) };
+                return regular_snapshot_file(file);
+            }
+
+            let err = io::Error::last_os_error();
+            if fallback == Some(false) || err.raw_os_error() != Some(libc::ENOSYS) {
+                return Err(err);
+            }
+        }
+        let mut parent = self.base.try_clone()?;
+        let mut step = 0;
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let name = match component {
+                Component::Normal(name) => name,
+                Component::CurDir => continue,
+                _ => return Err(io::ErrorKind::InvalidInput.into()),
+            };
+            let is_last = components.peek().is_none();
+            let flags = if is_last {
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK
+            } else {
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY
+            };
+            before_step(step);
+            step += 1;
+            parent = open(&parent, name, flags)?;
+        }
+        regular_snapshot_file(parent)
+    }
+
+    /// Returns a closure suitable for `SnapshotManifest::verify`.
+    pub fn verify_opener(&self) -> impl FnMut(&Path) -> io::Result<File> + '_ {
+        move |path| self.open(path)
+    }
+}
+
+fn regular_snapshot_file(file: File) -> io::Result<File> {
+    if !file.metadata()?.is_file() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    Ok(file)
+}
