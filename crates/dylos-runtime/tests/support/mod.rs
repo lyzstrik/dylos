@@ -144,15 +144,17 @@ pub fn run_fake_jailer_if_requested() {
         });
         std::process::exit(0);
     }
+    let sandbox = Path::new(&base).parent().unwrap().to_path_buf();
     let code = rt.block_on(fake_firecracker(
         &mode,
+        &sandbox,
         root.join(sock.trim_start_matches('/')),
         root.join(metrics.trim_start_matches('/')),
     ));
     std::process::exit(code);
 }
 
-async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
+async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
     match mode {
         "ExitAtOnce" => return 3,
@@ -199,7 +201,7 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
         stream.write_all(reply.as_bytes()).await.unwrap();
         stream.shutdown().await.unwrap();
         if request.contains("SendCtrlAltDel") && mode == "LeakOutputThenExit" {
-            hold_stderr(&sock).await;
+            hold_stderr(sandbox).await;
             return 0;
         }
         if request.contains("SendCtrlAltDel") && mode == "Serve" {
@@ -222,19 +224,14 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
     }
 }
 
-async fn hold_stderr(sock: &Path) {
-    let base = sock
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let base = base.parent().unwrap();
+/// Simulates a Firecracker that exits while a process it spawned still holds its stderr: the
+/// launcher's stderr pipe then never reaches EOF, which is what `Vm::finish` must survive with a
+/// bounded wait. The holder is this test binary again, in `HoldOutput` mode; it inherits stderr,
+/// binds `<sandbox>/output-holder.sock` to signal it is running, and stays alive until the test
+/// connects to that socket and closes it (`Sandbox::release_output_holder`). `sandbox` is the
+/// parent of the chroot base directory.
+async fn hold_stderr(sandbox: &Path) {
+    let base = sandbox;
     let holder = base.join("holder-mode");
     std::fs::write(&holder, "HoldOutput").unwrap();
     let child = std::process::Command::new(std::env::current_exe().unwrap())
