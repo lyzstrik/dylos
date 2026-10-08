@@ -331,3 +331,96 @@ fn remove_entry(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
     }
     Ok(())
 }
+use std::os::fd::FromRawFd;
+use std::os::unix::ffi::OsStrExt;
+
+#[repr(C)]
+#[derive(Debug, Default)]
+struct open_how {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+pub struct SnapshotOpener {
+    base: File,
+}
+
+impl SnapshotOpener {
+    /// Creates a new `SnapshotOpener` rooted at the given directory path.
+    ///
+    /// # Errors
+    /// Returns an error if the path cannot be opened safely.
+    pub fn new(path: &Path) -> io::Result<Self> {
+        let base = directory(path, false)?;
+        Ok(Self { base })
+    }
+
+    /// Opens a file relative to the snapshot directory.
+    ///
+    /// # Errors
+    /// Returns an error if the path escapes, traverses a symlink, or does not exist.
+    pub fn open(&self, path: &Path) -> io::Result<File> {
+        if path.is_absolute() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+
+        let how = open_how {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        };
+
+        // SAFETY: SYS_openat2 is a valid syscall. path_c is a valid C string.
+        // how is passed by reference with the correct size.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.base.as_raw_fd(),
+                path_c.as_ptr(),
+                &how,
+                std::mem::size_of::<open_how>(),
+            )
+        };
+
+        if fd >= 0 {
+            let fd_i32 =
+                i32::try_from(fd).map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
+            // SAFETY: We exclusively own this new descriptor.
+            return Ok(unsafe { std::fs::File::from_raw_fd(fd_i32) });
+        }
+
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(err);
+        }
+
+        let mut parent = self.base.try_clone()?;
+        let mut components = path.components().peekable();
+        while let Some(component) = components.next() {
+            let name = match component {
+                Component::Normal(name) => name,
+                Component::CurDir => continue,
+                _ => return Err(io::ErrorKind::InvalidInput.into()),
+            };
+            let is_last = components.peek().is_none();
+            let flags = if is_last {
+                OFlag::O_RDONLY
+            } else {
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY
+            };
+            parent = open(&parent, name, flags)?;
+        }
+        Ok(parent)
+    }
+
+    /// Returns a closure suitable for `SnapshotManifest::verify`.
+    pub fn verify_opener(&self) -> impl FnMut(&Path) -> io::Result<File> + '_ {
+        move |path| self.open(path)
+    }
+}
