@@ -5,6 +5,8 @@ use std::io;
 use std::os::fd::AsRawFd;
 
 nix::ioctl_readwrite_bad!(tun_set_iff, libc::TUNSETIFF, IfReq);
+nix::ioctl_write_int_bad!(tun_set_owner, libc::TUNSETOWNER);
+nix::ioctl_write_int_bad!(tun_set_group, libc::TUNSETGROUP);
 nix::ioctl_write_int_bad!(tun_set_persist, libc::TUNSETPERSIST);
 
 /// `struct ifreq` as read by TUNSETIFF: the name, then `ifr_flags` at the start of the union,
@@ -23,7 +25,7 @@ const _: () = assert!(size_of::<IfReq>() == size_of::<libc::ifreq>());
 /// `/dev/net/tun` binds the device to the netns of the thread that opens it, so the caller must
 /// already be inside the lab netns. The flags match the ones Firecracker passes when it attaches
 /// to the TAP; a later TUNSETIFF with a different TUN/TAP type or queue mode would be refused.
-pub(crate) fn create_persistent(name: &str) -> io::Result<()> {
+pub(crate) fn create_persistent(name: &str, user_id: u32, group_id: u32) -> io::Result<()> {
     if name.len() >= libc::IFNAMSIZ {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
@@ -43,6 +45,12 @@ pub(crate) fn create_persistent(name: &str) -> io::Result<()> {
     // with a NUL-terminated name (length checked above). The kernel copies that many bytes in and,
     // on success, back out; nothing keeps the pointer after the call returns.
     unsafe { tun_set_iff(tun.as_raw_fd(), &raw mut req) }?;
+    // SAFETY: `tun` owns a valid descriptor attached to the TAP for the whole call.
+    // TUNSETOWNER takes the uid integer by value, so no memory is shared with the kernel.
+    unsafe { tun_set_owner(tun.as_raw_fd(), i32::from_ne_bytes(user_id.to_ne_bytes())) }?;
+    // SAFETY: `tun` owns a valid descriptor attached to the TAP for the whole call.
+    // TUNSETGROUP takes the gid integer by value, so no memory is shared with the kernel.
+    unsafe { tun_set_group(tun.as_raw_fd(), i32::from_ne_bytes(group_id.to_ne_bytes())) }?;
     // SAFETY: same open descriptor, now attached to the TAP. TUNSETPERSIST takes its argument by
     // value, so no memory is shared with the kernel.
     unsafe { tun_set_persist(tun.as_raw_fd(), 1) }?;

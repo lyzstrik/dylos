@@ -66,7 +66,7 @@ fn test_all_devices_are_up_and_configured() {
     }
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
-        let mut net = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
 
         for bridge in ["br-left", "br-right"] {
             let info = ip_link(net.netns_path(), &[bridge]);
@@ -110,7 +110,9 @@ fn test_failed_create_rolls_back_then_teardown_is_idempotent() {
         let p = plan();
         let path = dir.path().join(p.netns_name());
 
-        let err = LabNetwork::create(p.clone(), dir.path()).await.unwrap_err();
+        let err = LabNetwork::create(p.clone(), dir.path(), 0, 0)
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -170,7 +172,7 @@ fn test_caller_and_pool_threads_are_not_moved_to_lab_netns() {
     let pool_ns = || async { tokio::task::spawn_blocking(thread_netns).await.unwrap() };
 
     runtime.block_on(async {
-        let mut net = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         assert_eq!(original_ns, thread_netns(), "caller moved by create");
         assert_eq!(original_ns, pool_ns().await, "pool thread moved by create");
         let lab_ns = std::fs::metadata(net.netns_path()).unwrap().ino();
@@ -184,7 +186,7 @@ fn test_caller_and_pool_threads_are_not_moved_to_lab_netns() {
             "pool thread moved by teardown"
         );
 
-        let live = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let live = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         let path = live.netns_path().to_owned();
         drop(live);
         let deadline = Instant::now() + Duration::from_secs(5);

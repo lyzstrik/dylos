@@ -22,7 +22,7 @@ pub struct LabNetwork {
 
 impl LabNetwork {
     /// Creates the netns `<netns_dir>/dylos-<lab id>`, then one bridge per segment and one
-    /// persistent TAP per VM interface inside it, all up.
+    /// persistent TAP per VM interface inside it, all up and owned by the jailer uid/gid.
     ///
     /// On failure everything created so far is removed before returning, except when the netns
     /// already existed: it may belong to a running lab, so it is left untouched. Cancel-safe:
@@ -32,13 +32,18 @@ impl LabNetwork {
     /// # Errors
     ///
     /// [`Error::NetnsExists`], or the system or netlink call that failed.
-    pub async fn create(plan: FabricPlan, netns_dir: &Path) -> Result<Self, Error> {
+    pub async fn create(
+        plan: FabricPlan,
+        netns_dir: &Path,
+        user_id: u32,
+        group_id: u32,
+    ) -> Result<Self, Error> {
         let span = info_span!("lab_network", lab = plan.lab_id());
         let netns_path = netns_dir.join(plan.netns_name());
         let started = Instant::now();
         let lab = plan.lab_id().to_owned();
         let net = blocking(&lab, move || {
-            let ns = create_blocking(&plan, &netns_path)?;
+            let ns = create_blocking(&plan, &netns_path, user_id, group_id)?;
             Ok(Self {
                 plan,
                 netns_path,
@@ -136,11 +141,16 @@ async fn teardown_at(
 
 /// Builds the fabric on a fresh thread, which moves into the new netns; on failure, rolls back
 /// before returning.
-fn create_blocking(plan: &FabricPlan, path: &Path) -> Result<File, Error> {
+fn create_blocking(
+    plan: &FabricPlan,
+    path: &Path,
+    user_id: u32,
+    group_id: u32,
+) -> Result<File, Error> {
     let lab = plan.lab_id();
     let created = on_fresh_thread_blocking(lab, {
         let (plan, path) = (plan.clone(), path.to_owned());
-        move || create_fabric(&plan, &path)
+        move || create_fabric(&plan, &path, user_id, group_id)
     });
     match created {
         Err(e) if !matches!(e, Error::NetnsExists { .. }) => {
@@ -157,7 +167,12 @@ fn create_blocking(plan: &FabricPlan, path: &Path) -> Result<File, Error> {
     }
 }
 
-fn create_fabric(plan: &FabricPlan, path: &Path) -> Result<File, Error> {
+fn create_fabric(
+    plan: &FabricPlan,
+    path: &Path,
+    user_id: u32,
+    group_id: u32,
+) -> Result<File, Error> {
     let lab = plan.lab_id();
     let ns = netns::create_and_enter(lab, path)?;
     with_netlink(lab, async |handle| {
@@ -172,7 +187,7 @@ fn create_fabric(plan: &FabricPlan, path: &Path) -> Result<File, Error> {
             res.map_err(nl_err(lab, "create bridge", &bridge.name))?;
         }
         for tap in plan.taps() {
-            tap::create_persistent(&tap.name).map_err(io_err(
+            tap::create_persistent(&tap.name, user_id, group_id).map_err(io_err(
                 lab,
                 "create tap",
                 Path::new(&tap.name),

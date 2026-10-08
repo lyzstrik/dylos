@@ -120,7 +120,7 @@ fn create_then_teardown_50_times_leaves_nothing() {
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
         for i in 0..50 {
-            let mut net = LabNetwork::create(plan(), dir.path()).await.unwrap();
+            let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
             let path = net.netns_path().to_owned();
             assert_eq!(fabric_links(&path), REFERENCE_LINKS, "iteration {i}");
             net.teardown().await.unwrap();
@@ -138,7 +138,7 @@ fn bridges_have_multicast_snooping_disabled_and_taps_are_enslaved() {
     }
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
-        let mut net = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         for bridge in ["br-left", "br-right"] {
             assert!(ip_link(net.netns_path(), &[bridge]).contains("mcast_snooping 0"));
         }
@@ -175,8 +175,10 @@ fn create_refuses_an_existing_netns_and_leaves_it_alone() {
     }
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
-        let mut first = LabNetwork::create(plan(), dir.path()).await.unwrap();
-        let err = LabNetwork::create(plan(), dir.path()).await.unwrap_err();
+        let mut first = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
+        let err = LabNetwork::create(plan(), dir.path(), 0, 0)
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NetnsExists { .. }), "{err}");
         assert_eq!(fabric_links(first.netns_path()), REFERENCE_LINKS);
         first.teardown().await.unwrap();
@@ -190,7 +192,7 @@ fn teardown_deletes_devices_even_if_a_process_still_holds_the_netns() {
     }
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
-        let mut net = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         let mut leaked = Command::new("nsenter")
             .arg(format!("--net={}", net.netns_path().display()))
             .args(["sleep", "30"])
@@ -223,7 +225,7 @@ fn dropping_a_live_lab_network_on_the_executor_tears_it_down() {
     }
     let dir = tempfile::tempdir().unwrap();
     let path = block_on(async {
-        let net = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         let path = net.netns_path().to_owned();
         drop(net);
         path
@@ -245,7 +247,7 @@ fn cancelled_create_leaves_nothing() {
         .unwrap();
     runtime.block_on(async {
         // The first poll hands the work to the blocking pool; the future is then dropped.
-        let mut create = pin!(LabNetwork::create(plan(), dir.path()));
+        let mut create = pin!(LabNetwork::create(plan(), dir.path(), 0, 0));
         std::future::poll_fn(|cx| {
             let _ = create.as_mut().poll(cx);
             Poll::Ready(())
@@ -266,21 +268,61 @@ fn a_stale_handle_never_tears_down_a_newer_network_with_the_same_name() {
     }
     let dir = tempfile::tempdir().unwrap();
     block_on(async {
-        let mut first = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut first = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         first.teardown().await.unwrap();
-        let mut second = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut second = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         first.teardown().await.unwrap();
         drop(first);
         assert_eq!(fabric_links(second.netns_path()), REFERENCE_LINKS);
 
         // Crash recovery by name while `second` is still live, then a new lab with the same id.
         teardown(&plan(), dir.path()).await.unwrap();
-        let mut third = LabNetwork::create(plan(), dir.path()).await.unwrap();
+        let mut third = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
         second.teardown().await.unwrap();
         drop(second);
         assert_eq!(fabric_links(third.netns_path()), REFERENCE_LINKS);
 
         third.teardown().await.unwrap();
         assert_netns_gone(third.netns_path());
+    });
+}
+
+#[test]
+fn taps_are_owned_by_the_requested_uid_and_gid() {
+    if !sandboxed("taps_are_owned_by_the_requested_uid_and_gid") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    block_on(async {
+        // The unshare harness maps only uid/gid 0; other owners are invalid in this user namespace.
+        let mut net = LabNetwork::create(plan(), dir.path(), 0, 0).await.unwrap();
+        for tap in net.plan().taps() {
+            let out = Command::new("nsenter")
+                .arg(format!("--net={}", net.netns_path().display()))
+                .args(["unshare", "--mount", "sh"])
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/tap-ownership.sh"
+                ))
+                .arg(&tap.name)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                String::from_utf8(out.stdout).unwrap(),
+                "0\n0\n",
+                "{}",
+                tap.name
+            );
+        }
+        let path = net.netns_path().to_owned();
+        net.teardown().await.unwrap();
+        net.teardown().await.unwrap();
+        assert_netns_gone(&path);
+        assert_eq!(fabric_links(Path::new("/proc/self/ns/net")), NO_LINKS);
     });
 }
