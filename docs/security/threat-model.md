@@ -28,7 +28,7 @@ This document outlines the threat model for the Dylos lab engine.
 
 | Threat | Mitigation | Status |
 | --- | --- | --- |
-| Injection through LabSpec names: interface names reach the guest kernel command line (`guest_net::boot_args`) and node names reach host resource names | Restrict names to `[A-Za-z0-9-]` with length limits | **Not mitigated yet**: LabSpec validation only checks uniqueness (LYZ-41) |
+| Injection through LabSpec names: interface names reach the guest kernel command line (`guest_net::boot_args`) and node names reach host resource names | Restrict names to `[A-Za-z0-9-]` with length limits | Mitigated by LYZ-41 (charset and length checked in `LabSpec::validate` and again in `guest_net::boot_args` for the supplied node); keep it lexical: it does not cover filesystem objects (LYZ-43, LYZ-46). |
 | Path traversal through snapshot manifest paths | Paths must be relative, without `..`, validated before any file is opened (`SnapshotManifest`) | Mitigated (lexical traversal only) (LYZ-21) |
 | Symlink/TOCTOU escape via snapshot manifest or jail population | Trusted, non-writable source/base-directory assumption. | **Not mitigated**: manifest `verify` delegates opening to the caller without a safe opener (LYZ-46). Jail population hard-links/copies sources and follows symlinks on `chown` as root (LYZ-43). |
 | Path traversal or unexpected characters in jail ids | Jail ids restricted to the jailer's `[A-Za-z0-9-]` rule | Mitigated in `dylos-runtime` (LYZ-11) |

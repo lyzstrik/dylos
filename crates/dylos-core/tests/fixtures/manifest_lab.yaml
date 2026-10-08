@@ -1,6 +1,6 @@
 nodes:
   - name: router
-    image: router.qcow2
+    image: router-qcow2
     vcpus: 1
     memory: 256
     interfaces:

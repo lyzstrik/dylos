@@ -62,7 +62,23 @@ pub fn boot_args(lab: &LabSpec, node: &Node) -> Result<String, Error> {
 
     let mut args = String::new();
 
-    for iface in &node.interfaces {
+    if let Err(reason) = crate::validate_name(&node.name, 32) {
+        return Err(Error::InvalidName {
+            path: "node.name".to_string(),
+            value: node.name.clone(),
+            reason,
+        });
+    }
+
+    for (j, iface) in node.interfaces.iter().enumerate() {
+        if let Err(reason) = crate::validate_name(&iface.name, 15) {
+            return Err(Error::InvalidName {
+                path: format!("interfaces[{j}].name"),
+                value: iface.name.clone(),
+                reason,
+            });
+        }
+
         let mac = mac_for_interface(&node.name, &iface.name);
 
         let mut if_arg = format!(
