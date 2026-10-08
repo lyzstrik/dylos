@@ -1,3 +1,5 @@
+mod body;
+pub use body::FakeBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -32,6 +34,8 @@ pub struct ReplyConfig {
     pub status: StatusCode,
     pub body: Vec<u8>,
     pub delay: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub stream_rx:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>>,
 }
 
 impl FakeServer {
@@ -51,6 +55,7 @@ impl FakeServer {
             status: StatusCode::NO_CONTENT,
             body: vec![],
             delay: None,
+            stream_rx: Arc::new(Mutex::new(None)),
         }));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let conn_tasks = Arc::new(Mutex::new(Vec::new()));
@@ -97,7 +102,7 @@ impl FakeServer {
                                             });
                                         }
 
-                                        let mut rc = ReplyConfig { status: StatusCode::NO_CONTENT, body: vec![], delay: None };
+                                        let mut rc = ReplyConfig { status: StatusCode::NO_CONTENT, body: vec![], delay: None, stream_rx: std::sync::Arc::new(std::sync::Mutex::new(None)) };
                                         if let Ok(reply_lock) = r.lock() {
                                             rc = reply_lock.clone();
                                         }
@@ -106,12 +111,16 @@ impl FakeServer {
                                             delay.notified().await;
                                         }
 
-                                        let response_body = Full::new(Bytes::from(rc.body));
+                                        let response_body = if let Ok(mut rx_lock) = rc.stream_rx.lock() {
+                                            if let Some(rx) = rx_lock.take() {
+                                                FakeBody::Channel(rx)
+                                            } else { FakeBody::Full(Full::new(Bytes::from(rc.body))) }
+                                        } else { FakeBody::Full(Full::new(Bytes::from(rc.body))) };
                                         let res = Response::builder()
                                             .status(rc.status)
                                             .header(hyper::header::CONTENT_TYPE, "application/json")
                                             .body(response_body)
-                                            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+                                            .unwrap_or_else(|_| Response::new(FakeBody::Full(Full::new(Bytes::new()))));
 
                                         Ok::<_, Infallible>(res)
                                     }
@@ -163,6 +172,19 @@ impl FakeServer {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn set_reply_stream(
+        &self,
+        status: StatusCode,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        if let Ok(mut r) = self.reply.lock() {
+            r.status = status;
+            r.body = vec![];
+            r.delay = None;
+            r.stream_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+        }
+    }
     pub fn history(&self) -> Vec<RequestRecord> {
         if let Ok(h) = self.history.lock() {
             h.clone()
