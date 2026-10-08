@@ -29,14 +29,18 @@ This document outlines the threat model for the Dylos lab engine.
 | Threat | Mitigation | Status |
 | --- | --- | --- |
 | Injection through LabSpec names: interface names reach the guest kernel command line (`guest_net::boot_args`) and node names reach host resource names | Restrict names to `[A-Za-z0-9-]` with length limits | **Not mitigated yet**: LabSpec validation only checks uniqueness (LYZ-41) |
-| Path traversal through snapshot manifest paths | Paths must be relative, without `..`, validated before any file is opened (`SnapshotManifest`) | Mitigated (LYZ-21) |
+| Path traversal through snapshot manifest paths | Paths must be relative, without `..`, validated before any file is opened (`SnapshotManifest`) | Mitigated (lexical traversal only) (LYZ-21) |
+| Symlink/TOCTOU escape via snapshot manifest or jail population | Trusted, non-writable source/base-directory assumption. | **Not mitigated**: manifest `verify` delegates opening to the caller without a safe opener. Jail population hard-links/copies sources and follows symlinks on `chown` as root. |
 | Path traversal or unexpected characters in jail ids | Jail ids restricted to the jailer's `[A-Za-z0-9-]` rule | Mitigated in `dylos-runtime` (LYZ-11) |
-| Guest escape to the host | Firecracker run by the upstream jailer: chroot, seccomp, own cgroup, unprivileged uid (ADR-0004) | Mitigated by Firecracker and the jailer; one uid shared by all VMs during the spike (per-VM uids are a follow-up) |
+| Guest escape to the host | Firecracker run by the upstream jailer: chroot, seccomp, own cgroup, unprivileged uid (ADR-0004) | Risk reduction conditional on trusted binaries and non-root target uid. `VmSpec.netns` is optional; lab-netns isolation depends on callers passing it and open PR #14. |
 | Root orchestrator acting on user-controlled data | Validate every name and path before a root operation; run the orchestrator as root only for the spike (ADR-0004) | Partially: depends on LYZ-41; privileged helper split is a follow-up |
 | Malicious data from the guest over vsock | Strict parsing and size limits on the host listener | **Not implemented yet**: the host side of the agent protocol does not exist (LYZ-37). The agent's own `MAX_LINE_BYTES` (4096) only protects the guest |
 | Malicious Firecracker stdout/stderr and metrics | Bounded buffers and line limits when the host reads them | **Not mitigated yet**: start errors keep only the last 20 lines, but lines themselves are not size-limited |
-| Resource exhaustion from a guest | Firecracker machine limits (vCPU, memory); cgroup per VM | Partially: no cgroup limits are set yet beyond the default `pids.max` |
+| Resource exhaustion from a guest | Configured guest vCPU/RAM limits; cgroup per VM | Partially: the default per-VM cgroup has no enforced limits beyond `pids.max=max`. Host CPU, memory overhead, disk/metrics growth and I/O are not limited. |
 | Shared kernel file chowned to the jailer uid through hard links | One copy per VM or per-VM uids | **Not mitigated yet** (noted in PR #17) |
+
+| Malicious Firecracker API responses | Socket directory ownership/permissions assumption. Response caps and internal deadlines. | **Not mitigated**: `dylos-fc` collects the complete response body without a byte cap or internal deadline. |
+| Untrusted network peers on a segment | Bridge/TAP isolation. Prevention of IPv6 NDP/RA and IPv4 ARP/address spoofing, lateral traffic, and packet flooding. | **Not mitigated**: PR #14 provides bridges/namespaces but not filtering between peers on a segment. `net-setup` disables RA/autoconfiguration but does not authenticate peers or enforce source addresses. |
 
 ## Follow-ups
 

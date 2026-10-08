@@ -161,7 +161,7 @@ If you are asked to review a PR, follow `docs/agents/review.md` exactly.
 
 ## 10. Security
 
-- A PR touching `dylos-net`, `dylos-runtime`, `dylos-store`, `dylos-agent`, parsing in `dylos-core`, `xtask/images`, `scripts/` or CI gets a dedicated security review pass by a model family different from the author, following the checklist and `docs/security/threat-model.md`; other PRs only go through the checklist in the normal review.
+- A PR touching `dylos-net`, `dylos-runtime`, `dylos-store`, `dylos-agent`, `dylos-fc`, parsing in `dylos-core`, `xtask/images`, `scripts/` or CI gets a dedicated security review pass, following the checklist and `docs/security/threat-model.md`; other PRs only go through the checklist in the normal review. For a PR authored by several model families, the security pass uses a family that wrote none of it, or, if none is left, the family that wrote the least and never the one that wrote the code under review. The pass is recorded as one PR comment with the header `## Security review: <model>`. Keep it short and factual; no claim of protection that the code does not have.
 - Never commit or print secrets, tokens or credentials.
 - Never commit binaries or runtime data (kernels, rootfs, snapshots, memory files, disks). Record versions and SHA-256 in `docs/host.md`.
 - Never use `sudo` or change host configuration (sysctl, firewall, services, kernel modules) without asking first. Host network changes happen only inside the lab's namespace.
