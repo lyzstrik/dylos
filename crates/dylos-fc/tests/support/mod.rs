@@ -1,3 +1,5 @@
+mod body;
+pub use body::FakeBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -11,6 +13,7 @@ use tokio::net::UnixListener;
 pub struct FakeServer {
     socket_path: PathBuf,
     history: Arc<Mutex<Vec<RequestRecord>>>,
+    arrived: Arc<tokio::sync::Notify>,
     reply: Arc<Mutex<ReplyConfig>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     server_task: Option<tokio::task::JoinHandle<()>>,
@@ -32,6 +35,8 @@ pub struct ReplyConfig {
     pub status: StatusCode,
     pub body: Vec<u8>,
     pub delay: Option<std::sync::Arc<tokio::sync::Notify>>,
+    pub stream_rx:
+        std::sync::Arc<std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>>>>,
 }
 
 impl FakeServer {
@@ -51,10 +56,13 @@ impl FakeServer {
             status: StatusCode::NO_CONTENT,
             body: vec![],
             delay: None,
+            stream_rx: Arc::new(Mutex::new(None)),
         }));
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
         let conn_tasks = Arc::new(Mutex::new(Vec::new()));
 
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let a_clone = Arc::clone(&arrived);
         let h_clone = Arc::clone(&history);
         let r_clone = Arc::clone(&reply);
         let c_clone = Arc::clone(&conn_tasks);
@@ -65,12 +73,14 @@ impl FakeServer {
                     _ = shutdown_rx.changed() => break,
                     accept_res = listener.accept() => {
                         if let Ok((stream, _)) = accept_res {
+                            let a = Arc::clone(&a_clone);
                             let h = Arc::clone(&h_clone);
                             let r = Arc::clone(&r_clone);
 
                             let conn_task = tokio::spawn(async move {
                                 let io = hyper_util::rt::TokioIo::new(stream);
                                 let svc = service_fn(move |req: Request<Incoming>| {
+                                    let a = Arc::clone(&a);
                                     let h = Arc::clone(&h);
                                     let r = Arc::clone(&r);
                                     async move {
@@ -97,21 +107,26 @@ impl FakeServer {
                                             });
                                         }
 
-                                        let mut rc = ReplyConfig { status: StatusCode::NO_CONTENT, body: vec![], delay: None };
+                                        let mut rc = ReplyConfig { status: StatusCode::NO_CONTENT, body: vec![], delay: None, stream_rx: std::sync::Arc::new(std::sync::Mutex::new(None)) };
                                         if let Ok(reply_lock) = r.lock() {
                                             rc = reply_lock.clone();
                                         }
 
+                                        a.notify_one();
                                         if let Some(delay) = rc.delay {
                                             delay.notified().await;
                                         }
 
-                                        let response_body = Full::new(Bytes::from(rc.body));
+                                        let response_body = if let Ok(mut rx_lock) = rc.stream_rx.lock() {
+                                            if let Some(rx) = rx_lock.take() {
+                                                FakeBody::Channel(rx)
+                                            } else { FakeBody::Full(Full::new(Bytes::from(rc.body))) }
+                                        } else { FakeBody::Full(Full::new(Bytes::from(rc.body))) };
                                         let res = Response::builder()
                                             .status(rc.status)
                                             .header(hyper::header::CONTENT_TYPE, "application/json")
                                             .body(response_body)
-                                            .unwrap_or_else(|_| Response::new(Full::new(Bytes::new())));
+                                            .unwrap_or_else(|_| Response::new(FakeBody::Full(Full::new(Bytes::new()))));
 
                                         Ok::<_, Infallible>(res)
                                     }
@@ -134,6 +149,7 @@ impl FakeServer {
         Ok(Self {
             socket_path,
             history,
+            arrived,
             reply,
             shutdown_tx,
             server_task: Some(server_task),
@@ -163,6 +179,19 @@ impl FakeServer {
         }
     }
 
+    #[allow(dead_code)]
+    pub fn set_reply_stream(
+        &self,
+        status: StatusCode,
+        rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    ) {
+        if let Ok(mut r) = self.reply.lock() {
+            r.status = status;
+            r.body = vec![];
+            r.delay = None;
+            r.stream_rx = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+        }
+    }
     pub fn history(&self) -> Vec<RequestRecord> {
         if let Ok(h) = self.history.lock() {
             h.clone()
@@ -171,8 +200,34 @@ impl FakeServer {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn wait_for_request(&self) -> Result<(), Box<dyn std::error::Error>> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), self.arrived.notified())
+            .await
+            .map_err(|e| format!("request did not arrive: {e}"))?;
+        Ok(())
+    }
+
+    // Await actual connection completion before shutdown can abort any tasks.
+    #[allow(dead_code)]
+    pub async fn wait_for_connections(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let tasks: Vec<_> = self
+            .conn_tasks
+            .lock()
+            .map_err(|e| e.to_string())?
+            .drain(..)
+            .collect();
+        assert!(!tasks.is_empty(), "no connections observed");
+        for task in tasks {
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .map_err(|e| format!("connection leaked: {e}"))??;
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         if let Some(task) = self.server_task.take() {
             #[allow(clippy::collapsible_if)]
             if let Err(e) = task.await {
@@ -194,7 +249,7 @@ impl FakeServer {
 
 impl Drop for FakeServer {
     fn drop(&mut self) {
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         if let Some(task) = self.server_task.take() {
             task.abort();
         }

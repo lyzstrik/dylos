@@ -5,7 +5,9 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 use crate::config::{
     BootSource, Drive, InstanceActionInfo, MachineConfiguration, NetworkInterface,
@@ -13,9 +15,37 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::snapshot::{SnapshotCreateParams, SnapshotLoadParams, Vm};
 
+/// Firecracker API client over a Unix socket.
+///
+/// Response bodies are capped at 1 MiB (1,048,576 bytes), for both success and
+/// error responses. Fault messages are capped at 1,024 UTF-8 bytes, truncated at
+/// a character boundary; truncated messages gain an additional `...` suffix
+/// (up to 1,027 bytes total).
+///
+/// The default request deadline is 10 seconds. Only [`Self::create_snapshot`]
+/// and [`Self::load_snapshot`] use the separate 120-second snapshot deadline.
+/// Both deadlines cover connecting, sending the request, and receiving the full
+/// response body. The builders accept [`Duration`] values to override them.
+///
+/// The spike envelope is VMs with up to a few GiB of memory on local SSD storage.
+/// A full snapshot writes all guest memory, so 120 seconds leaves a wide margin
+/// at low disk throughput. LYZ-28 benchmarks will measure actual durations and
+/// inform adjustments to this default.
+///
+/// A timeout leaves the server-side outcome unknown; callers must not assume
+/// rollback or blindly retry.
 pub struct FcClient {
     socket_path: PathBuf,
+    timeout: Duration,
+    snapshot_timeout: Duration,
 }
+
+const RESPONSE_SIZE_LIMIT: usize = 1024 * 1024;
+/// The byte limit for a fault message before truncation. The "..." suffix is appended
+/// after truncation, so the final string may be up to limit + 3 bytes long.
+const FAULT_MESSAGE_LIMIT: usize = 1024;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Deserialize)]
 struct FaultMessage {
@@ -52,25 +82,63 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 impl FcClient {
+    /// Configures the request deadline (default: 10 seconds), excluding snapshot create/load.
+    /// The deadline covers the entire operation: connection, sending the request, and receiving the full body.
+    ///
+    /// On timeout, the server-side outcome is unknown (Firecracker may still complete the operation).
+    /// Callers must not assume rollback or blindly retry.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Configures the snapshot deadline (default: 120 seconds), used only by
+    /// `create_snapshot` and `load_snapshot`.
+    /// The deadline covers the entire operation: connection, sending the request, and receiving the full body.
+    ///
+    /// On timeout, the server-side outcome is unknown (Firecracker may still complete the operation).
+    /// Callers must not assume rollback or blindly retry.
+    #[must_use]
+    pub fn with_snapshot_timeout(mut self, timeout: Duration) -> Self {
+        self.snapshot_timeout = timeout;
+        self
+    }
+
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            timeout: DEFAULT_TIMEOUT,
+            snapshot_timeout: DEFAULT_SNAPSHOT_TIMEOUT,
         }
     }
 
-    #[tracing::instrument(skip(self, body), fields(method = %method, route = %route, duration_ms = tracing::field::Empty))]
+    #[tracing::instrument(skip(self, body, timeout_duration), fields(method = %method, route = %route, duration_ms = tracing::field::Empty))]
     async fn request<B, R>(
         &self,
         method: hyper::Method,
         route: &str,
         body: Option<&B>,
+        timeout_duration: Duration,
     ) -> Result<Option<R>>
     where
         B: Serialize + ?Sized,
         R: for<'de> Deserialize<'de>,
     {
         let start = std::time::Instant::now();
-        let res = self.request_inner(method, route, body).await;
+        let res = match timeout(
+            timeout_duration,
+            self.request_inner(method.clone(), route, body),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(Error::Timeout {
+                path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
+            }),
+        };
         tracing::Span::current().record(
             "duration_ms",
             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -143,26 +211,48 @@ impl FcClient {
         })?;
 
         let status = res.status();
-        let body_bytes = res
-            .into_body()
+        let limited_body = http_body_util::Limited::new(res.into_body(), RESPONSE_SIZE_LIMIT);
+        let body_bytes = limited_body
             .collect()
             .await
-            .map_err(|e| Error::BodyRead {
-                path: self.socket_path.clone(),
-                method: method.to_string(),
-                route: route.to_string(),
-                status: status.as_u16(),
-                source: e,
+            .map_err(|e| {
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    Error::ResponseTooLarge {
+                        path: self.socket_path.clone(),
+                        method: method.to_string(),
+                        route: route.to_string(),
+                        limit: RESPONSE_SIZE_LIMIT,
+                    }
+                } else {
+                    Error::BodyRead {
+                        path: self.socket_path.clone(),
+                        method: method.to_string(),
+                        route: route.to_string(),
+                        status: status.as_u16(),
+                        source: e,
+                    }
+                }
             })?
             .to_bytes();
 
         if !status.is_success() {
-            let fault_message =
+            let mut fault_message =
                 if let Ok(fault) = serde_json::from_slice::<FaultMessage>(&body_bytes) {
                     fault.fault_message
                 } else {
                     String::from_utf8_lossy(&body_bytes).into_owned()
                 };
+
+            if fault_message.len() > FAULT_MESSAGE_LIMIT {
+                let mut limit = FAULT_MESSAGE_LIMIT;
+                while limit > 0 && !fault_message.is_char_boundary(limit) {
+                    limit -= 1;
+                }
+                fault_message.truncate(limit);
+                fault_message.push_str("...");
+            }
 
             return Err(Error::Api {
                 path: self.socket_path.clone(),
@@ -173,19 +263,27 @@ impl FcClient {
             });
         }
 
+        Self::parse_response(&self.socket_path, &method, route, status, &body_bytes)
+    }
+
+    fn parse_response<R: for<'de> Deserialize<'de>>(
+        socket_path: &std::path::Path,
+        method: &hyper::Method,
+        route: &str,
+        status: hyper::StatusCode,
+        body_bytes: &[u8],
+    ) -> Result<Option<R>> {
         if body_bytes.is_empty() {
-            Ok(None)
-        } else {
-            let parsed: R =
-                serde_json::from_slice(&body_bytes).map_err(|e| Error::Deserialize {
-                    path: self.socket_path.clone(),
-                    method: method.to_string(),
-                    route: route.to_string(),
-                    status: status.as_u16(),
-                    source: e,
-                })?;
-            Ok(Some(parsed))
+            return Ok(None);
         }
+        let parsed: R = serde_json::from_slice(body_bytes).map_err(|e| Error::Deserialize {
+            path: socket_path.to_path_buf(),
+            method: method.to_string(),
+            route: route.to_string(),
+            status: status.as_u16(),
+            source: e,
+        })?;
+        Ok(Some(parsed))
     }
 
     /// `route` starts with `/` (for example `/machine-config`). Returns `Ok(None)` when Firecracker
@@ -198,7 +296,8 @@ impl FcClient {
     where
         R: for<'de> Deserialize<'de>,
     {
-        self.request::<(), R>(hyper::Method::GET, route, None).await
+        self.request::<(), R>(hyper::Method::GET, route, None, self.timeout)
+            .await
     }
 
     /// Same contract as [`FcClient::get`], with `body` sent as JSON.
@@ -211,7 +310,8 @@ impl FcClient {
         B: Serialize + ?Sized,
         R: for<'de> Deserialize<'de>,
     {
-        self.request(hyper::Method::PUT, route, Some(body)).await
+        self.request(hyper::Method::PUT, route, Some(body), self.timeout)
+            .await
     }
 
     /// Same contract as [`FcClient::get`], with `body` sent as JSON.
@@ -224,7 +324,8 @@ impl FcClient {
         B: Serialize + ?Sized,
         R: for<'de> Deserialize<'de>,
     {
-        self.request(hyper::Method::PATCH, route, Some(body)).await
+        self.request(hyper::Method::PATCH, route, Some(body), self.timeout)
+            .await
     }
 
     /// Configures the microVM vCPU count, memory, and related machine parameters (`PUT /machine-config`).
@@ -311,8 +412,16 @@ impl FcClient {
     /// # Errors
     ///
     /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    /// On timeout, the server-side outcome is unknown; do not assume rollback or retry blindly.
     pub async fn create_snapshot(&self, params: &SnapshotCreateParams) -> Result<()> {
-        let _: Option<serde_json::Value> = self.put("/snapshot/create", params).await?;
+        let _: Option<serde_json::Value> = self
+            .request(
+                hyper::Method::PUT,
+                "/snapshot/create",
+                Some(params),
+                self.snapshot_timeout,
+            )
+            .await?;
         Ok(())
     }
 
@@ -321,8 +430,16 @@ impl FcClient {
     /// # Errors
     ///
     /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    /// On timeout, the server-side outcome is unknown; do not assume rollback or retry blindly.
     pub async fn load_snapshot(&self, params: &SnapshotLoadParams) -> Result<()> {
-        let _: Option<serde_json::Value> = self.put("/snapshot/load", params).await?;
+        let _: Option<serde_json::Value> = self
+            .request(
+                hyper::Method::PUT,
+                "/snapshot/load",
+                Some(params),
+                self.snapshot_timeout,
+            )
+            .await?;
         Ok(())
     }
 }

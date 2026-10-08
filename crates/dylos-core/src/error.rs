@@ -21,6 +21,13 @@ pub enum Error {
     #[error("{path}: duplicate node name {name:?}")]
     DuplicateNodeName { path: String, name: String },
 
+    #[error("{path}: invalid name {value:?}: {reason}")]
+    InvalidName {
+        path: String,
+        value: String,
+        reason: &'static str,
+    },
+
     #[error("{path}: duplicate segment name {name:?}")]
     DuplicateSegmentName { path: String, name: String },
 

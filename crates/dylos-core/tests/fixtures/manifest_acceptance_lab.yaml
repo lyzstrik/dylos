@@ -6,7 +6,7 @@ segments:
     ipv6: 2001:db8:2::/64
 nodes:
   - name: router
-    image: router.img
+    image: router-img
     vcpus: 2
     memory: 512
     interfaces:
