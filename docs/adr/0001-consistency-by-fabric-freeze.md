@@ -4,6 +4,8 @@
 - Date: 2026-10-03
 - Issue: LYZ-9
 
+**Revision (2026-10-08):** The freeze contract becomes "no frame sent after freeze completion (T) is received by a lab VM before thaw". Frames already queued host-side at T were sent before T, so delivering them during the freeze keeps the cut consistent, because the sender is captured after T and its state contains the send. This revision is necessary because Linux does not purge a TAP's queue when the link goes down; purging requires the TAP file descriptor, which Firecracker owns.
+
 ## Context
 
 A Dylos lab is several Firecracker microVMs connected by a virtual network (the fabric: one bridge per segment, one TAP per interface, all inside the lab's network namespace).
@@ -30,10 +32,7 @@ Being forwarded by the bridge or counted by a TAP is neither: it is the channel.
 
 We obtain a consistent cut by freezing the fabric before pausing any VM, and we drop the frames in transit instead of recording them: the channel state of every snapshot is empty.
 
-The freeze contract has two parts, both required:
-
-- **No delivery:** while frozen, no frame enters the captured state of any VM of the lab.
-- **Discard, not retain:** frames already queued on the host side when the freeze starts, and frames emitted by VMs while it lasts, are dropped. None of them may be delivered after the thaw, on the original lab or on a restored clone.
+The freeze contract is: no frame sent after freeze completion (T) is received by a lab VM before thaw. Frames already queued host-side at T were sent before T, so delivering them during the freeze keeps the cut consistent.
 
 Lab snapshot sequence (each step completes for all VMs before the next starts; steps on several VMs run in parallel):
 
@@ -52,17 +51,15 @@ Let T be the instant at which step 1 has completed on every interface. Every VM 
 
 Take any frame m recorded as received in some VM's snapshot:
 
-1. m entered that VM's state before T, because of the no-delivery part of the freeze contract.
+1. m cannot have been sent after T, because the freeze contract ensures no frame sent after T is received before thaw.
 2. So m was sent before T.
 3. The sender is captured after T, and a VM's state only moves forward, so the sender's snapshot includes having sent m.
 
 No snapshot can therefore contain a reception without the matching emission. This holds whatever the skew between pauses and snapshots, which is exactly the quantity we cannot control.
 
-The proof is conditional on the no-delivery premise, and that premise is about the VM's captured state, not about host interfaces.
-A frame queued at a TAP before T could still be read into guest memory after T without any further TAP counter change, and Firecracker v1.17.0 completes deferred RX work when it prepares a snapshot (`Net::prepare_save`).
-Frozen host-side counters alone therefore do not prove the premise: LYZ-19 must also observe the receive side inside the guest (virtio and guest interface counters) across the freeze.
+Frames already queued host-side at T were sent before T, so delivering them during the freeze keeps the cut consistent. Clones never see those frames (fresh TAPs in a fresh netns), and on the original lab they are a normal delay after thaw.
 
-The freeze does not need to be atomic across interfaces: the argument only needs every delivery to stop before the first VM is paused. A per-TAP freeze is not a counterexample, since every capture happens after the last interface is frozen.
+The freeze does not need to be atomic across interfaces: the argument only needs the freeze to apply to every interface before the first VM is paused. A per-TAP freeze is not a counterexample, since every capture happens after the last interface is frozen.
 
 ### Why dropping frames in transit is acceptable
 
@@ -80,15 +77,14 @@ For the supported workloads, dropping the in-transit frames costs nothing, and i
 
 - The snapshot and restore sequences above are fixed, and AGENTS.md forbids reordering them. Pausing a VM before the freeze has completed on every interface breaks the guarantee.
 - Thawing only after every VM has resumed is a chosen invariant, not a consistency requirement: once all snapshots exist, delivering a frame to a still-paused VM is only delay. We keep it because it gives one simple rule for readiness on both the original lab and the clones.
-- Correctness depends on the freeze contract (no delivery, discard), not on the pause skew. Both parts must be tested (see below).
+- Correctness depends on the freeze contract (no frame sent after T is received before thaw), not on the pause skew. This must be tested (see below).
 - Long-lived TCP connections must survive a snapshot and a restore through retransmission. This is measured in LYZ-27.
 - The freeze duration adds to the lab's network downtime. It must stay well under the snapshot budget of 1 s for 5 VMs.
 
 ## What this does not cover
 
 - Frames already inside a VM (guest kernel queues, virtio rings) at the freeze: they are part of that VM's state and are captured with it, not lost. On restore, frames still queued for sending are transmitted into a frozen fabric and dropped, or after the thaw delivered late. Both are loss or delay, which Ethernet allows.
-- Host-side queues (TAP queue, bridge, Firecracker device buffers) must neither deliver anything during the freeze nor keep frames for after the thaw. This is an assumption to verify by test under heavy traffic in LYZ-19, observing both host interface counters and the receive side inside the guests.
-- Whether a paused Firecracker VM still moves frames into guest memory is not relied on. It must be observed in the same test, because a delivery into a paused VM after T would violate the premise of the proof, not only change how much is lost.
+- What remains to verify with real VMs (the LYZ-19 key test): frames sent after T are dropped (a down TAP drops writes, the bridge does not forward to a down port), and Firecracker's own device buffers (`Net::prepare_save`).
 - Workloads that cannot recover from packet loss (see above).
 - Disk consistency: pausing stops the vCPUs, but host-side writes may still be in flight before the reflink. Handled in LYZ-22 (fsync, continuous-write test).
 - Guest clock, entropy and identical identities across clones: separate decisions (LYZ-25, LYZ-26 / ADR-0002).
