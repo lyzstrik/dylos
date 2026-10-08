@@ -5,7 +5,9 @@ use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::net::UnixStream;
+use tokio::time::timeout;
 
 use crate::config::{
     BootSource, Drive, InstanceActionInfo, MachineConfiguration, NetworkInterface,
@@ -15,7 +17,12 @@ use crate::snapshot::{SnapshotCreateParams, SnapshotLoadParams, Vm};
 
 pub struct FcClient {
     socket_path: PathBuf,
+    timeout: Duration,
 }
+
+const RESPONSE_SIZE_LIMIT: usize = 1024 * 1024; // 1 MiB
+const FAULT_MESSAGE_LIMIT: usize = 1024; // 1 KiB
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000); // 1s
 
 #[derive(Deserialize)]
 struct FaultMessage {
@@ -52,9 +59,16 @@ fn validate_id(id: &str) -> Result<()> {
 }
 
 impl FcClient {
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
+            timeout: DEFAULT_TIMEOUT,
         }
     }
 
@@ -70,7 +84,19 @@ impl FcClient {
         R: for<'de> Deserialize<'de>,
     {
         let start = std::time::Instant::now();
-        let res = self.request_inner(method, route, body).await;
+        let res = match timeout(
+            self.timeout,
+            self.request_inner(method.clone(), route, body),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(_) => Err(Error::Timeout {
+                path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
+            }),
+        };
         tracing::Span::current().record(
             "duration_ms",
             u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -143,26 +169,44 @@ impl FcClient {
         })?;
 
         let status = res.status();
-        let body_bytes = res
-            .into_body()
+        let limited_body = http_body_util::Limited::new(res.into_body(), RESPONSE_SIZE_LIMIT);
+        let body_bytes = limited_body
             .collect()
             .await
-            .map_err(|e| Error::BodyRead {
-                path: self.socket_path.clone(),
-                method: method.to_string(),
-                route: route.to_string(),
-                status: status.as_u16(),
-                source: e,
+            .map_err(|e| {
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    Error::ResponseTooLarge {
+                        path: self.socket_path.clone(),
+                        method: method.to_string(),
+                        route: route.to_string(),
+                        limit: RESPONSE_SIZE_LIMIT,
+                    }
+                } else {
+                    Error::BodyRead {
+                        path: self.socket_path.clone(),
+                        method: method.to_string(),
+                        route: route.to_string(),
+                        status: status.as_u16(),
+                        source: e,
+                    }
+                }
             })?
             .to_bytes();
 
         if !status.is_success() {
-            let fault_message =
+            let mut fault_message =
                 if let Ok(fault) = serde_json::from_slice::<FaultMessage>(&body_bytes) {
                     fault.fault_message
                 } else {
                     String::from_utf8_lossy(&body_bytes).into_owned()
                 };
+
+            if fault_message.len() > FAULT_MESSAGE_LIMIT {
+                fault_message.truncate(FAULT_MESSAGE_LIMIT);
+                fault_message.push_str("...");
+            }
 
             return Err(Error::Api {
                 path: self.socket_path.clone(),
@@ -173,19 +217,27 @@ impl FcClient {
             });
         }
 
+        Self::parse_response(&self.socket_path, &method, route, status, &body_bytes)
+    }
+
+    fn parse_response<R: for<'de> Deserialize<'de>>(
+        socket_path: &std::path::Path,
+        method: &hyper::Method,
+        route: &str,
+        status: hyper::StatusCode,
+        body_bytes: &[u8],
+    ) -> Result<Option<R>> {
         if body_bytes.is_empty() {
-            Ok(None)
-        } else {
-            let parsed: R =
-                serde_json::from_slice(&body_bytes).map_err(|e| Error::Deserialize {
-                    path: self.socket_path.clone(),
-                    method: method.to_string(),
-                    route: route.to_string(),
-                    status: status.as_u16(),
-                    source: e,
-                })?;
-            Ok(Some(parsed))
+            return Ok(None);
         }
+        let parsed: R = serde_json::from_slice(body_bytes).map_err(|e| Error::Deserialize {
+            path: socket_path.to_path_buf(),
+            method: method.to_string(),
+            route: route.to_string(),
+            status: status.as_u16(),
+            source: e,
+        })?;
+        Ok(Some(parsed))
     }
 
     /// `route` starts with `/` (for example `/machine-config`). Returns `Ok(None)` when Firecracker

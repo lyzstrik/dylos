@@ -134,3 +134,79 @@ async fn test_client_non_json_error_body() -> TestResult {
     server.shutdown().await;
     Ok(())
 }
+
+/// Tests that a response exceeding the body size limit yields `Error::ResponseTooLarge`.
+#[tokio::test]
+async fn test_client_oversized_body() -> TestResult {
+    let dir = tempdir()?;
+    let sock = dir.path().join("api.socket");
+    let server = FakeServer::new(&sock)?;
+
+    // Body larger than 1 MiB
+    let big_body = vec![b'A'; 2 * 1024 * 1024];
+    server.set_reply(hyper::StatusCode::OK, big_body);
+
+    let client = FcClient::new(&sock);
+    let err_res = client.get::<serde_json::Value>("/machine-config").await;
+
+    if let Err(Error::ResponseTooLarge { limit, .. }) = err_res {
+        assert_eq!(limit, 1024 * 1024);
+    } else {
+        return Err(format!("Expected ResponseTooLarge error, got {err_res:?}").into());
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Tests that a slow response yields `Error::Timeout`.
+#[tokio::test]
+async fn test_client_timeout() -> TestResult {
+    use std::time::Duration;
+
+    let dir = tempdir()?;
+    let sock = dir.path().join("api.socket");
+    let server = FakeServer::new(&sock)?;
+
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    server.set_reply_with_delay(hyper::StatusCode::OK, vec![], notify.clone());
+
+    let client = FcClient::new(&sock).with_timeout(Duration::from_millis(50));
+    let err_res = client.get::<serde_json::Value>("/machine-config").await;
+
+    if let Err(Error::Timeout { .. }) = err_res {
+        // expected
+    } else {
+        return Err(format!("Expected Timeout error, got {err_res:?}").into());
+    }
+
+    // We notify here just to unblock the server task cleanly
+    notify.notify_one();
+    server.shutdown().await;
+    Ok(())
+}
+
+/// Tests that an oversized fault message is truncated.
+#[tokio::test]
+async fn test_client_oversized_fault_message() -> TestResult {
+    let dir = tempdir()?;
+    let sock = dir.path().join("api.socket");
+    let server = FakeServer::new(&sock)?;
+
+    let big_fault = "A".repeat(2048);
+    let body = format!(r#"{{"fault_message": "{big_fault}"}}"#);
+    server.set_reply(hyper::StatusCode::BAD_REQUEST, body.into_bytes());
+
+    let client = FcClient::new(&sock);
+    let err_res = client.get::<serde_json::Value>("/machine-config").await;
+
+    if let Err(Error::Api { fault_message, .. }) = err_res {
+        assert!(fault_message.len() <= 1024 + 3); // 1024 limit + "..."
+        assert!(fault_message.ends_with("..."));
+    } else {
+        return Err(format!("Expected Api error, got {err_res:?}").into());
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
