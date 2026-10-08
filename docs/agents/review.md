@@ -13,7 +13,7 @@ Post exactly one review comment with `gh pr comment <number>`.
 6. **Architecture**: dependency direction (AGENTS.md section 4), crate boundaries, no system code in `dylos-core`; networking code and tests are IPv6-first and also cover IPv4 (ADR-0002).
 7. **Scope**: unrelated changes, drive-by refactors, unjustified dependencies, commands not going through `just`; size over ~400 lines, not counting acceptance tests written by another model family.
 8. **Comments and tests placement**: comments only where the code is non-obvious, none restating a name or type (AGENTS.md section 5); tests in `tests/*.rs` through the public API; test data longer than a few lines in `tests/fixtures/` files, not inline strings.
-9. **Security**: secrets, privilege usage, host side effects outside the lab's namespace, anything inappropriate for a public repo.
+9. **Security**: user- or guest-controlled names and paths (charset, traversal, symlinks, TOCTOU in root operations); arguments passed to spawned processes and to the guest kernel command line; root operations and privilege drops (ADR-0004); data from the guest (size limits, strict parsing); `unsafe` blocks and their SAFETY comments; resource limits and denial of service; secrets.
 9. **Branch hygiene**: the PR targets `main` from an issue branch; no commits made directly on `main`.
 
 ## Comment format
