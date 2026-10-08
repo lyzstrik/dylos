@@ -6,7 +6,7 @@ This document provides a high-level overview of the Dylos architecture, its depe
 
 The following outlines the current implementation status on `main` vs the target design constraints:
 - **`dylos-cli`**: Currently a placeholder.
-- **`dylos-store`**: Currently being written (LYZ-50).
+- **`dylos-store`**: Implements the lab directory layout and reflink rootfs copies (LYZ-50). Lab bring-up (LYZ-51) and the CLI (LYZ-52) are still to come.
 - **`dylos-runtime`**: Currently launches and shuts down single VMs.
 - **Lab-wide features**: No lab-wide snapshot, restore, or fork exists yet (LYZ-19, LYZ-22, LYZ-23).
 - **Fabric features**: No fabric freeze/thaw exist yet (LYZ-24).
