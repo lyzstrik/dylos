@@ -38,6 +38,8 @@ pub enum Mode {
     StallReadyThenExit,
     /// Spawns a background process that inherits stdout/stderr, then exits immediately.
     LeakOutputThenExit,
+    SpamOutput,
+    FalseReadiness,
 }
 
 pub struct Sandbox {
@@ -177,6 +179,22 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         None
     };
     let listener = UnixListener::bind(&sock).unwrap();
+    if mode == "SpamOutput" {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            println!("dylos: ready");
+            for i in 0..30 {
+                println!("spam {i}");
+            }
+        });
+    } else if mode == "FalseReadiness" {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            println!("this is just a line with dylos: ready inside it");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            println!("dylos: network setup failed");
+        });
+    }
     let mut stalled = Vec::new();
     loop {
         let (mut stream, _) = listener.accept().await.unwrap();

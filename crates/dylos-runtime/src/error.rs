@@ -3,6 +3,12 @@ use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("VM {id}: process exited while waiting for readiness")]
+    ReadinessExit { id: String },
+    #[error("VM {id}: readiness failed: {line}")]
+    ReadinessFailed { id: String, line: String },
+    #[error("VM {id}: readiness not reached after {timeout:?}")]
+    ReadinessTimeout { id: String, timeout: Duration },
     #[error("invalid jail id {id:?}: must be 1 to 64 of [A-Za-z0-9-]")]
     InvalidJailId { id: String },
     #[error("invalid chroot file name {name:?} for VM {id}: must be a single path component")]

@@ -87,6 +87,7 @@ pub struct Vm {
     cleanup_error: Option<String>,
     pid: Option<u32>,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    lines_tx: tokio::sync::broadcast::Sender<String>,
     output_tasks_done: mpsc::Receiver<()>,
 }
 
@@ -157,19 +158,32 @@ impl Vm {
         let output = Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::with_capacity(20),
         ));
+        let (lines_tx, _) = tokio::sync::broadcast::channel(256);
         let (done_tx, done_rx) = mpsc::channel(1);
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
         // is not daemonized.
         if let Some(out) = child.stdout.take() {
             tasks.push(tokio::spawn(
-                forward_lines(out, "stdout", Arc::clone(&output), done_tx.clone())
-                    .in_current_span(),
+                forward_lines(
+                    out,
+                    "stdout",
+                    Arc::clone(&output),
+                    lines_tx.clone(),
+                    done_tx.clone(),
+                )
+                .in_current_span(),
             ));
         }
         if let Some(err) = child.stderr.take() {
             tasks.push(tokio::spawn(
-                forward_lines(err, "stderr", Arc::clone(&output), done_tx.clone())
-                    .in_current_span(),
+                forward_lines(
+                    err,
+                    "stderr",
+                    Arc::clone(&output),
+                    lines_tx.clone(),
+                    done_tx.clone(),
+                )
+                .in_current_span(),
             ));
         }
         drop(done_tx);
@@ -196,6 +210,7 @@ impl Vm {
             cleanup_error: None,
             pid,
             output,
+            lines_tx,
             output_tasks_done: done_rx,
         }
     }
@@ -211,6 +226,67 @@ impl Vm {
         self.pid
     }
 
+    /// Waits for the specified line to be printed to the VM output.
+    ///
+    /// # Errors
+    /// Returns an error if the failed marker is printed, the process exits, or the timeout expires.
+    pub async fn wait_for_line(
+        &self,
+        ready: &str,
+        failed: &str,
+        timeout: Duration,
+    ) -> Result<Duration> {
+        let mut rx = self.lines_tx.subscribe();
+        let mut state = self.state.clone();
+        let start = std::time::Instant::now();
+
+        let wait_fut = async {
+            loop {
+                tokio::select! {
+                    res = rx.recv() => {
+                        match res {
+                            Ok(line) => {
+                                if line == ready {
+                                    return Ok(());
+                                }
+                                if line == failed {
+                                    return Err(Error::ReadinessFailed {
+                                        id: self.paths.id.clone(),
+                                        line,
+                                    });
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                return Err(Error::ReadinessExit {
+                                    id: self.paths.id.clone(),
+                                });
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                // Ignore lagged error, although 256 lines is enough for boot.
+                            }
+                        }
+                    }
+                    _ = state.wait_for(|s| *s != ProcessState::Running) => {
+                        return Err(Error::ReadinessExit {
+                            id: self.paths.id.clone(),
+                        });
+                    }
+                }
+            }
+        };
+
+        match tokio::time::timeout(timeout, wait_fut).await {
+            Ok(Ok(())) => Ok(start.elapsed()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(Error::ReadinessTimeout {
+                id: self.paths.id.clone(),
+                timeout,
+            }),
+        }
+    }
+
+    /// Returns a lossy tail of untrusted stdout and stderr (up to the last 20 lines).
+    /// This is not a complete serial stream.
     #[must_use]
     pub fn output(&self) -> Vec<String> {
         self.output
@@ -505,6 +581,7 @@ async fn forward_lines(
     stream: impl AsyncRead + Unpin,
     source: &'static str,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    lines_tx: tokio::sync::broadcast::Sender<String>,
     _done_tx: mpsc::Sender<()>,
 ) {
     let mut lines = BufReader::new(stream).lines();
@@ -518,7 +595,8 @@ async fn forward_lines(
                 if q.len() >= 20 {
                     q.pop_front();
                 }
-                q.push_back(line);
+                q.push_back(line.clone());
+                let _ = lines_tx.send(line);
             }
             Ok(None) => break,
             Err(e) => {

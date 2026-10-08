@@ -383,3 +383,41 @@ async fn launch_passes_vm_resources_to_jailer_limits() {
     vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
+
+#[tokio::test]
+async fn readiness_marker_retained_under_spam() {
+    let sandbox = Sandbox::new(Mode::SpamOutput);
+    let vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // Firecracker output might take a moment to be forwarded.
+    let res = vm
+        .wait_for_line(
+            "dylos: ready",
+            "dylos: network setup failed",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+    assert!(
+        res.is_ok(),
+        "Readiness should be detected even if 30 lines follow it immediately"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::panic)]
+async fn readiness_requires_exact_match() {
+    let sandbox = Sandbox::new(Mode::FalseReadiness);
+    let vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let res = vm
+        .wait_for_line(
+            "dylos: ready",
+            "dylos: network setup failed",
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+    match res {
+        Err(dylos_runtime::Error::ReadinessFailed { line, .. }) => {
+            assert_eq!(line, "dylos: network setup failed");
+        }
+        other => panic!("expected ReadinessFailed, got {other:?}"),
+    }
+}

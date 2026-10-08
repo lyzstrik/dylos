@@ -5,7 +5,6 @@ use dylos_runtime::jailer::{ChrootFile, JailerConfig};
 use dylos_runtime::{Timeouts, Vm, VmSpec};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::time::Instant;
 
 const NOBODY: u32 = 65534;
 
@@ -65,63 +64,55 @@ async fn vm_boots_and_reaches_readiness() {
         timeouts: Timeouts::default(),
     };
 
-    let start_time = Instant::now();
-
     let mut vm = Vm::launch(&config, &spec).await.unwrap();
     let paths = vm.paths().clone();
 
-    let client = vm.client();
-    client
-        .put_machine_config(&MachineConfiguration::new(1, 128))
-        .await
-        .unwrap();
+    let pid = vm.pid().unwrap();
+    let res = async {
+        let client = vm.client();
+        client
+            .put_machine_config(&MachineConfiguration::new(1, 128))
+            .await
+            .map_err(|e| e.to_string())?;
 
-    let mut boot_source = BootSource::new("/vmlinux.bin");
-    boot_source.boot_args = Some("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda".into());
-    client.put_boot_source(&boot_source).await.unwrap();
+        let mut boot_source = BootSource::new("/vmlinux.bin");
+        boot_source.boot_args = Some("console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda".into());
+        client
+            .put_boot_source(&boot_source)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    let mut drive = Drive::new("rootfs", true);
-    drive.path_on_host = Some("/rootfs.ext4".into());
-    client.put_drive(&drive).await.unwrap();
+        let mut drive = Drive::new("rootfs", true);
+        drive.path_on_host = Some("/rootfs.ext4".into());
+        client.put_drive(&drive).await.map_err(|e| e.to_string())?;
 
-    client
-        .put::<_, serde_json::Value>("/actions", &InstanceActionInfo::instance_start())
-        .await
-        .unwrap();
+        client
+            .put::<_, serde_json::Value>("/actions", &InstanceActionInfo::instance_start())
+            .await
+            .map_err(|e| e.to_string())?;
 
-    // Wait for the guest to respond. We monitor the serial output for the login prompt.
-    // This shows that the guest kernel has booted, user space init has run, and it's ready.
-    let mut ready = false;
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !vm.output()
-                .iter()
-                .any(|line| line.contains("dylos: network setup failed")),
-            "Guest network setup failed. Output: {:?}",
-            vm.output()
-        );
-        if vm.output().iter().any(|line| line.contains("dylos: ready")) {
-            ready = true;
-            break;
-        }
+        // Wait for the guest to respond. We monitor the serial output for the agreed signal.
+        // This shows that the guest kernel has booted, user space init has run, and it's ready.
+        let boot_time = vm
+            .wait_for_line(
+                "dylos: ready",
+                "dylos: network setup failed",
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok::<_, String>(boot_time)
     }
-
-    let boot_time = start_time.elapsed();
-    tracing::info!(boot_time_ms = boot_time.as_millis(), "Guest became ready");
-    println!("Boot time: {} ms", boot_time.as_millis());
-
-    assert!(
-        ready,
-        "Guest did not reach readiness in time. Output: {:?}",
-        vm.output()
-    );
+    .await;
 
     vm.shutdown().await.unwrap();
 
-    let pid = vm.pid().unwrap();
     assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
     assert!(!paths.jail_dir.exists());
     assert!(!paths.cgroup_dir.exists());
     assert!(!paths.api_socket().exists());
+
+    let boot_time = res.expect("Guest did not reach readiness in time or API failed");
+    println!("Boot time: {} ms", boot_time.as_millis());
 }
