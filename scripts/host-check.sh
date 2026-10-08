@@ -17,11 +17,19 @@ echo "==> Checking KVM..."
 
 # 2. Check Firecracker, Jailer and their checksums
 echo "==> Checking Firecracker and Jailer..."
-FC_BIN="$(command -v firecracker 2>/dev/null)" || fail "Firecracker is not installed in PATH."
-JAILER_BIN="$(command -v jailer 2>/dev/null)" || fail "Jailer is not installed in PATH."
+FC_BIN_DIR="${DYLOS_FC_BIN_DIR:-$HOME/.local/share/dylos/bin}"
+FC_BIN="$FC_BIN_DIR/firecracker"
+JAILER_BIN="$FC_BIN_DIR/jailer"
+[ -x "$FC_BIN" ] || fail "Firecracker not found at $FC_BIN (see docs/host.md, or set DYLOS_FC_BIN_DIR)."
+[ -x "$JAILER_BIN" ] || fail "Jailer not found at $JAILER_BIN (see docs/host.md, or set DYLOS_FC_BIN_DIR)."
 
-echo "  - Firecracker : $(firecracker --version | head -n1)"
-echo "  - Jailer      : $(jailer --version | head -n1)"
+# The jailer runs Firecracker inside an empty chroot: a dynamically linked build cannot start there.
+if readelf -l "$FC_BIN" | grep -q "Requesting program interpreter"; then
+    fail "$FC_BIN is dynamically linked; use the static upstream release binary (see docs/host.md)."
+fi
+
+echo "  - Firecracker : $("$FC_BIN" --version | head -n1) (static)"
+echo "  - Jailer      : $("$JAILER_BIN" --version | head -n1)"
 
 if [ -f "$DOC_HOST" ]; then
     echo "==> Checking consistency with docs/host.md..."
