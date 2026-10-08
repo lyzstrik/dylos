@@ -33,7 +33,9 @@ pub struct JailerConfig {
     /// Override the derived memory limit, in bytes.
     pub memory_max: Option<u64>,
     /// `<cgroup_file>=<value>` entries, each passed as `--cgroup` (cgroup v2).
-    /// A nonempty list replaces both derived limits, including the overrides above.
+    /// Each entry overrides only its own property, including the numeric overrides above.
+    /// Unrelated entries retain both resource limits. Explicit `pids.max=max` or
+    /// `memory.max=max` opts out of that limit. For repeated properties, the last entry wins.
     pub cgroups: Vec<String>,
     /// Mount point of the cgroup v2 hierarchy. The jailer finds it in `/proc/mounts`; this must
     /// match, since the VM cgroup is removed from here.
@@ -172,18 +174,32 @@ pub fn jailer_args(
     if let Some(parent) = &config.parent_cgroup {
         flags.push(("--parent-cgroup", parent.into()));
     }
-    if config.cgroups.is_empty() {
+    if !config.cgroups.iter().any(|c| c.starts_with("pids.max=")) {
         // One task per vCPU plus 32 for the API, VMM and I/O threads and startup headroom.
         let pids = config.pids_max.unwrap_or(u64::from(vcpu_count) + 32);
+        flags.push(("--cgroup", format!("pids.max={pids}").into()));
+    }
+    if !config.cgroups.iter().any(|c| c.starts_with("memory.max=")) {
         // Guest RAM plus 128 MiB for Firecracker's heap, stacks, mappings and I/O buffers.
         // Promote before arithmetic so even the largest u32 MiB value cannot overflow.
         let memory = config
             .memory_max
             .unwrap_or((u64::from(mem_size_mib) + 128) * 1024 * 1024);
-        flags.push(("--cgroup", format!("pids.max={pids}").into()));
         flags.push(("--cgroup", format!("memory.max={memory}").into()));
     }
-    flags.extend(config.cgroups.iter().map(|c| ("--cgroup", c.into())));
+    for (index, entry) in config.cgroups.iter().enumerate() {
+        let property = entry.split_once('=').map(|(property, _)| property);
+        if property.is_some_and(|property| {
+            config.cgroups[index + 1..].iter().any(|later| {
+                later
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key == property)
+            })
+        }) {
+            continue;
+        }
+        flags.push(("--cgroup", entry.into()));
+    }
     if let Some(netns) = netns {
         flags.push(("--netns", netns.into()));
     }
