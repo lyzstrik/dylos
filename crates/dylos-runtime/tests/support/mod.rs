@@ -144,6 +144,12 @@ pub fn run_fake_jailer_if_requested() {
         });
         std::process::exit(0);
     }
+    let properties: Vec<_> = args
+        .windows(2)
+        .filter(|w| w[0] == "--cgroup")
+        .map(|w| w[1].as_str())
+        .collect();
+    std::fs::write(root.join("cgroup-args"), properties.join("\n")).unwrap();
     let sandbox = Path::new(&base).parent().unwrap().to_path_buf();
     let code = rt.block_on(fake_firecracker(
         &mode,
