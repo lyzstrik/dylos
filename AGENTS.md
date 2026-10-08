@@ -123,6 +123,7 @@ CI runs `just check`, so local and CI results must match.
 
 - Each acceptance criterion maps to at least one test, or the PR explains why not.
 - Tests in `crates/<crate>/tests/*.rs` through the public API (section 5); property tests (`proptest`) for pure logic in `dylos-core`.
+- Test data longer than a few lines (YAML lab specs, JSON, shell scripts) goes in `crates/<crate>/tests/fixtures/` as real files, loaded with `include_str!` or run by path. Only one-line snippets stay inline.
 - KVM/privileged tests are e2e tests (`just e2e`), skipped with an explicit message when `/dev/kvm` is missing.
 - **Never delete, weaken or `#[ignore]` a test to make a check pass.** If a test seems wrong, stop and ask.
 - No sleeps as synchronization: wait on a condition with a timeout.
@@ -163,6 +164,7 @@ If you are asked to review a PR, follow `docs/agents/review.md` exactly.
 - Never commit or print secrets, tokens or credentials.
 - Never commit binaries or runtime data (kernels, rootfs, snapshots, memory files, disks). Record versions and SHA-256 in `docs/host.md`.
 - Never use `sudo` or change host configuration (sysctl, firewall, services, kernel modules) without asking first. Host network changes happen only inside the lab's namespace.
+- See [ADR-0004](docs/adr/0004-privilege-model.md) for privileged operations. Tests stay unprivileged with fakes; e2e tests may need root and are run by a human, never via `sudo` inside tests.
 - Never disable a check, lint or `cargo deny` rule to get a PR through.
 
 ## 11. Stop and ask the human when

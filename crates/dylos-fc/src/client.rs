@@ -7,7 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::net::UnixStream;
 
+use crate::config::{
+    BootSource, Drive, InstanceActionInfo, MachineConfiguration, NetworkInterface,
+};
 use crate::error::{Error, Result};
+use crate::snapshot::{SnapshotCreateParams, SnapshotLoadParams, Vm};
 
 pub struct FcClient {
     socket_path: PathBuf,
@@ -33,6 +37,18 @@ fn request_uri(route: &str) -> Result<hyper::Uri> {
             route: route.to_string(),
             source: e,
         })
+}
+
+/// Firecracker resource identifiers (`drive_id`, `iface_id`) must be non-empty and match `[A-Za-z0-9_-]`.
+fn validate_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Error::InvalidId { id: id.to_string() });
+    }
+    Ok(())
 }
 
 impl FcClient {
@@ -209,5 +225,104 @@ impl FcClient {
         R: for<'de> Deserialize<'de>,
     {
         self.request(hyper::Method::PATCH, route, Some(body)).await
+    }
+
+    /// Configures the microVM vCPU count, memory, and related machine parameters (`PUT /machine-config`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn put_machine_config(&self, config: &MachineConfiguration) -> Result<()> {
+        let _: Option<serde_json::Value> = self.put("/machine-config", config).await?;
+        Ok(())
+    }
+
+    /// Configures the microVM kernel and boot arguments (`PUT /boot-source`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn put_boot_source(&self, boot_source: &BootSource) -> Result<()> {
+        let _: Option<serde_json::Value> = self.put("/boot-source", boot_source).await?;
+        Ok(())
+    }
+
+    /// Attaches or updates a drive (`PUT /drives/{drive_id}`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidId`] if `drive_id` is empty or contains characters outside `[A-Za-z0-9_-]`.
+    /// Also returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn put_drive(&self, drive: &Drive) -> Result<()> {
+        validate_id(&drive.drive_id)?;
+        let route = format!("/drives/{}", drive.drive_id);
+        let _: Option<serde_json::Value> = self.put(&route, drive).await?;
+        Ok(())
+    }
+
+    /// Attaches or updates a network interface (`PUT /network-interfaces/{iface_id}`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidId`] if `iface_id` is empty or contains characters outside `[A-Za-z0-9_-]`.
+    /// Also returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn put_network_interface(&self, iface: &NetworkInterface) -> Result<()> {
+        validate_id(&iface.iface_id)?;
+        let route = format!("/network-interfaces/{}", iface.iface_id);
+        let _: Option<serde_json::Value> = self.put(&route, iface).await?;
+        Ok(())
+    }
+
+    /// Boots the microVM (`PUT /actions` with `InstanceStart`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn start_instance(&self) -> Result<()> {
+        let body = InstanceActionInfo::instance_start();
+        let _: Option<serde_json::Value> = self.put("/actions", &body).await?;
+        Ok(())
+    }
+
+    /// Pauses the microVM vCPUs (`PATCH /vm` with `Paused`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn pause(&self) -> Result<()> {
+        let body = Vm::pause();
+        let _: Option<serde_json::Value> = self.patch("/vm", &body).await?;
+        Ok(())
+    }
+
+    /// Resumes the microVM vCPUs (`PATCH /vm` with `Resumed`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn resume(&self) -> Result<()> {
+        let body = Vm::resume();
+        let _: Option<serde_json::Value> = self.patch("/vm", &body).await?;
+        Ok(())
+    }
+
+    /// Creates a snapshot of the microVM state and memory (`PUT /snapshot/create`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn create_snapshot(&self, params: &SnapshotCreateParams) -> Result<()> {
+        let _: Option<serde_json::Value> = self.put("/snapshot/create", params).await?;
+        Ok(())
+    }
+
+    /// Loads a microVM from a snapshot (`PUT /snapshot/load`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] on connection, HTTP, serialization, or API error.
+    pub async fn load_snapshot(&self, params: &SnapshotLoadParams) -> Result<()> {
+        let _: Option<serde_json::Value> = self.put("/snapshot/load", params).await?;
+        Ok(())
     }
 }

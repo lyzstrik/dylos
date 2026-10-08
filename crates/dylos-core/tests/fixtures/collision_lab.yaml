@@ -1,0 +1,22 @@
+segments:
+  - name: s1
+    ipv6: fd00:1::/64
+  - name: s2
+    ipv6: fd00:2::/64
+nodes:
+  - name: NODE_A
+    image: x
+    vcpus: 1
+    memory: 128
+    interfaces:
+      - name: eth0
+        segment: SEG_A
+        ipv6: IP_A
+  - name: NODE_B
+    image: x
+    vcpus: 1
+    memory: 128
+    interfaces:
+      - name: eth0
+        segment: SEG_B
+        ipv6: IP_B

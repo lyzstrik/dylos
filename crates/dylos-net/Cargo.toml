@@ -11,7 +11,7 @@ workspace = true
 dylos-core = { path = "../dylos-core" }
 futures-util = { workspace = true }
 libc = { workspace = true }
-nix = { workspace = true }
+nix = { workspace = true, features = ["mount", "sched", "ioctl"] }
 rtnetlink = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
