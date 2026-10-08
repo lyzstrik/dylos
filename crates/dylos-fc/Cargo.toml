@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+nix = { workspace = true, features = ["fs"] }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

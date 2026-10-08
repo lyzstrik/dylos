@@ -120,7 +120,11 @@ async fn ready_timeout_kills_and_cleans_up() {
     let mut spec = spec(&sandbox);
     spec.timeouts.ready = Duration::from_millis(300);
     let err = Vm::launch(&sandbox.config, &spec).await.err().unwrap();
-    assert!(matches!(err, Error::ReadyTimeout { .. }), "{err}");
+    assert!(
+        matches!(&err, Error::ReadyTimeout { last_probe_error: Some(error), .. }
+        if error.contains("Connect") && error.contains("NotFound")),
+        "{err:?}"
+    );
     sandbox.assert_no_jail_left();
 }
 
