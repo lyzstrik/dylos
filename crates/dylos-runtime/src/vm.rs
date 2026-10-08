@@ -322,8 +322,13 @@ impl Vm {
         let output_ref = &self.output;
         let done_rx = &mut self.output_tasks_done;
 
+        let mut last_probe_error = None;
         let poll = async {
-            while client.get::<serde_json::Value>("/").await.is_err() {
+            loop {
+                match client.get::<serde_json::Value>("/").await {
+                    Ok(_) => break,
+                    Err(error) => last_probe_error = Some(format!("{error:?}")),
+                }
                 tokio::time::sleep(READY_RETRY).await;
             }
         };
@@ -358,6 +363,7 @@ impl Vm {
                     id: self.paths.id.clone(),
                     socket: self.paths.api_socket(),
                     timeout: self.timeouts.ready,
+                    last_probe_error,
                     output,
                 })
             })

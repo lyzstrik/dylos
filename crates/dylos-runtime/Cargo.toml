@@ -11,7 +11,11 @@ test-hooks = []
 workspace = true
 
 [dependencies]
+dylos-core = { path = "../dylos-core" }
 dylos-fc = { path = "../dylos-fc" }
+dylos-net = { path = "../dylos-net" }
+dylos-store = { path = "../dylos-store" }
+futures-util = { workspace = true, features = ["std", "async-await"] }
 nix = { workspace = true, features = ["fs", "signal", "user"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

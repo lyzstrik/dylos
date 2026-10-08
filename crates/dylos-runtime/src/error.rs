@@ -36,11 +36,14 @@ pub enum Error {
         state: crate::vm::ProcessState,
         output: String,
     },
-    #[error("VM {id}: API socket {socket:?} not ready after {timeout:?}\n{output}")]
+    #[error(
+        "VM {id}: API socket {socket:?} not ready after {timeout:?}; last probe error: {last_probe_error:?}\n{output}"
+    )]
     ReadyTimeout {
         id: String,
         socket: PathBuf,
         timeout: Duration,
+        last_probe_error: Option<String>,
         output: String,
     },
     #[error("VM {id}: {task} task failed")]

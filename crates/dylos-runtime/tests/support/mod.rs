@@ -42,6 +42,11 @@ pub enum Mode {
     EarlyReadiness,
     SpamOutput,
     FalseReadiness,
+    LabReady,
+    LabPartialLaunch,
+    LabConfigureFailure,
+    LabNetworkFailure,
+    LabCrashOnFlush,
 }
 
 pub struct Sandbox {
@@ -51,7 +56,17 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn new(mode: Mode) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::with_dir(mode, tempfile::tempdir().unwrap())
+    }
+
+    pub fn in_target(mode: Mode) -> Self {
+        Self::with_dir(
+            mode,
+            tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
+        )
+    }
+
+    fn with_dir(mode: Mode, dir: tempfile::TempDir) -> Self {
         let meta = std::fs::metadata(dir.path()).unwrap();
         let exec = dir.path().join("firecracker");
         std::fs::write(&exec, format!("{mode:?}")).unwrap();
@@ -137,6 +152,12 @@ pub fn run_fake_jailer_if_requested() {
         std::fs::create_dir_all(cgroup.join(parent).join(&id)).unwrap();
     }
     let mode = std::fs::read_to_string(&exec).unwrap();
+    if mode == "LabPartialLaunch" && id.ends_with("-B") {
+        std::process::exit(3);
+    }
+    if mode.starts_with("Lab") {
+        std::fs::write(root.join("netns-arg"), flag("--netns").unwrap_or_default()).unwrap();
+    }
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -202,8 +223,16 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             assert!(status.success());
             return 5;
         }
-        let request = read_request(&mut stream).await;
+        let request = normalize_lab_request(mode, read_request(&mut stream).await);
+        record_lab_request(mode, &sock, &request);
+        assert_lab_barriers(mode, &sock, &request);
         if request.contains("InstanceStart") {
+            if mode == "LabReady" || mode == "LabPartialLaunch" || mode == "LabCrashOnFlush" {
+                println!("dylos: ready");
+            }
+            if mode == "LabNetworkFailure" {
+                println!("dylos: network setup failed");
+            }
             if mode == "SpamOutput" {
                 for i in 0..4096 {
                     println!("before {i}");
@@ -223,7 +252,9 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             stalled.push(stream);
             continue;
         }
-        let reply = if request.starts_with("GET / ") {
+        let reply = if mode == "LabConfigureFailure" && request.starts_with("PUT /boot-source ") {
+            "HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}"
+        } else if request.starts_with("GET / ") {
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"
         } else {
             "HTTP/1.1 204 No Content\r\n\r\n"
@@ -234,7 +265,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             hold_stderr(sandbox).await;
             return 0;
         }
-        if request.contains("SendCtrlAltDel") && mode == "Serve" {
+        if request.contains("SendCtrlAltDel") && (mode == "Serve" || mode.starts_with("Lab")) {
             return 0;
         }
         if request.contains("FlushMetrics") {
@@ -249,7 +280,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             f.write_all(line.as_bytes()).await.unwrap();
             // Tokio buffers writes; process::exit must not terminate the pending blocking write.
             f.flush().await.unwrap();
-            if mode == "CrashOnFlush" {
+            if mode == "CrashOnFlush" || mode == "LabCrashOnFlush" {
                 return 7;
             }
         }
@@ -404,4 +435,53 @@ pub async fn readiness_case(
         );
     }
     result
+}
+
+fn record_lab_request(mode: &str, sock: &Path, request: &str) {
+    if mode.starts_with("Lab") {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(sock.parent().unwrap().parent().unwrap().join("requests"))
+            .unwrap()
+            .write_all(request.as_bytes())
+            .unwrap();
+    }
+}
+
+fn assert_lab_barriers(mode: &str, sock: &Path, request: &str) {
+    if mode != "LabReady" {
+        return;
+    }
+    let jail = sock.parent().unwrap().parent().unwrap().parent().unwrap();
+    let parent = jail.parent().unwrap();
+    let own_id = jail.file_name().unwrap().to_str().unwrap();
+    let prefix = own_id.rsplit_once('-').unwrap().0;
+    for node in ["A", "B", "C"] {
+        let root = parent.join(format!("{prefix}-{node}/root"));
+        if request.starts_with("PUT /machine-config ") {
+            assert!(
+                root.join("run/firecracker.socket").exists(),
+                "configuration before all VMs launched"
+            );
+        }
+        if request.contains("InstanceStart") {
+            let requests = std::fs::read_to_string(root.join("requests")).unwrap();
+            assert!(requests.contains("PUT /drives/rootfs "));
+            let interface = if node == "B" { "eth1" } else { "eth0" };
+            assert!(
+                requests.contains(&format!("PUT /network-interfaces/{interface} ")),
+                "start before all VMs configured"
+            );
+        }
+    }
+}
+
+fn normalize_lab_request(mode: &str, request: String) -> String {
+    if mode.starts_with("Lab") {
+        request.replacen(" http://localhost/", " /", 1)
+    } else {
+        request
+    }
 }
