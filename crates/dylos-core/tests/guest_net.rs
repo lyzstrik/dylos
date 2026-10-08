@@ -124,3 +124,31 @@ fn test_mac_collision_validation() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+#[test]
+fn test_boot_args_name_injection_rejection() -> Result<(), Box<dyn Error>> {
+    let yaml = std::fs::read_to_string(format!(
+        "{}/../../labs/abc.yaml",
+        env!("CARGO_MANIFEST_DIR")
+    ))?;
+    let spec = LabSpec::from_yaml_str(&yaml)?;
+    let mut node = spec.nodes[0].clone();
+
+    // a node mutated after validation
+    node.name = "A B".to_string();
+    let err = boot_args(&spec, &node).unwrap_err();
+    assert!(matches!(err, dylos_core::Error::InvalidName { .. }));
+
+    node.name = "A".to_string();
+    node.interfaces[0].name = "eth0=".to_string();
+    let err = boot_args(&spec, &node).unwrap_err();
+    assert!(matches!(err, dylos_core::Error::InvalidName { .. }));
+
+    // a separate node passed alongside a valid lab
+    let mut intruder = node.clone();
+    intruder.name = "intruder ".to_string();
+    let err = boot_args(&spec, &intruder).unwrap_err();
+    assert!(matches!(err, dylos_core::Error::InvalidName { .. }));
+
+    Ok(())
+}
