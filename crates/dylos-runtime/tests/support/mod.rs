@@ -217,6 +217,8 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
                 .await
                 .unwrap();
             f.write_all(line.as_bytes()).await.unwrap();
+            // Tokio buffers writes; process::exit must not terminate the pending blocking write.
+            f.flush().await.unwrap();
             if mode == "CrashOnFlush" {
                 return 7;
             }
