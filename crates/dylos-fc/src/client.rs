@@ -4,6 +4,7 @@ use hyper::body::Bytes;
 use hyper::client::conn::http1;
 use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
@@ -146,6 +147,27 @@ impl FcClient {
         res
     }
 
+    async fn connect(&self) -> std::io::Result<UnixStream> {
+        if self.socket_path.as_os_str().len() < 108 {
+            return UnixStream::connect(&self.socket_path).await;
+        }
+        // Linux sockaddr_un has only 108 bytes, including the terminator. The jailer
+        // binds a short chroot path; pin its host parent and connect through procfs.
+        let parent = self
+            .socket_path
+            .parent()
+            .ok_or(std::io::ErrorKind::InvalidInput)?;
+        let name = self
+            .socket_path
+            .file_name()
+            .ok_or(std::io::ErrorKind::InvalidInput)?;
+        let directory = tokio::fs::File::open(parent).await?.into_std().await;
+        let alias = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd())).join(name);
+        let stream = UnixStream::connect(alias).await;
+        drop(directory);
+        stream
+    }
+
     async fn request_inner<B, R>(
         &self,
         method: hyper::Method,
@@ -156,14 +178,12 @@ impl FcClient {
         B: Serialize + ?Sized,
         R: for<'de> Deserialize<'de>,
     {
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(|e| Error::Connect {
-                path: self.socket_path.clone(),
-                method: method.to_string(),
-                route: route.to_string(),
-                source: e,
-            })?;
+        let stream = self.connect().await.map_err(|e| Error::Connect {
+            path: self.socket_path.clone(),
+            method: method.to_string(),
+            route: route.to_string(),
+            source: e,
+        })?;
 
         let io = TokioIo::new(stream);
         let (mut sender, conn) = http1::handshake(io).await.map_err(|e| Error::Handshake {

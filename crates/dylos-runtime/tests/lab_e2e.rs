@@ -53,7 +53,16 @@ async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
         ..LabConfig::default()
     };
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
-    let lab = Lab::up_with(&config, &spec, "abc-e2e").await.unwrap();
+    eprintln!(
+        "lab_e2e: config={config:?}; netns={:?}; mountns={:?}",
+        std::fs::read_link("/proc/self/ns/net"),
+        std::fs::read_link("/proc/self/ns/mnt")
+    );
+    let result = Lab::up_with(&config, &spec, "abc-e2e").await;
+    if let Err(error) = &result {
+        eprintln!("lab bring-up failed: {error}\n{error:#?}");
+    }
+    let lab = result.expect("lab bring-up failed; see diagnostics above");
     assert_eq!(lab.vms().len(), 3);
     let paths: Vec<_> = lab
         .vms()

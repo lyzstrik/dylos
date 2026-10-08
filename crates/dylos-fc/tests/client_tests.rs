@@ -427,3 +427,29 @@ async fn test_client_connection_cleanup() -> TestResult {
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn client_connects_to_socket_with_long_host_path() -> TestResult {
+    use std::os::fd::AsRawFd;
+    let dir = tempdir()?;
+    let parent = dir.path().join("a".repeat(120));
+    std::fs::create_dir(&parent)?;
+    let directory = std::fs::File::open(&parent)?;
+    let alias = std::path::PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+        .join("firecracker.socket");
+    let socket = parent.join("firecracker.socket");
+    assert!(socket.as_os_str().len() >= 108);
+    let server = FakeServer::new(&alias)?;
+    let direct_error = tokio::net::UnixStream::connect(&socket)
+        .await
+        .err()
+        .ok_or("direct connect unexpectedly accepted an overlong path")?;
+    assert_eq!(direct_error.kind(), std::io::ErrorKind::InvalidInput);
+    server.set_reply(hyper::StatusCode::OK, b"{}".to_vec());
+    let client = FcClient::new(&socket);
+    assert_eq!(client.get::<serde_json::Value>("/").await?, Some(json!({})));
+    assert_eq!(server.history().len(), 1);
+    server.shutdown().await;
+    drop(directory);
+    Ok(())
+}
