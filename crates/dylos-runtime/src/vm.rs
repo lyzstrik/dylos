@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use dylos_fc::FcClient;
 use dylos_fc::config::{ActionType, InstanceActionInfo};
@@ -67,6 +67,13 @@ pub enum ProcessState {
     Lost,
 }
 
+#[derive(Clone, Copy)]
+enum Readiness {
+    Pending,
+    Ready(Instant),
+    Failed(Instant),
+}
+
 /// A running Firecracker process inside its jail.
 ///
 /// The supervisor task owns the child and the [`Jail`]: whatever the reason the process exits,
@@ -87,6 +94,8 @@ pub struct Vm {
     cleanup_error: Option<String>,
     pid: Option<u32>,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    readiness: watch::Receiver<Readiness>,
+    boot_start: Instant,
     output_tasks_done: mpsc::Receiver<()>,
 }
 
@@ -108,6 +117,7 @@ impl Vm {
         async {
             let start = std::time::Instant::now();
             let mut jail = jailer::prepare_chroot(config, &paths, &spec.files).await?;
+            let boot_start = Instant::now();
             let child = Command::new(&config.jailer)
                 .args(jailer::jailer_args(
                     config,
@@ -134,7 +144,7 @@ impl Vm {
                     });
                 }
             };
-            let mut vm = Self::start(child, jail, spec.timeouts);
+            let mut vm = Self::start(child, jail, spec.timeouts, boot_start);
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
                 vm.send_signal(Signal::SIGKILL);
@@ -150,26 +160,39 @@ impl Vm {
         .await
     }
 
-    fn start(mut child: Child, jail: Jail, timeouts: Timeouts) -> Self {
+    fn start(mut child: Child, jail: Jail, timeouts: Timeouts, boot_start: Instant) -> Self {
         let paths = jail.paths().clone();
         let pid = child.id();
         let mut tasks = Vec::new();
         let output = Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::with_capacity(20),
         ));
+        let (readiness_tx, readiness) = watch::channel(Readiness::Pending);
         let (done_tx, done_rx) = mpsc::channel(1);
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
         // is not daemonized.
         if let Some(out) = child.stdout.take() {
             tasks.push(tokio::spawn(
-                forward_lines(out, "stdout", Arc::clone(&output), done_tx.clone())
-                    .in_current_span(),
+                forward_lines(
+                    out,
+                    "stdout",
+                    Arc::clone(&output),
+                    readiness_tx.clone(),
+                    done_tx.clone(),
+                )
+                .in_current_span(),
             ));
         }
         if let Some(err) = child.stderr.take() {
             tasks.push(tokio::spawn(
-                forward_lines(err, "stderr", Arc::clone(&output), done_tx.clone())
-                    .in_current_span(),
+                forward_lines(
+                    err,
+                    "stderr",
+                    Arc::clone(&output),
+                    readiness_tx.clone(),
+                    done_tx.clone(),
+                )
+                .in_current_span(),
             ));
         }
         drop(done_tx);
@@ -196,6 +219,8 @@ impl Vm {
             cleanup_error: None,
             pid,
             output,
+            readiness,
+            boot_start,
             output_tasks_done: done_rx,
         }
     }
@@ -209,6 +234,61 @@ impl Vm {
     #[must_use]
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    /// Waits for the first complete guest readiness or network-failure signal.
+    /// The result persists from spawn, independently of the lossy output tail.
+    /// Boot duration runs from process launch to receipt of the readiness line.
+    ///
+    /// # Errors
+    /// Returns an error if the failure marker is printed, output closes, or the timeout expires.
+    pub async fn wait_for_ready(&self, timeout: Duration) -> Result<Duration> {
+        let mut readiness = self.readiness.clone();
+        let wait = async {
+            loop {
+                match *readiness.borrow_and_update() {
+                    Readiness::Ready(at) => return Ok(at.duration_since(self.boot_start)),
+                    Readiness::Failed(at) => {
+                        tracing::warn!(
+                            duration_ms = at.duration_since(self.boot_start).as_millis(),
+                            "guest network setup failed"
+                        );
+                        return Err(Error::ReadinessFailed {
+                            id: self.paths.id.clone(),
+                            line: "dylos: network setup failed".into(),
+                        });
+                    }
+                    Readiness::Pending => {}
+                }
+                readiness
+                    .changed()
+                    .await
+                    .map_err(|_| Error::ReadinessExit {
+                        id: self.paths.id.clone(),
+                    })?;
+            }
+        };
+        let duration =
+            tokio::time::timeout(timeout, wait)
+                .await
+                .map_err(|_| Error::ReadinessTimeout {
+                    id: self.paths.id.clone(),
+                    timeout,
+                })??;
+        tracing::info!(vm = %self.paths.id, duration_ms = duration.as_millis(), "VM boot ready");
+        Ok(duration)
+    }
+
+    /// Returns a lossy tail of untrusted stdout and stderr (up to the last 20 lines).
+    /// This is not a complete serial stream.
+    #[must_use]
+    pub fn output(&self) -> Vec<String> {
+        self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[must_use]
@@ -495,12 +575,28 @@ async fn forward_lines(
     stream: impl AsyncRead + Unpin,
     source: &'static str,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    readiness: watch::Sender<Readiness>,
     _done_tx: mpsc::Sender<()>,
 ) {
     let mut lines = BufReader::new(stream).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
+                let marker = match line.as_str() {
+                    "dylos: ready" => Some(Readiness::Ready(Instant::now())),
+                    "dylos: network setup failed" => Some(Readiness::Failed(Instant::now())),
+                    _ => None,
+                };
+                if let Some(marker) = marker {
+                    readiness.send_if_modified(|state| {
+                        if matches!(state, Readiness::Pending) {
+                            *state = marker;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
                 tracing::info!(target: "dylos::firecracker", source, "{line}");
                 let mut q = output
                     .lock()

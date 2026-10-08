@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use dylos_runtime::Vm;
 use dylos_runtime::jailer::JailerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -38,6 +39,9 @@ pub enum Mode {
     StallReadyThenExit,
     /// Spawns a background process that inherits stdout/stderr, then exits immediately.
     LeakOutputThenExit,
+    EarlyReadiness,
+    SpamOutput,
+    FalseReadiness,
 }
 
 pub struct Sandbox {
@@ -177,6 +181,10 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         None
     };
     let listener = UnixListener::bind(&sock).unwrap();
+    if mode == "EarlyReadiness" {
+        println!("dylos: ready");
+        println!("early marker forwarded");
+    }
     let mut stalled = Vec::new();
     loop {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -195,6 +203,22 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             return 5;
         }
         let request = read_request(&mut stream).await;
+        if request.contains("InstanceStart") {
+            if mode == "SpamOutput" {
+                for i in 0..4096 {
+                    println!("before {i}");
+                }
+                println!("dylos: ready");
+                for i in 0..4096 {
+                    println!("after {i}");
+                }
+                println!("burst forwarded");
+            } else if mode == "FalseReadiness" {
+                println!("this is just a line with dylos: ready inside it");
+                println!("dylos: network setup failed");
+                println!("dylos: ready");
+            }
+        }
         if mode == "StallActions" && request.starts_with("PUT /actions ") {
             stalled.push(stream);
             continue;
@@ -317,11 +341,67 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
         struct Visit(String);
         impl tracing::field::Visit for Visit {
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                let _ = write!(self.0, "{}={value:?} ", field.name());
+                write!(self.0, "{}={value:?} ", field.name()).unwrap();
             }
         }
         let mut visit = Visit(format!("{} ", event.metadata().target()));
         event.record(&mut visit);
         self.0.lock().unwrap().push(visit.0);
     }
+}
+
+pub async fn readiness_case(
+    sandbox: &Sandbox,
+    spec: &dylos_runtime::VmSpec,
+    mode: Mode,
+    forwarded: Option<&str>,
+) -> dylos_runtime::Result<Duration> {
+    let mut vm = Vm::launch(&sandbox.config, spec).await.unwrap();
+    let pid = vm.pid().unwrap();
+    let paths = vm.paths().clone();
+    let (logs, _guard) = Captured::install();
+    let start = if matches!(mode, Mode::EarlyReadiness) {
+        Ok(None)
+    } else {
+        vm.client()
+            .put::<_, serde_json::Value>(
+                "/actions",
+                &dylos_fc::config::InstanceActionInfo::instance_start(),
+            )
+            .await
+    };
+    let result = async {
+        if let Some(line) = forwarded {
+            let timeout = Duration::from_secs(5);
+            tokio::time::timeout(timeout, async {
+                while !vm.output().iter().any(|entry| entry == line) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .map_err(|_| dylos_runtime::Error::ReadinessTimeout {
+                id: paths.id.clone(),
+                timeout,
+            })?;
+        }
+        vm.wait_for_ready(Duration::from_millis(100)).await
+    }
+    .await;
+    let shutdown = vm.shutdown().await;
+    assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+    assert!(!paths.jail_dir.exists());
+    assert!(!paths.cgroup_dir.exists());
+    assert!(!paths.api_socket().exists());
+    sandbox.assert_no_jail_left();
+    shutdown.unwrap();
+    start.unwrap();
+    if let Ok(duration) = result {
+        assert!(logs.contains("VM boot ready"));
+        assert!(logs.contains(&format!("duration_ms={}", duration.as_millis())));
+        assert_eq!(
+            vm.wait_for_ready(Duration::from_secs(1)).await.unwrap(),
+            duration
+        );
+    }
+    result
 }
