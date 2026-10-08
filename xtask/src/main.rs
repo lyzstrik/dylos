@@ -23,8 +23,10 @@ fn run() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
         Some("e2e") => {
-            eprintln!("xtask: e2e is not implemented yet");
-            Ok(())
+            if args.next().is_some() {
+                bail!("e2e does not accept arguments");
+            }
+            run_e2e()
         }
         Some("images") => {
             if args.next().is_some() {
@@ -39,6 +41,20 @@ fn run() -> anyhow::Result<()> {
             bail!("missing subcommand");
         }
     }
+}
+
+/// End-to-end tests are `#[ignore]`d so that `just check` never runs them; each one prints
+/// `SKIPPED ...` and returns when root or KVM is missing.
+fn run_e2e() -> anyhow::Result<()> {
+    let status = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args(["nextest", "run", "--workspace", "--run-ignored", "only"])
+        .arg("--no-capture")
+        .status()
+        .context("could not run cargo nextest")?;
+    if !status.success() {
+        bail!("end-to-end tests failed (exit status {status})");
+    }
+    Ok(())
 }
 
 fn build_images() -> anyhow::Result<()> {
