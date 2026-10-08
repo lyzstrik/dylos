@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-hooks = []
+
 [lints]
 workspace = true
 
@@ -17,4 +20,5 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+dylos-store = { path = ".", features = ["test-hooks"] }
 tempfile = { workspace = true }
