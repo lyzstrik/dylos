@@ -1114,32 +1114,71 @@ proptest! {
     }
 
     #[test]
-    fn boot_args_output_contains_no_spaces(mut spec in valid_spec(), arbitrary_name in ".*") {
-        let mut node = spec.nodes[0].clone();
-        prop_assume!(!node.interfaces.is_empty());
-        node.name = arbitrary_name.clone();
-        node.interfaces[0].name = arbitrary_name;
-        spec.nodes[0] = node.clone();
+    fn boot_args_output_contains_no_spaces(
+        arbitrary_name in ".*",
+        target in 0..3usize,
+    ) {
+        let mut spec = valid();
+        prop_assume!(arbitrary_name != "a" && arbitrary_name != "b");
+        prop_assume!(arbitrary_name != "left" && arbitrary_name != "right");
 
-        let res = dylos_core::guest_net::boot_args(&spec, &node);
-        if let Ok(args) = res {
-            // Assert accepted names satisfy the full charset and length rule
-            prop_assert!(node.name.len() <= 32);
-            prop_assert!(node.interfaces[0].name.len() <= 15);
-            prop_assert!(node.name.chars().next().unwrap().is_ascii_alphanumeric());
-            prop_assert!(node.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
-            prop_assert!(node.interfaces[0].name.chars().next().unwrap().is_ascii_alphanumeric());
-            prop_assert!(node.interfaces[0].name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        let max_len = match target {
+            0 | 1 => 32, // node or segment
+            _ => 15, // interface
+        };
 
-            let tokens: Vec<_> = args.split(' ').filter(|s| !s.is_empty()).collect();
-            let expected_tokens = node.interfaces.len() + node.static_routes.len() + usize::from(node.interfaces.len() > 1);
-            prop_assert_eq!(tokens.len(), expected_tokens);
+        match target {
+            0 => {
+                spec.nodes[0].name = arbitrary_name.clone();
+            }
+            1 => {
+                spec.segments[0].name = arbitrary_name.clone();
+                spec.nodes[0].interfaces[0].segment = arbitrary_name.clone();
+                spec.nodes[1].interfaces[0].segment = arbitrary_name.clone();
+            }
+            _ => {
+                spec.nodes[0].interfaces[0].name = arbitrary_name.clone();
+            }
+        }
 
-            for token in tokens {
-                prop_assert!(
-                    token.starts_with("dylos.if=") || token.starts_with("dylos.rt=") || token == "dylos.fwd=1",
-                    "invalid token: {:?}", token
-                );
+        let is_valid_len = arbitrary_name.len() <= max_len && !arbitrary_name.is_empty();
+        let is_valid_chars = if arbitrary_name.is_empty() {
+            false
+        } else {
+            let mut chars = arbitrary_name.chars();
+            let first = chars.next().unwrap();
+            first.is_ascii_alphanumeric() && chars.all(|c| c.is_ascii_alphanumeric() || c == '-')
+        };
+        let rule_satisfied = is_valid_len && is_valid_chars;
+
+        let validate_res = spec.validate();
+        prop_assert_eq!(validate_res.is_ok(), rule_satisfied);
+
+        if rule_satisfied {
+            for node in &spec.nodes {
+                let args = dylos_core::guest_net::boot_args(&spec, node)
+                    .unwrap_or_else(|e| panic!("boot_args failed for valid node: {e}"));
+
+                let mut expected_args = Vec::new();
+                for iface in &node.interfaces {
+                    let mac = dylos_core::guest_net::mac_for_interface(&node.name, &iface.name);
+                    let mut arg = format!("dylos.if={},{},{}/{}", iface.name, mac, iface.ipv6.addr(), iface.ipv6.prefix_len());
+                    if let Some(v4) = iface.ipv4 {
+                        arg = format!("{arg},{}/{}", v4.addr(), v4.prefix_len());
+                    }
+                    expected_args.push(arg);
+                }
+                for route in &node.static_routes {
+                    expected_args.push(format!("dylos.rt={},{}", route.destination, route.gateway));
+                }
+                if node.interfaces.len() > 1 {
+                    expected_args.push("dylos.fwd=1".to_string());
+                }
+                let expected_out = expected_args.join(" ");
+
+                let tokens: Vec<_> = args.split(' ').filter(|s| !s.is_empty()).collect();
+                let expected_tokens: Vec<_> = expected_out.split(' ').filter(|s| !s.is_empty()).collect();
+                prop_assert_eq!(tokens, expected_tokens);
             }
         }
     }
@@ -1443,4 +1482,26 @@ fn labs_abc_yaml_loads_and_validates() {
         route(c, &net4(left)),
         std::net::IpAddr::from(b_right.ipv4.unwrap().addr())
     );
+}
+
+#[test]
+fn deterministic_adversarial_name_injection_cases() {
+    let base = valid();
+    let cases = ["eth0 dylos.rt=::/0,fe80::1", "eth0\tdylos", "eth0\ndylos"];
+
+    for case in cases {
+        let mut spec = base.clone();
+        spec.nodes[0].interfaces[0].name = case.to_string();
+
+        assert!(
+            spec.validate().is_err(),
+            "validate should reject injected space/tab/newline: {case:?}"
+        );
+
+        let boot_err = dylos_core::guest_net::boot_args(&spec, &spec.nodes[0]);
+        assert!(
+            boot_err.is_err(),
+            "boot_args should reject injected space/tab/newline: {case:?}"
+        );
+    }
 }
