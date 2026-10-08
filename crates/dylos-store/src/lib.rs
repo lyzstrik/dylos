@@ -1,4 +1,19 @@
+//! Lab directory layout and reflink cloning of disks.
+//!
 //! Synchronous, descriptor-relative lab storage. Async callers must use `spawn_blocking`.
+//!
+//! # Current status of the spike
+//!
+//! `dylos-store` implements the lab directory layout and reflink rootfs copies (LYZ-50).
+//! Lab bring-up (LYZ-51) and the CLI (LYZ-52) are still to come.
+//!
+//! # Target Design Constraints
+//!
+//! This crate manages the host directory structure for a lab and provides fast
+//! copy-on-write disk cloning via `ioctl_ficlone`.
+//! It depends on `dylos-core`, but must never depend on higher-level orchestration
+//! crates (like `dylos-runtime` or `dylos-cli`).
+
 use dylos_core::LabSpec;
 use nix::{
     dir::Dir,

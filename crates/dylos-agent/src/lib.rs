@@ -1,7 +1,9 @@
+//! In-guest agent over vsock.
+//!
+//! This crate contains the agent binary that runs inside the guest VMs.
+//! It is built statically (musl) and is completely standalone. It does not
+//! depend on any other Dylos crate. See [`protocol`] for the wire format.
 #![forbid(unsafe_code)]
-
-//! In-guest agent: keeps a vsock connection to the host and answers
-//! `resync` and `health` requests. See [`protocol`] for the wire format.
 
 pub mod agent;
 pub mod clock;
