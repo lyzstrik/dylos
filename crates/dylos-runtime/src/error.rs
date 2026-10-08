@@ -44,6 +44,10 @@ pub enum Error {
         #[source]
         source: tokio::task::JoinError,
     },
+    #[error("VM {id}: cleanup did not complete within {timeout:?}")]
+    CleanupTimeout { id: String, timeout: Duration },
+    #[error("VM {id}: earlier cleanup failed: {message}")]
+    CleanupFailed { id: String, message: String },
     #[error("VM {id}: metrics_poll must not be zero")]
     ZeroMetricsPoll { id: String },
     #[error("VM {id}: process still alive {timeout:?} after SIGKILL")]

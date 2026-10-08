@@ -81,6 +81,7 @@ pub struct Vm {
     expected_exit: Arc<AtomicBool>,
     supervisor: Option<JoinHandle<Result<()>>>,
     tasks: Vec<JoinHandle<()>>,
+    cleanup_error: Option<String>,
     pid: Option<u32>,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     output_tasks_done: mpsc::Receiver<()>,
@@ -127,7 +128,7 @@ impl Vm {
             let mut vm = Self::start(child, jail, spec.timeouts);
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
-                let _ = vm.signals.send(Signal::SIGKILL);
+                vm.send_signal(Signal::SIGKILL);
                 if let Err(cleanup) = vm.finish(vm.timeouts.kill).await {
                     tracing::error!(error = %cleanup, "cleanup after failed start");
                 }
@@ -183,6 +184,7 @@ impl Vm {
             expected_exit,
             supervisor: Some(supervisor),
             tasks,
+            cleanup_error: None,
             pid,
             output,
             output_tasks_done: done_rx,
@@ -241,7 +243,9 @@ impl Vm {
                 () = poll => Ok(()),
                 res = state.wait_for(|s| *s != ProcessState::Running) => {
                     let st = res.map_or(ProcessState::Lost, |s| s.clone());
-                    let _ = tokio::time::timeout(Duration::from_millis(50), done_rx.recv()).await;
+                    if tokio::time::timeout(Duration::from_millis(50), done_rx.recv()).await.is_err() {
+                        tracing::debug!("output still open after startup exit");
+                    }
                     let output = output_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).collect::<Vec<_>>().join("\n");
                     Err(Error::ExitedDuringStart {
                         id: paths_id.clone(),
@@ -313,8 +317,15 @@ impl Vm {
     ///
     /// [`Error::KillTimeout`] if the process survives SIGKILL (the supervisor keeps the jail and
     /// removes it once the process is reaped), [`Error::Io`] if cleanup fails, or
-    /// [`Error::Task`].
+    /// [`Error::Task`], [`Error::CleanupTimeout`], or [`Error::CleanupFailed`] on a retry
+    /// after cleanup failed.
     pub async fn shutdown(&mut self) -> Result<()> {
+        if let Some(message) = &self.cleanup_error {
+            return Err(Error::CleanupFailed {
+                id: self.paths.id.clone(),
+                message: message.clone(),
+            });
+        }
         if self.supervisor.is_none() {
             return Ok(());
         }
@@ -324,10 +335,10 @@ impl Vm {
             self.expected_exit.store(true, Ordering::SeqCst);
             let running = *self.state.borrow() == ProcessState::Running;
             if running && !self.ctrl_alt_del().await {
-                let _ = self.signals.send(Signal::SIGTERM);
+                self.send_signal(Signal::SIGTERM);
                 if !self.wait_exit(self.timeouts.term).await {
                     tracing::warn!("Firecracker ignored SIGTERM, sending SIGKILL");
-                    let _ = self.signals.send(Signal::SIGKILL);
+                    self.send_signal(Signal::SIGKILL);
                 }
             }
             self.finish(self.timeouts.kill).await?;
@@ -341,6 +352,12 @@ impl Vm {
         .await
     }
 
+    fn send_signal(&self, signal: Signal) {
+        if let Err(error) = self.signals.send(signal) {
+            tracing::debug!(%error, ?signal, "supervisor already stopped");
+        }
+    }
+
     /// Waits up to `timeout` for the exit, then joins the supervisor (which has released the
     /// jail by then) and the forwarding tasks.
     async fn finish(&mut self, timeout: Duration) -> Result<()> {
@@ -350,34 +367,55 @@ impl Vm {
                 timeout,
             });
         }
+        let tasks_fut = async {
+            while let Some(task) = self.tasks.first_mut() {
+                let result = task.await;
+                self.tasks.remove(0);
+                report_join(result);
+            }
+        };
+        if tokio::time::timeout(timeout, tasks_fut).await.is_err() {
+            tracing::warn!("output/metrics tasks did not finish in time, aborting them");
+            for task in &self.tasks {
+                task.abort();
+            }
+            while let Some(task) = self.tasks.first_mut() {
+                let result = task.await;
+                self.tasks.remove(0);
+                report_join(result);
+            }
+        }
+        tracing::debug!("post-exit tasks joined");
         let Some(supervisor) = self.supervisor.as_mut() else {
             return Ok(());
         };
-
-        let tasks_fut = async {
-            for task in &mut self.tasks {
-                let _ = (&mut *task).await;
-            }
-        };
-
-        if tokio::time::timeout(timeout, tasks_fut).await.is_err() {
-            tracing::warn!("output/metrics tasks did not finish in time, aborting them");
-            for task in &mut self.tasks {
-                task.abort();
-                let _ = (&mut *task).await;
-            }
-        }
-
-        let res = (&mut *supervisor).await.map_err(|source| Error::Task {
-            id: self.paths.id.clone(),
-            task: "supervisor",
-            source,
-        })?;
-
+        // Timeout or cancellation leaves the cleanup owner available for the next shutdown.
+        let result = tokio::time::timeout(timeout, supervisor)
+            .await
+            .map_err(|_| Error::CleanupTimeout {
+                id: self.paths.id.clone(),
+                timeout,
+            })?;
         self.supervisor = None;
-        self.tasks.clear();
+        let result = result
+            .map_err(|source| Error::Task {
+                id: self.paths.id.clone(),
+                task: "supervisor",
+                source,
+            })
+            .and_then(|result| result);
+        if let Err(error) = &result {
+            self.cleanup_error = Some(error.to_string());
+        }
+        result
+    }
+}
 
-        res
+fn report_join(result: std::result::Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && !error.is_cancelled()
+    {
+        tracing::error!(%error, "output/metrics task failed");
     }
 }
 
@@ -425,7 +463,9 @@ async fn supervise(
         Ok(status) => ProcessState::Exited(status),
         Err(e) => {
             tracing::error!(error = %e, "waiting on Firecracker failed, killing it");
-            let _ = child.start_kill();
+            if let Err(error) = child.start_kill() {
+                tracing::warn!(%error, "failed to kill Firecracker after wait failure");
+            }
             ProcessState::Lost
         }
     };

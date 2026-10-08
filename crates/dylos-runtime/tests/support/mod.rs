@@ -77,6 +77,17 @@ impl Sandbox {
         assert_eq!(left, Vec::<PathBuf>::new(), "cgroups left behind");
     }
 
+    pub async fn release_output_holder(&self) {
+        let socket = self.dir.path().join("output-holder.sock");
+        let stream = UnixStream::connect(socket).await.unwrap();
+        drop(stream);
+        let pid = std::fs::read_to_string(self.dir.path().join("output-holder.pid")).unwrap();
+        wait_until("output holder is reaped", Duration::from_secs(5), || {
+            !Path::new(&format!("/proc/{pid}")).exists()
+        })
+        .await;
+    }
+
     pub fn jail_dir(&self, id: &str) -> PathBuf {
         self.dir.path().join("jails/firecracker").join(id)
     }
@@ -126,6 +137,13 @@ pub fn run_fake_jailer_if_requested() {
         .enable_all()
         .build()
         .unwrap();
+    if mode == "HoldOutput" {
+        rt.block_on(async {
+            let listener = UnixListener::bind(Path::new(&base).join("output-holder.sock")).unwrap();
+            let _connection = listener.accept().await.unwrap();
+        });
+        std::process::exit(0);
+    }
     let code = rt.block_on(fake_firecracker(
         &mode,
         root.join(sock.trim_start_matches('/')),
@@ -142,14 +160,6 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
             eprintln!("fake jailer failed during start");
             return 1;
         }
-        "LeakOutputThenExit" => {
-            let status = std::process::Command::new("sh")
-                .args(["-c", "sleep 60 >&1 2>&2 &"])
-                .status()
-                .unwrap();
-            assert!(status.success());
-            return 0;
-        }
         "NoSocket" => std::future::pending::<()>().await,
         _ => {}
     }
@@ -158,7 +168,7 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
     } else {
         None
     };
-    let listener = UnixListener::bind(sock).unwrap();
+    let listener = UnixListener::bind(&sock).unwrap();
     let mut stalled = Vec::new();
     loop {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -188,6 +198,10 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
         };
         stream.write_all(reply.as_bytes()).await.unwrap();
         stream.shutdown().await.unwrap();
+        if request.contains("SendCtrlAltDel") && mode == "LeakOutputThenExit" {
+            hold_stderr(&sock).await;
+            return 0;
+        }
         if request.contains("SendCtrlAltDel") && mode == "Serve" {
             return 0;
         }
@@ -206,6 +220,46 @@ async fn fake_firecracker(mode: &str, sock: PathBuf, metrics: PathBuf) -> i32 {
             }
         }
     }
+}
+
+async fn hold_stderr(sock: &Path) {
+    let base = sock
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let base = base.parent().unwrap();
+    let holder = base.join("holder-mode");
+    std::fs::write(&holder, "HoldOutput").unwrap();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([ENTRY, "--exact", "--nocapture", "--", "--chroot-base-dir"])
+        .arg(base)
+        .arg("--exec-file")
+        .arg(holder)
+        .args([
+            "--id",
+            "holder",
+            "--api-sock",
+            "/unused",
+            "--metrics-path",
+            "/unused",
+        ])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::fs::write(base.join("output-holder.pid"), child.id().to_string()).unwrap();
+    wait_until("output holder socket", Duration::from_secs(5), || {
+        base.join("output-holder.sock").exists()
+    })
+    .await;
+    // The holder retains only stderr, so stdout completes before shutdown times out.
+    drop(child);
 }
 
 async fn read_request(stream: &mut UnixStream) -> String {

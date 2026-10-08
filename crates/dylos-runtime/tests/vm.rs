@@ -97,10 +97,17 @@ async fn unexpected_death_is_reported_and_metrics_and_logs_reach_tracing() {
     let flush = InstanceActionInfo::new(ActionType::FlushMetrics);
     let _: Option<serde_json::Value> = vm.client().put("/actions", &flush).await.unwrap();
 
+    wait_until("metrics are captured", Duration::from_secs(5), || {
+        logs.contains("process_startup_time_us")
+    })
+    .await;
     assert_eq!(exit_state(&vm).await, exited(7));
     vm.shutdown().await.unwrap();
     assert!(logs.contains("Firecracker exited unexpectedly"));
-    assert!(logs.contains("process_startup_time_us"));
+    wait_until("metrics are captured", Duration::from_secs(5), || {
+        logs.contains("process_startup_time_us")
+    })
+    .await;
     assert!(logs.contains("fake firecracker starting"));
     sandbox.assert_no_jail_left();
 }
@@ -252,8 +259,7 @@ async fn cancelled_launch_leaves_no_jail_and_retry_works() {
     )
     .await;
 
-    // Retry works
-    let sandbox = Sandbox::new(Mode::Serve); // fresh config without barrier
+    sandbox.config.preparation_barrier = None;
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
     vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
@@ -298,4 +304,67 @@ async fn launch_fails_during_start_and_includes_output() {
         Ok(_) => panic!("expected error, got Ok"),
         Err(e) => panic!("expected ExitedDuringStart, got {e:?}"),
     }
+}
+
+#[tokio::test]
+async fn inherited_stderr_does_not_block_shutdown_or_reaping() {
+    let sandbox = Sandbox::new(Mode::LeakOutputThenExit);
+    let mut test_spec = spec(&sandbox);
+    test_spec.timeouts.kill = Duration::from_millis(100);
+    let mut vm = Vm::launch(&sandbox.config, &test_spec).await.unwrap();
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{}", vm.pid().unwrap()));
+    tokio::time::timeout(Duration::from_secs(3), vm.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!proc_dir.exists());
+    sandbox.assert_no_jail_left();
+    sandbox.release_output_holder().await;
+}
+
+#[tokio::test]
+async fn cancelled_shutdown_retries_and_waits_for_cleanup() {
+    let (logs, _guard) = Captured::install();
+    let mut sandbox = Sandbox::new(Mode::Serve);
+    let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+    sandbox.config.cleanup_barrier = Some(barrier.clone());
+    let mut test_spec = spec(&sandbox);
+    test_spec.timeouts.kill = Duration::from_millis(100);
+    let mut vm = Vm::launch(&sandbox.config, &test_spec).await.unwrap();
+    let cancelled = tokio::select! {
+        biased;
+        () = barrier.0.notified() => true,
+        _ = vm.shutdown() => false,
+    };
+    assert!(cancelled);
+    assert!(vm.paths().jail_dir.exists());
+    let cancelled = tokio::select! {
+        biased;
+        () = wait_until("forwarding handles are consumed", Duration::from_secs(5), || logs.contains("post-exit tasks joined")) => true,
+        _ = vm.shutdown() => false,
+    };
+    assert!(cancelled);
+    let error = vm.shutdown().await.unwrap_err();
+    assert!(matches!(error, Error::CleanupTimeout { .. }));
+    assert!(vm.paths().jail_dir.exists());
+    barrier.1.notify_one();
+    vm.shutdown().await.unwrap();
+    sandbox.assert_no_jail_left();
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_retry_preserves_cleanup_failure() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let leftover = vm.paths().cgroup_dir.join("busy");
+    std::fs::write(&leftover, "busy").unwrap();
+    let error = vm.shutdown().await.unwrap_err();
+    assert!(matches!(error, Error::Io { .. }));
+    let error = vm.shutdown().await.unwrap_err();
+    assert!(matches!(error, Error::CleanupFailed { .. }));
+    std::fs::remove_file(leftover).unwrap();
+    std::fs::remove_dir(&vm.paths().cgroup_dir).unwrap();
+    std::fs::remove_dir_all(&vm.paths().jail_dir).unwrap();
+    sandbox.assert_no_jail_left();
 }

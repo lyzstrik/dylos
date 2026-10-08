@@ -35,8 +35,11 @@ pub struct JailerConfig {
     /// Arguments inserted before the jailer flags. Empty for the real jailer; lets tests run a
     /// fake launcher that needs its own leading arguments.
     pub launcher_args: Vec<OsString>,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-hooks")]
+    /// Two-phase preparation barrier for integration tests.
     pub preparation_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
+    #[cfg(feature = "test-hooks")]
+    pub cleanup_barrier: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
 
 impl JailerConfig {
@@ -52,8 +55,10 @@ impl JailerConfig {
             cgroups: Vec::new(),
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             launcher_args: Vec::new(),
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-hooks")]
             preparation_barrier: None,
+            #[cfg(feature = "test-hooks")]
+            cleanup_barrier: None,
         }
     }
 }
@@ -181,6 +186,8 @@ pub fn jailer_args(
 pub struct Jail {
     paths: JailPaths,
     owned: bool,
+    #[cfg(feature = "test-hooks")]
+    cleanup_barrier: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
 
 impl Jail {
@@ -199,6 +206,11 @@ impl Jail {
     pub async fn release(&mut self) -> Result<()> {
         if !self.owned {
             return Ok(());
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Some(barrier) = self.cleanup_barrier.take() {
+            barrier.0.notify_one();
+            barrier.1.notified().await;
         }
         remove_jail(&self.paths).await?;
         self.owned = false;
@@ -246,14 +258,22 @@ pub async fn prepare_chroot(
     }
     let (paths, files, uid, gid) = (paths.clone(), files.to_vec(), config.uid, config.gid);
     let id = paths.id.clone();
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-hooks")]
+    let cleanup_barrier = config.cleanup_barrier.clone();
+    #[cfg(feature = "test-hooks")]
     let barrier = config.preparation_barrier.clone();
     tokio::task::spawn_blocking(move || {
         let jail = claim(paths)?;
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-hooks")]
+        let jail = {
+            let mut jail = jail;
+            jail.cleanup_barrier = cleanup_barrier;
+            jail
+        };
+        #[cfg(feature = "test-hooks")]
         if let Some(b) = barrier {
-            b.wait(); // Wait for test to observe claimed directory
-            b.wait(); // Wait for test to cancel
+            b.wait();
+            b.wait();
         }
         populate(&jail.paths, &files, uid, gid)?;
         Ok(jail)
@@ -286,7 +306,12 @@ fn claim(paths: JailPaths) -> Result<Jail> {
         std::fs::create_dir_all(parent).map_err(io_error(&paths, "create dir", parent))?;
     }
     match std::fs::create_dir(jail_dir) {
-        Ok(()) => Ok(Jail { paths, owned: true }),
+        Ok(()) => Ok(Jail {
+            paths,
+            owned: true,
+            #[cfg(feature = "test-hooks")]
+            cleanup_barrier: None,
+        }),
         Err(e) if e.kind() == ErrorKind::AlreadyExists => Err(Error::JailExists {
             path: jail_dir.clone(),
             id: paths.id,
