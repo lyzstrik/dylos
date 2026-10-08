@@ -1,0 +1,15 @@
+nodes:
+  - name: router
+    image: router-qcow2
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: wan
+        ipv6: 2001:db8:1::1/64
+        ipv4: 192.0.2.1/24
+    static_routes: []
+segments:
+  - name: wan
+    ipv6: 2001:db8:1::/64
+    ipv4: 192.0.2.0/24

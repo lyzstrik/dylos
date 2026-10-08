@@ -171,6 +171,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "tempfile",
@@ -199,8 +200,12 @@ dependencies = [
 name = "dylos-runtime"
 version = "0.1.0"
 dependencies = [
+ "dylos-core",
  "dylos-fc",
+ "dylos-net",
  "dylos-runtime",
+ "dylos-store",
+ "futures-util",
  "nix 0.31.3",
  "serde_json",
  "tempfile",
@@ -215,6 +220,7 @@ name = "dylos-store"
 version = "0.1.0"
 dependencies = [
  "dylos-core",
+ "dylos-store",
  "libc",
  "nix 0.31.3",
  "serde",
