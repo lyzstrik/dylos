@@ -48,40 +48,96 @@ fn validate_err(spec: &LabSpec) -> Error {
 fn name_injection_attempts_are_rejected() {
     let base = valid();
     let bad_names = [
-        " ", "a b", "a=b", "a,b", "a\nb", "a\0b", "a/b", "a..b", "..", "", "-a", "a_",
-        "a_b", // test underscore
+        " ",
+        "a b",
+        "a=b",
+        "a,b",
+        "a\nb",
+        "a\0b",
+        "a/b",
+        "a..b",
+        "..",
+        "",
+        "-a",
+        "a_",
+        "a_b",
+        "a\tb",
+        "a\"b",
+        "a'b",
+        "a\u{00E9}b", // test underscore, tab, quote, non-ASCII
     ];
     for name in bad_names {
         // segment name
         let mut bad = base.clone();
         bad.segments[0].name = name.into();
-        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+        let err = validate_err(&bad);
+        assert!(
+            matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "segments[0].name" && value == name)
+        );
 
         // node name
         let mut bad = base.clone();
         bad.nodes[0].name = name.into();
-        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+        let err = validate_err(&bad);
+        assert!(
+            matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "nodes[0].name" && value == name)
+        );
 
         // interface name
         let mut bad = base.clone();
         bad.nodes[0].interfaces[0].name = name.into();
-        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+        let err = validate_err(&bad);
+        assert!(
+            matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "nodes[0].interfaces[0].name" && value == name)
+        );
 
         // image
         let mut bad = base.clone();
         bad.nodes[0].image = name.into();
-        assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+        let err = validate_err(&bad);
+        assert!(
+            matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "nodes[0].image" && value == name)
+        );
     }
+
+    // exact boundaries accepted
+    let mut ok = base.clone();
+    ok.nodes[0].interfaces[0].name = "a".repeat(15);
+    ok.nodes[0].name = "a".repeat(32);
+    let new_seg_name = "a".repeat(32);
+    ok.segments[0].name = new_seg_name.clone();
+    for node in &mut ok.nodes {
+        for iface in &mut node.interfaces {
+            if iface.segment == "left" {
+                iface.segment = new_seg_name.clone();
+            }
+        }
+    }
+    ok.validate().unwrap();
 
     // specific length check: interface name > 15
     let mut bad = base.clone();
     bad.nodes[0].interfaces[0].name = "a".repeat(16);
-    assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+    let err = validate_err(&bad);
+    assert!(
+        matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "nodes[0].interfaces[0].name" && value == &"a".repeat(16))
+    );
 
     // specific length check: node name > 32
     let mut bad = base.clone();
     bad.nodes[0].name = "a".repeat(33);
-    assert!(matches!(validate_err(&bad), Error::InvalidName { .. }));
+    let err = validate_err(&bad);
+    assert!(
+        matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "nodes[0].name" && value == &"a".repeat(33))
+    );
+
+    // segment name > 32
+    let mut bad = base.clone();
+    bad.segments[0].name = "a".repeat(33);
+    let err = validate_err(&bad);
+    assert!(
+        matches!(err, Error::InvalidName { ref path, ref value, .. } if path == "segments[0].name" && value == &"a".repeat(33))
+    );
 }
 
 #[test]
@@ -1058,18 +1114,31 @@ proptest! {
     }
 
     #[test]
-    fn boot_args_output_contains_no_spaces(spec in valid_spec()) {
-        for node in &spec.nodes {
-            let args = dylos_core::guest_net::boot_args(&spec, node).unwrap();
-            if args.is_empty() {
-                continue;
-            }
-            for param in args.split(' ') {
+    fn boot_args_output_contains_no_spaces(mut spec in valid_spec(), arbitrary_name in ".*") {
+        let mut node = spec.nodes[0].clone();
+        prop_assume!(!node.interfaces.is_empty());
+        node.name = arbitrary_name.clone();
+        node.interfaces[0].name = arbitrary_name;
+        spec.nodes[0] = node.clone();
+
+        let res = dylos_core::guest_net::boot_args(&spec, &node);
+        if let Ok(args) = res {
+            // Assert accepted names satisfy the full charset and length rule
+            prop_assert!(node.name.len() <= 32);
+            prop_assert!(node.interfaces[0].name.len() <= 15);
+            prop_assert!(node.name.chars().next().unwrap().is_ascii_alphanumeric());
+            prop_assert!(node.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+            prop_assert!(node.interfaces[0].name.chars().next().unwrap().is_ascii_alphanumeric());
+            prop_assert!(node.interfaces[0].name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+
+            let tokens: Vec<_> = args.split(' ').filter(|s| !s.is_empty()).collect();
+            let expected_tokens = node.interfaces.len() + node.static_routes.len() + usize::from(node.interfaces.len() > 1);
+            prop_assert_eq!(tokens.len(), expected_tokens);
+
+            for token in tokens {
                 prop_assert!(
-                    param.starts_with("dylos.if=")
-                        || param.starts_with("dylos.rt=")
-                        || param == "dylos.fwd=1",
-                    "found space inside a parameter value, or invalid param: {param:?} in {args:?}"
+                    token.starts_with("dylos.if=") || token.starts_with("dylos.rt=") || token == "dylos.fwd=1",
+                    "invalid token: {:?}", token
                 );
             }
         }

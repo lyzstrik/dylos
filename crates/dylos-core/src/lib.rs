@@ -201,7 +201,11 @@ impl LabSpec {
     }
 }
 
-fn validate_name(name: &str, max_len: usize) -> Result<(), &'static str> {
+/// Validates a resource name against the safe-name rules.
+///
+/// # Errors
+/// Returns a string slice describing the reason if the name is invalid.
+pub fn validate_name(name: &str, max_len: usize) -> Result<(), &'static str> {
     if name.len() > max_len {
         return Err("too long");
     }
