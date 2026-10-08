@@ -216,7 +216,7 @@ async fn failed_preparation_rolls_back_and_bad_names_are_refused() {
         matches!(
             err,
             Error::Io {
-                op: "hard link",
+                op: "validate source",
                 ..
             }
         ),
@@ -233,4 +233,151 @@ async fn failed_preparation_rolls_back_and_bad_names_are_refused() {
         );
     }
     assert!(!paths.jail_dir.exists());
+}
+
+#[tokio::test]
+async fn symlink_and_non_regular_sources_are_rejected_without_touching_target() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let config = local_config(dir.path());
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    let target = dir.path().join("outside");
+    std::fs::write(&target, b"outside contents").unwrap();
+    let before = std::fs::symlink_metadata(&target).unwrap();
+    let source = dir.path().join("symlink");
+    symlink(&target, &source).unwrap();
+    for source in [&source, &dir.path().to_path_buf()] {
+        let err = prepare_chroot(&config, &paths, &[ChrootFile::new(source, "kernel")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io { id, op: "validate regular source", path, .. }
+            if id == &paths.id && path == source),
+            "{err}"
+        );
+        assert!(!paths.jail_dir.exists());
+    }
+    let after = std::fs::symlink_metadata(&target).unwrap();
+    assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside contents");
+}
+
+#[tokio::test]
+async fn source_symlink_replacement_after_validation_is_rejected() {
+    source_replacement_is_rejected(false, false).await;
+}
+
+#[tokio::test]
+async fn source_ancestor_symlink_replacement_after_validation_is_rejected() {
+    source_replacement_is_rejected(true, false).await;
+}
+
+#[tokio::test]
+async fn source_symlink_replacement_after_open_is_not_followed_by_placement() {
+    source_replacement_is_rejected(false, true).await;
+}
+
+#[allow(clippy::unwrap_used)]
+async fn source_replacement_is_rejected(ancestor: bool, after_open: bool) {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = local_config(dir.path());
+    let parent = dir.path().join("sources");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&parent).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let source = parent.join("kernel");
+    let target = outside.join("kernel");
+    std::fs::write(&source, b"kernel").unwrap();
+    std::fs::write(&target, b"outside contents").unwrap();
+    let before = std::fs::symlink_metadata(&target).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    config.source_validation_barrier = Some(barrier.clone());
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    let task_paths = paths.clone();
+    let task_source = source.clone();
+    let task = tokio::spawn(async move {
+        prepare_chroot(
+            &config,
+            &task_paths,
+            &[ChrootFile::new(task_source, "kernel")],
+        )
+        .await
+    });
+    let race_target = target.clone();
+    let _dir = tokio::task::spawn_blocking(move || {
+        barrier.wait();
+        if after_open {
+            barrier.wait();
+            barrier.wait();
+        }
+        if ancestor {
+            std::fs::rename(&parent, dir.path().join("original-sources")).unwrap();
+            symlink(&outside, &parent).unwrap();
+        } else {
+            std::fs::remove_file(&source).unwrap();
+            symlink(&race_target, &source).unwrap();
+        }
+        barrier.wait();
+        dir
+    })
+    .await
+    .unwrap();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Io {
+                op: "open source" | "open source parent" | "open placed file",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(!paths.jail_dir.exists());
+    let after = std::fs::symlink_metadata(&target).unwrap();
+    assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside contents");
+}
+
+#[tokio::test]
+async fn injected_jail_directory_symlink_is_rejected_without_touching_target() {
+    use std::os::unix::fs::{MetadataExt, symlink};
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = local_config(dir.path());
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let target = outside.join("metrics.json");
+    std::fs::write(&target, b"outside contents").unwrap();
+    let before = std::fs::symlink_metadata(&outside).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    config.preparation_barrier = Some(barrier.clone());
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    let task_paths = paths.clone();
+    let task = tokio::spawn(async move { prepare_chroot(&config, &task_paths, &[]).await });
+    let root = paths.root.clone();
+    let outside_copy = outside.clone();
+    tokio::task::spawn_blocking(move || {
+        barrier.wait();
+        symlink(outside_copy, root).unwrap();
+        barrier.wait();
+    })
+    .await
+    .unwrap();
+    let err = task.await.unwrap().unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::Io {
+                op: "create dir",
+                ..
+            }
+        ),
+        "{err}"
+    );
+    assert!(!paths.jail_dir.exists());
+    let after = std::fs::symlink_metadata(&outside).unwrap();
+    assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside contents");
+    assert!(!outside.join("run").exists());
 }
