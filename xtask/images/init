@@ -8,4 +8,6 @@ dylos-agent &
 # PID 1 must survive console logout; Alpine BusyBox provides setsid -c, not cttyhack.
 while :; do
     setsid -c /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1
+    # Back off even when the console fails to open or immediately hangs up.
+    sleep 1
 done
