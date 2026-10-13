@@ -40,11 +40,35 @@ cp release-v1.17.0-x86_64/jailer-v1.17.0-x86_64 $D/bin/jailer
 - Guest shutdown/reboot : use `poweroff -f` or `reboot -f`; the minimal shell init does not handle the signals sent by the unforced BusyBox commands.
 - Storage base and image ancestors must be operator-controlled and not writable by untrusted processes. Directory components and source files are opened without following symlinks; lab directories use mode 0700 and files 0600.
 
+## Rust toolchain
+Rustup in the user home is required so that `rust-toolchain.toml` (pinned channel `1.99.0` and `x86_64-unknown-linux-musl` target) is honoured locally (distribution packages like Arch Linux system `rust` ignore `rust-toolchain.toml` and lack the musl target sysroot).
+
+Install toolchain and targets via rustup:
+
+```sh
+rustup show
+```
+
 ## Dev tools
 - just : 1.58.0
 - cargo-nextest : 0.9.146
 - cargo-deny : 0.20.2
 - lefthook : 2.1.16
+- actionlint : 1.7.12 (SHA-256 archive: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8; on Arch Linux: `paru -S actionlint` or install binary below)
+- zizmor : 1.30.1
+
+Install:
+
+```sh
+# actionlint (or `paru -S actionlint`)
+curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c
+tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+install -m 0755 actionlint ~/.local/bin/
+
+# zizmor
+cargo install --locked zizmor --version 1.30.1
+```
 
 ## Commit signing
 `main` requires verified signatures. The SSH key must be registered on GitHub as a signing key and have no passphrase prompt, so that agents can sign without interaction. The settings live in the repository config, shared by every worktree:
