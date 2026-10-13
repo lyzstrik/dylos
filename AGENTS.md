@@ -139,6 +139,10 @@ feat(net): create per-lab network namespace
 Refs: LYZ-15
 ```
 
+Every commit must be signed: `main` only accepts verified signatures, so one unsigned commit blocks the whole PR.
+The repository git config signs commits automatically (`commit.gpgsign=true`, SSH key). Never pass `--no-gpg-sign` and never change `commit.gpgsign`, `gpg.*` or `user.signingkey`.
+Check with `git log --format='%h %G? %s' origin/main..HEAD` (`G` = signed) before pushing. If a commit cannot be signed, stop and ask the human.
+
 PR title: `<type>(<scope>): <summary> [LYZ-xx]`. PR description:
 
 ```markdown
