@@ -16,10 +16,12 @@ anyhow.workspace = true
 clap.workspace = true
 dylos-core = { path = "../dylos-core" }
 dylos-runtime = { path = "../dylos-runtime" }
+nix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "fs"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
 dylos-runtime = { path = "../dylos-runtime", features = ["test-hooks"] }
+nix = { workspace = true, features = ["signal"] }
 tempfile.workspace = true
