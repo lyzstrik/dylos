@@ -46,5 +46,15 @@ cp release-v1.17.0-x86_64/jailer-v1.17.0-x86_64 $D/bin/jailer
 - cargo-deny : 0.20.2
 - lefthook : 2.1.16
 
+## Commit signing
+`main` requires verified signatures. The SSH key must be registered on GitHub as a signing key and have no passphrase prompt, so that agents can sign without interaction. The settings live in the repository config, shared by every worktree:
+
+```sh
+git config --local gpg.format ssh
+git config --local user.signingkey ~/.ssh/id_ed25519.pub
+git config --local commit.gpgsign true
+git config --local tag.gpgsign true
+```
+
 ## Verification
 `scripts/host-check.sh` must pass before any work session.
