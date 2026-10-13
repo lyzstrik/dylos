@@ -61,9 +61,9 @@ Install:
 
 ```sh
 # actionlint (or `paru -S actionlint`)
-curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
-echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c
-tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz && \
+echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c && \
+tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint && \
 install -m 0755 actionlint ~/.local/bin/
 
 # zizmor

@@ -34,6 +34,7 @@ deny:
 agent-check:
     cargo build --locked -p dylos-agent --target x86_64-unknown-linux-musl
     ./scripts/check-static-elf.sh target/x86_64-unknown-linux-musl/debug/dylos-agent
+    ./scripts/test-check-static-elf.sh target/x86_64-unknown-linux-musl/debug/dylos-agent
 
 # Lint GitHub Actions workflows
 ci-lint:
