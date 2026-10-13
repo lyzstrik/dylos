@@ -5,4 +5,7 @@ mount -t devtmpfs devtmpfs /dev
 /sbin/net-setup-guard
 /sbin/report-readiness
 dylos-agent &
-exec setsid cttyhack /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1
+# PID 1 must survive console logout; Alpine BusyBox provides setsid -c, not cttyhack.
+while :; do
+    setsid -c /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1
+done

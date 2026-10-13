@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use dylos_core::LabSpec;
 use dylos_runtime::jailer::JailerConfig;
-use dylos_runtime::{Lab, LabConfig};
+use dylos_runtime::{Lab, LabConfig, ProcessState};
+use futures_util::future::join_all;
 
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
@@ -64,6 +65,21 @@ async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
     }
     let lab = result.expect("lab bring-up failed; see diagnostics above");
     assert_eq!(lab.vms().len(), 3);
+    join_all(lab.vms().iter().map(|vm| async move {
+        let mut state = vm.state();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                state.wait_for(|state| *state != ProcessState::Running),
+            )
+            .await
+            .is_err(),
+            "VM {} exited within three seconds of readiness: {:?}",
+            vm.paths().id,
+            *state.borrow(),
+        );
+    }))
+    .await;
     let paths: Vec<_> = lab
         .vms()
         .iter()
