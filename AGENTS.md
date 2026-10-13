@@ -47,6 +47,7 @@ If it is ambiguous, contradicts an ADR, or cannot be done as written: **stop and
 
 Everything you write in commits, PRs and comments is public. No secrets, no internal notes, no personal data. Professional tone.
 No AI attribution: no `Co-Authored-By` trailer for an AI model and no "Generated with ..." line in commits, PRs or comments.
+Never name the model, model family or agent that wrote, tested or reviewed a change (no "Gemini", "GPT", "Claude", "Codex" ...) in commits, PR titles, PR descriptions or comments, including review headers.
 
 ### Issues labeled `critical-path`
 
@@ -139,6 +140,10 @@ feat(net): create per-lab network namespace
 Refs: LYZ-15
 ```
 
+Every commit must be signed: `main` only accepts verified signatures, so one unsigned commit blocks the whole PR.
+The repository git config signs commits automatically (`commit.gpgsign=true`, SSH key). Never pass `--no-gpg-sign` and never change `commit.gpgsign`, `gpg.*` or `user.signingkey`.
+Check with `git log --format='%h %G? %s' origin/main..HEAD` (`G` = signed) before pushing. If a commit cannot be signed, stop and ask the human.
+
 PR title: `<type>(<scope>): <summary> [LYZ-xx]`. PR description:
 
 ```markdown
@@ -161,7 +166,7 @@ If you are asked to review a PR, follow `docs/agents/review.md` exactly.
 
 ## 10. Security
 
-- A PR touching `dylos-net`, `dylos-runtime`, `dylos-store`, `dylos-agent`, `dylos-fc`, parsing in `dylos-core`, `xtask/images`, `scripts/` or CI gets a dedicated security review pass by a model family different from the author, following the checklist and `docs/security/threat-model.md`; other PRs only go through the checklist in the normal review. For a PR authored by several model families, the security pass uses a family that wrote none of it, or, if none is left, the family that wrote the least and never the one that wrote the code under review. The pass is recorded as one PR comment with the header `## Security review: <model>`.
+- A PR touching `dylos-net`, `dylos-runtime`, `dylos-store`, `dylos-agent`, `dylos-fc`, parsing in `dylos-core`, `xtask/images`, `scripts/` or CI gets a dedicated security review pass by a model family different from the author, following the checklist and `docs/security/threat-model.md`; other PRs only go through the checklist in the normal review. For a PR authored by several model families, the security pass uses a family that wrote none of it, or, if none is left, the family that wrote the least and never the one that wrote the code under review. The pass is recorded as one PR comment with the header `## Security review` (no model name).
 - Never commit or print secrets, tokens or credentials.
 - Never commit binaries or runtime data (kernels, rootfs, snapshots, memory files, disks). Record versions and SHA-256 in `docs/host.md`.
 - Never use `sudo` or change host configuration (sysctl, firewall, services, kernel modules) without asking first. Host network changes happen only inside the lab's namespace.

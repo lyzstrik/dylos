@@ -19,7 +19,7 @@ Post exactly one review comment with `gh pr comment <number>`.
 ## Comment format
 
 ```markdown
-## Review: <model name>
+## Review
 
 **Verdict:** ready for human review | changes needed | blocked (needs human decision)
 
