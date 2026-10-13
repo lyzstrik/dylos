@@ -176,23 +176,24 @@ async fn lab_up(args: UpArgs) -> Result<()> {
         .context("failed to register SIGTERM handler")?;
     tracing::info!(lab = %id, "registered termination signal handlers for bring-up");
 
-    let spec_content = tokio::fs::read_to_string(&args.spec)
-        .await
-        .with_context(|| format!("failed to read lab spec from {}", args.spec.display()))?;
-    let spec = LabSpec::from_yaml_str(&spec_content)
-        .with_context(|| format!("failed to parse lab spec from {}", args.spec.display()))?;
-
     let config = build_config();
-
-    let up_future = Lab::up_with(&config, &spec, &id);
+    let up_future = async {
+        let spec_content = tokio::fs::read_to_string(&args.spec)
+            .await
+            .with_context(|| format!("failed to read lab spec from {}", args.spec.display()))?;
+        let spec = LabSpec::from_yaml_str(&spec_content)
+            .with_context(|| format!("failed to parse lab spec from {}", args.spec.display()))?;
+        Lab::up_with(&config, &spec, &id)
+            .await
+            .with_context(|| format!("failed to bring up lab '{id}'"))
+    };
     tokio::pin!(up_future);
 
     let mut interrupted = false;
     let lab = loop {
         tokio::select! {
-            res = &mut up_future => {
-                break res.with_context(|| format!("failed to bring up lab '{id}'"))?;
-            }
+            // Consume ready signals before a simultaneous bring-up error can exit.
+            biased;
             _ = sigint.recv() => {
                 tracing::info!(lab = %id, "received Ctrl+C (SIGINT) during bring-up, will tear down once ready");
                 interrupted = true;
@@ -200,6 +201,9 @@ async fn lab_up(args: UpArgs) -> Result<()> {
             _ = sigterm.recv() => {
                 tracing::info!(lab = %id, "received SIGTERM during bring-up, will tear down once ready");
                 interrupted = true;
+            }
+            res = &mut up_future => {
+                break res?;
             }
         }
     };
