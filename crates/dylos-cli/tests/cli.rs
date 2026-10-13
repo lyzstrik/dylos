@@ -233,6 +233,15 @@ fn down_live_supervisor_protocol_and_timeout() {
 
 #[test]
 fn signals_before_resource_creation_roll_back_failed_up() {
+    check_signal_rollback(false);
+}
+
+#[test]
+fn signals_are_observed_while_spec_loading_is_blocked() {
+    check_signal_rollback(true);
+}
+
+fn check_signal_rollback(wait_for_signal: bool) {
     for signal in [Signal::SIGINT, Signal::SIGTERM] {
         let temp = tempfile::tempdir().unwrap();
         let store = temp.path().join("store");
@@ -276,6 +285,11 @@ fn signals_before_resource_creation_roll_back_failed_up() {
             signal,
         )
         .unwrap();
+        if wait_for_signal {
+            // A registered handler must be serviced even while spec loading is blocked.
+            until(|| process.stderr().contains(&signal.to_string()).then_some(()));
+            assert_eq!(fs::read_dir(&store).unwrap().count(), 0);
+        }
         fifo.write_all(include_bytes!("../../../labs/abc.yaml"))
             .unwrap();
         drop(fifo);
