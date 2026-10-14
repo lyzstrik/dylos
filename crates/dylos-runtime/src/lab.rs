@@ -95,6 +95,26 @@ pub struct Lab {
 }
 
 impl Lab {
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Constructs a VM-only lab for unprivileged API tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn from_test_vms(id: &str, vms: Vec<Vm>) -> Self {
+        Self {
+            id: id.into(),
+            storage: None,
+            network: None,
+            vms,
+            listener: None,
+            lock: None,
+            span: tracing::info_span!("lab", lab = id),
+            cleanup_on_drop: false,
+        }
+    }
+
     /// # Errors
     /// Rejects invalid specs and rolls back all completed steps on a launch or readiness error.
     pub async fn up(spec: &LabSpec, lab_id: &str) -> Result<Self> {

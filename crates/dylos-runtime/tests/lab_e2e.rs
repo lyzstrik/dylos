@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dylos_core::LabSpec;
 use dylos_runtime::jailer::JailerConfig;
-use dylos_runtime::{Lab, LabConfig, ProcessState};
+use dylos_runtime::{Lab, LabConfig, ProcessState, pause_all, resume_all};
 use futures_util::future::join_all;
 
 #[tokio::test]
@@ -63,7 +63,7 @@ async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
     if let Err(error) = &result {
         eprintln!("lab bring-up failed: {error}\n{error:#?}");
     }
-    let lab = result.expect("lab bring-up failed; see diagnostics above");
+    let mut lab = result.expect("lab bring-up failed; see diagnostics above");
     assert_eq!(lab.vms().len(), 3);
     join_all(lab.vms().iter().map(|vm| async move {
         let mut state = vm.state();
@@ -80,6 +80,7 @@ async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
         );
     }))
     .await;
+    measure_pause_cycles(&mut lab).await;
     let paths: Vec<_> = lab
         .vms()
         .iter()
@@ -108,4 +109,20 @@ async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
             .contains(netns.to_str().unwrap())
     );
     Lab::teardown_by_name(&config, "abc-e2e").await.unwrap();
+}
+
+async fn measure_pause_cycles(lab: &mut Lab) {
+    let mut total = Duration::ZERO;
+    let mut maximum = Duration::ZERO;
+    for _ in 0..50 {
+        let skew = pause_all(lab).await.expect("pause cycle failed");
+        total += skew;
+        maximum = maximum.max(skew);
+        resume_all(lab).await.expect("resume cycle failed");
+    }
+    eprintln!(
+        "abc pause/resume: cycles=50 mean_skew_us={} maximum_skew_us={}",
+        (total / 50).as_micros(),
+        maximum.as_micros()
+    );
 }
