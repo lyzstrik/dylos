@@ -186,7 +186,7 @@ impl Lab {
                 cleanup_on_drop: true,
                 active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
             };
-            let result = lab.bring_up(config, spec, plan).await;
+            let result = lab.bring_up(config, spec, plan, false).await;
             if let Err(operation) = result {
                 return match lab.teardown().await {
                     Ok(()) => Err(operation),
@@ -203,20 +203,90 @@ impl Lab {
         .await
     }
 
+    /// Restores a verified snapshot into a fresh, independently supervised lab.
+    /// # Errors
+    /// Rejects invalid snapshots or ids and rolls back all owned resources on failure.
+    pub async fn restore_with(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
+        let (config, snapshot, lab_id) = (config.clone(), snapshot.to_owned(), lab_id.to_owned());
+        tokio::spawn(async move { Self::restore_owned(&config, &snapshot, &lab_id).await })
+            .await
+            .map_err(|source| LabError::Task {
+                lab: "restore".into(),
+                source,
+            })?
+    }
+
+    async fn restore_owned(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
+        let (store, path, id) = (config.store.clone(), snapshot.to_owned(), lab_id.to_owned());
+        let (storage, manifest) = blocking(lab_id, move || Ok(store.restore(&id, &path)?)).await?;
+        let spec = manifest.lab_spec;
+        validate(config, &spec, lab_id)?;
+        let plan = FabricPlan::new(lab_id, &spec)?;
+        let span = tracing::info_span!("lab_restore", lab = lab_id);
+        let mut lab = Self {
+            id: lab_id.into(),
+            store: Some(config.store.clone()),
+            spec: Some(spec.clone()),
+            storage: Some(storage),
+            network: None,
+            vms: Vec::new(),
+            listener: None,
+            lock: None,
+            span: span.clone(),
+            cleanup_on_drop: true,
+            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+        };
+        let started = Instant::now();
+        if let Err(operation) = lab
+            .bring_up(config, &spec, plan, true)
+            .instrument(span)
+            .await
+        {
+            return match lab.teardown().await {
+                Ok(()) => Err(operation),
+                Err(cleanup) => Err(LabError::Rollback {
+                    operation: Box::new(operation),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
+        tracing::info!(
+            lab = lab_id,
+            duration_ms = started.elapsed().as_millis(),
+            "lab restored"
+        );
+        Ok(lab)
+    }
+
     async fn bring_up(
         &mut self,
         config: &LabConfig,
         spec: &LabSpec,
         plan: FabricPlan,
+        restoring: bool,
     ) -> Result<()> {
         let root = self.root().to_owned();
         self.lock = Some(blocking(&self.id, move || lock_directory(&root)).await?);
-        self.network = Some(create_network(config, plan).await?);
+        self.network = Some(create_network(config, plan, restoring).await?);
         let netns = config.netns_dir.join(format!("dylos-{}", self.id));
         let specs: Vec<_> = spec
             .nodes
             .iter()
             .map(|node| {
+                let mut files = vec![ChrootFile::new(
+                    self.root().join("vms").join(&node.name).join("rootfs.ext4"),
+                    "rootfs.ext4",
+                )];
+                if restoring {
+                    for name in ["vm.state", "vm.mem"] {
+                        files.push(ChrootFile::new(
+                            self.root().join("vms").join(&node.name).join(name),
+                            name,
+                        ));
+                    }
+                } else {
+                    files.push(ChrootFile::new(&config.kernel, "vmlinux.bin"));
+                }
                 Ok(VmSpec {
                     lab_id: jail_identity(&self.id),
                     node: node.name.clone(),
@@ -224,13 +294,7 @@ impl Lab {
                         .map_err(|_| invalid(&self.id, "vCPU count exceeds u8"))?,
                     mem_size_mib: node.memory,
                     netns: Some(netns.clone()),
-                    files: vec![
-                        ChrootFile::new(&config.kernel, "vmlinux.bin"),
-                        ChrootFile::new(
-                            self.root().join("vms").join(&node.name).join("rootfs.ext4"),
-                            "rootfs.ext4",
-                        ),
-                    ],
+                    files,
                     timeouts: config.timeouts,
                 })
             })
@@ -254,6 +318,15 @@ impl Lab {
             duration_ms = started.elapsed().as_millis(),
             "all VM APIs ready"
         );
+        if restoring {
+            self.load_restored().await?;
+            crate::resume_all(self).await?;
+            if let Some(network) = self.network.as_mut() {
+                network.thaw().await?;
+            }
+            self.bind_control_socket().await?;
+            return Ok(());
+        }
         let started = Instant::now();
         complete(
             join_all(self.vms.iter().zip(&spec.nodes).map(|(vm, node)| {
@@ -288,6 +361,28 @@ impl Lab {
             .await,
         )?;
         self.bind_control_socket().await?;
+        Ok(())
+    }
+
+    async fn load_restored(&self) -> Result<()> {
+        complete(
+            join_all(self.vms.iter().map(|vm| async {
+                let params = dylos_fc::snapshot::SnapshotLoadParams::with_file_backend(
+                    "/vm.state",
+                    "/vm.mem",
+                )
+                .with_resume_vm(false);
+                vm.client()
+                    .load_snapshot(&params)
+                    .await
+                    .map_err(|source| LabError::Api {
+                        lab: self.id.clone(),
+                        vm: vm.node().into(),
+                        source: Box::new(source),
+                    })
+            }))
+            .await,
+        )?;
         Ok(())
     }
 
@@ -998,7 +1093,7 @@ fn jail_identity(id: &str) -> String {
     format!("lab{}-{id}", id.len())
 }
 
-async fn create_network(config: &LabConfig, plan: FabricPlan) -> Result<LabNetwork> {
+async fn create_network(config: &LabConfig, plan: FabricPlan, frozen: bool) -> Result<LabNetwork> {
     let started = Instant::now();
     let netns_dir = config.netns_dir.clone();
     let lab_id = plan.lab_id().to_owned();
@@ -1008,13 +1103,23 @@ async fn create_network(config: &LabConfig, plan: FabricPlan) -> Result<LabNetwo
             .map_err(|e| io(&lab_id, e))
     })
     .await?;
-    let network = LabNetwork::create(
-        plan,
-        &config.netns_dir,
-        config.jailer.uid,
-        config.jailer.gid,
-    )
-    .await?;
+    let network = if frozen {
+        LabNetwork::create_frozen(
+            plan,
+            &config.netns_dir,
+            config.jailer.uid,
+            config.jailer.gid,
+        )
+        .await?
+    } else {
+        LabNetwork::create(
+            plan,
+            &config.netns_dir,
+            config.jailer.uid,
+            config.jailer.gid,
+        )
+        .await?
+    };
     tracing::info!(duration_ms = started.elapsed().as_millis(), "fabric ready");
     Ok(network)
 }

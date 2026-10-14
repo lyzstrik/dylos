@@ -575,8 +575,7 @@ impl Vm {
         let ready = async {
             tokio::select! {
                 () = poll => Ok(()),
-                res = state.wait_for(|s| *s != ProcessState::Running) => {
-                    let st = res.map_or(ProcessState::Lost, |s| s.clone());
+                st = async { state.wait_for(|s| *s != ProcessState::Running).await.map_or(ProcessState::Lost, |s| s.clone()) } => {
                     if tokio::time::timeout(Duration::from_millis(50), done_rx.recv()).await.is_err() {
                         tracing::debug!("output still open after startup exit");
                     }
