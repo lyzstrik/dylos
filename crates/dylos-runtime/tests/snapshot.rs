@@ -143,13 +143,79 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
     let network = dylos_net::LabNetwork::create(plan, &netns_dir, 0, 0)
         .await
         .unwrap();
+    let netns_path = network.netns_path().to_path_buf();
     lab.set_network(network);
 
-    let manifest = lab.snapshot("snap-net").await.unwrap();
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
+
+    let task = tokio::spawn(async move {
+        let manifest = lab.snapshot("snap-net").await;
+        (manifest, lab)
+    });
+
+    wait_until("snapshot capture started", Duration::from_secs(5), || {
+        vm0_root.join("snapshot-started").exists()
+    })
+    .await;
+
+    // Observable barrier invariant: during snapshot capture, TAP interfaces in netns must be DOWN
+    let output = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "show",
+        ])
+        .output()
+        .expect("failed to run nsenter");
+    let link_out = String::from_utf8_lossy(&output.stdout);
+    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        assert!(
+            link_out.contains(tap),
+            "expected TAP interface {tap} in netns"
+        );
+        for line in link_out.lines() {
+            if line.contains(tap) {
+                assert!(
+                    !line.contains(",UP") && !line.contains("<UP,"),
+                    "TAP device {tap} must be DOWN during freeze barrier, got: {line}"
+                );
+            }
+        }
+    }
+
+    // Release stall so snapshot finishes
+    fs::remove_file(vm0_root.join("stall-snapshot")).unwrap();
+
+    let (res, mut lab) = task.await.unwrap();
+    let manifest = res.unwrap();
     assert_eq!(manifest.vms.len(), 3);
     // Observe freeze and thaw durations were captured
     assert!(manifest.step_durations_ms.freeze < 60_000);
     assert!(manifest.step_durations_ms.thaw < 60_000);
+
+    // After snapshot finishes and thaw occurs, TAP interfaces must be UP again
+    let output_thawed = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "show",
+        ])
+        .output()
+        .expect("failed to run nsenter");
+    let link_out_thawed = String::from_utf8_lossy(&output_thawed.stdout);
+    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        for line in link_out_thawed.lines() {
+            if line.contains(tap) {
+                assert!(
+                    line.contains("UP"),
+                    "TAP device {tap} must be UP after thaw, got: {line}"
+                );
+            }
+        }
+    }
 
     let snap_dir = store.snapshot_dir("ls-net", "snap-net");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
@@ -291,17 +357,37 @@ async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
 #[tokio::test]
 async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfm").await;
-    let snap_dir = store.snapshot_dir("lfm", "snap-err");
-    // Pre-create snap_dir as a read-only directory so manifest write fails
-    fs::create_dir_all(&snap_dir).unwrap();
-    fs::set_permissions(&snap_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
-    let err = lab.snapshot("snap-err").await.unwrap_err();
+    let task = tokio::spawn(async move {
+        let res = lab.snapshot("snap-err").await;
+        (res, lab)
+    });
+
+    wait_until("snapshot capture started", Duration::from_secs(5), || {
+        vm0_root.join("snapshot-started").exists()
+    })
+    .await;
+
+    // At this point, store.create_snapshot has run and created the directory!
+    let snap_dir = store.snapshot_dir("lfm", "snap-err");
+    assert!(
+        snap_dir.exists(),
+        "snapshot dir must exist prior to manifest write"
+    );
+    // Induce a failure specifically during manifest writing by creating manifest.json.tmp as a directory
+    fs::create_dir(snap_dir.join("manifest.json.tmp")).unwrap();
+
+    // Release snapshot stall so capture completes and manifest write is attempted
+    fs::remove_file(vm0_root.join("stall-snapshot")).unwrap();
+
+    let (res, mut lab) = task.await.unwrap();
+    let err = res.unwrap_err();
     assert!(err.to_string().contains("lfm"));
 
-    // Restore permissions for cleanup
-    let _ = fs::set_permissions(&snap_dir, fs::Permissions::from_mode(0o755));
-    let _ = fs::remove_dir_all(&snap_dir);
+    // Cleanup the injected failure directory so assertions can verify partial cleanup
+    let _ = fs::remove_dir(snap_dir.join("manifest.json.tmp"));
 
     for vm in lab.vms() {
         assert!(
@@ -314,6 +400,133 @@ async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
         // Partial jail files must be cleaned up
         assert!(!vm.paths().root.join("vm.state").exists());
         assert!(!vm.paths().root.join("vm.mem").exists());
+    }
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
+    if !sandboxed("snapshot_fails_at_thaw_cleans_up_and_reports_error") {
+        return;
+    }
+    let (sandbox, store, spec, mut lab) = setup_lab("ls-tf").await;
+
+    let netns_dir = sandbox.dir.path().join("netns");
+    fs::create_dir_all(&netns_dir).unwrap();
+    let plan = dylos_net::FabricPlan::new("ls-tf", &spec).unwrap();
+    let network = dylos_net::LabNetwork::create(plan, &netns_dir, 0, 0)
+        .await
+        .unwrap();
+    let netns_path = network.netns_path().to_path_buf();
+    lab.set_network(network);
+
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
+
+    let task = tokio::spawn(async move {
+        let res = lab.snapshot("snap-thaw-err").await;
+        (res, lab)
+    });
+
+    wait_until("snapshot capture started", Duration::from_secs(5), || {
+        vm0_root.join("snapshot-started").exists()
+    })
+    .await;
+
+    // Delete one TAP device inside the netns so thaw fails when trying to restore it
+    let status = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "del",
+            "tap-A-eth0",
+        ])
+        .status()
+        .expect("failed to run nsenter ip link del");
+    assert!(status.success());
+
+    fs::remove_file(vm0_root.join("stall-snapshot")).unwrap();
+
+    let (res, mut lab) = task.await.unwrap();
+    let err = res.unwrap_err();
+    assert!(err.to_string().contains("ls-tf"));
+
+    // Ensure partial snapshot directory is cleaned up
+    assert!(!store.snapshot_dir("ls-tf", "snap-thaw-err").exists());
+
+    // VMs must be resumed
+    for vm in lab.vms() {
+        assert!(
+            sandbox
+                .dir
+                .path()
+                .join(format!("{}.resumed", vm.paths().id))
+                .exists()
+        );
+        assert!(!vm.paths().root.join("vm.state").exists());
+        assert!(!vm.paths().root.join("vm.mem").exists());
+    }
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("lf-clean").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
+    // VM 1 will fail snapshot create
+    fs::write(lab.vms()[1].paths().root.join("fail-snapshot"), b"").unwrap();
+
+    let task = tokio::spawn(async move {
+        let res = lab.snapshot("snap-clean-err").await;
+        (res, lab)
+    });
+
+    wait_until("snapshot capture started", Duration::from_secs(5), || {
+        vm0_root.join("snapshot-started").exists()
+    })
+    .await;
+
+    // While stall-snapshot is held, create an undeletable directory inside snap_dir
+    let snap_dir = store.snapshot_dir("lf-clean", "snap-clean-err");
+    let locked_dir = snap_dir.join("locked_subdir");
+    fs::create_dir_all(&locked_dir).unwrap();
+    fs::write(locked_dir.join("file.txt"), b"cannot delete").unwrap();
+    fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    fs::remove_file(vm0_root.join("stall-snapshot")).unwrap();
+
+    let (res, mut lab) = task.await.unwrap();
+    let err = res.unwrap_err();
+    // Must be LabError::Rollback containing both the operation error and the cleanup error
+    match &err {
+        dylos_runtime::LabError::Rollback { operation, cleanup } => {
+            assert!(operation.to_string().contains("lf-clean"));
+            assert!(
+                cleanup.to_string().contains("locked_subdir")
+                    || cleanup.to_string().contains("Permission denied")
+            );
+        }
+        other => panic!("expected LabError::Rollback, got: {other:?}"),
+    }
+
+    // Restore permissions so lab teardown can clean up
+    let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
+    let _ = fs::remove_dir_all(&snap_dir);
+
+    for vm in lab.vms() {
+        assert!(
+            sandbox
+                .dir
+                .path()
+                .join(format!("{}.resumed", vm.paths().id))
+                .exists()
+        );
     }
 
     lab.teardown().await.unwrap();
@@ -335,27 +548,85 @@ async fn snapshot_fails_at_resume_preserves_error_and_cleans_up() {
 }
 
 #[tokio::test]
-async fn snapshot_cancellation_guard_resumes_vms() {
-    let (sandbox, _store, _spec, mut lab) = setup_lab("lcan").await;
+async fn snapshot_in_flight_cancellation_during_pause() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("lcan-pause").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
     let vm_id = lab.vms()[0].paths().id.clone();
-    let root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-pause"), b"").unwrap();
 
-    {
-        let mut guard = dylos_runtime::snapshot::SnapshotLifecycleGuard::new(&mut lab);
-        guard.pause().await.unwrap();
-        assert!(root.join("is-paused").exists());
-        // Simulate cancellation / future drop by dropping guard without disarming!
+    tokio::select! {
+        _ = lab.snapshot("snap-cancel-pause") => {}
+        () = async {
+            wait_until("pause started", Duration::from_secs(5), || {
+                vm0_root.join("pause-started").exists()
+            })
+            .await;
+        } => {}
     }
 
+    // Release stall so background recovery can complete VM resume
+    let _ = fs::remove_file(vm0_root.join("stall-pause"));
+
     wait_until(
-        "VM is resumed on cancellation",
+        "VM is resumed after in-flight pause cancellation",
         Duration::from_secs(5),
         || {
-            !root.join("is-paused").exists()
+            !vm0_root.join("is-paused").exists()
                 && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
         },
     )
     .await;
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_in_flight_cancellation_during_capture() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("lcan-cap").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    let vm_id = lab.vms()[0].paths().id.clone();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
+
+    tokio::select! {
+        _ = lab.snapshot("snap-cancel-cap") => {}
+        () = async {
+            wait_until("snapshot capture started", Duration::from_secs(5), || {
+                vm0_root.join("snapshot-started").exists()
+            })
+            .await;
+        } => {}
+    }
+
+    // Release stall so in-flight API request completes and background recovery finishes
+    let _ = fs::remove_file(vm0_root.join("stall-snapshot"));
+
+    wait_until(
+        "VM is resumed and cleaned after capture cancellation",
+        Duration::from_secs(5),
+        || {
+            !vm0_root.join("is-paused").exists()
+                && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
+                && !vm0_root.join("vm.state").exists()
+                && !vm0_root.join("vm.mem").exists()
+                && !store.snapshot_dir("lcan-cap", "snap-cancel-cap").exists()
+        },
+    )
+    .await;
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_in_flight_cancellation_during_freeze() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("lcf").await;
+
+    {
+        let mut guard = dylos_runtime::snapshot::SnapshotLifecycleGuard::new(&mut lab);
+        guard.freeze().await.unwrap();
+        // Guard dropped while frozen without pause! Recovery thaws network and succeeds.
+    }
 
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
@@ -378,7 +649,20 @@ async fn snapshot_via_control_socket() {
         assert_eq!(n, 0);
     }
 
-    // 2. Invalid snapshot ID rejection before freeze/pause
+    // 2. Malformed command rejection: too many arguments
+    {
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(b"snapshot snap-1 extra-arg\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        let mut reader = tokio::io::BufReader::new(stream);
+        reader.read_line(&mut resp).await.unwrap();
+        assert_eq!(resp, "err invalid command: too many arguments\n");
+    }
+
+    // 3. Invalid snapshot ID rejection before freeze/pause
     {
         let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
         stream.write_all(b"snapshot ../bad\n").await.unwrap();
@@ -388,7 +672,7 @@ async fn snapshot_via_control_socket() {
         assert!(resp.starts_with("err invalid snapshot id:"), "got {resp}");
     }
 
-    // 3. Command too long rejection closes connection
+    // 4. Command too long rejection closes connection
     {
         let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
         let long_cmd = format!("snapshot {}\n", "a".repeat(260));
@@ -399,7 +683,24 @@ async fn snapshot_via_control_socket() {
         assert!(res.is_err() || res.unwrap() == 0);
     }
 
-    // 4. Successful snapshot returns snapshot ID
+    // 5. Unauthorized peer UID rejection closes connection without response
+    {
+        Lab::set_control_uid_override(Some(9999));
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream
+            .write_all(b"snapshot unauthorized-test\n")
+            .await
+            .unwrap();
+        let mut resp = String::new();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let read_res =
+            tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut resp)).await;
+        assert!(matches!(read_res, Err(_) | Ok(Err(_) | Ok(0))));
+        assert!(!store.snapshot_dir("lc", "unauthorized-test").exists());
+        Lab::set_control_uid_override(None);
+    }
+
+    // 6. Successful snapshot returns snapshot ID
     let snap_id = Lab::request_snapshot(&socket, Some("snap-socket"), Duration::from_secs(10))
         .await
         .unwrap();
@@ -411,7 +712,7 @@ async fn snapshot_via_control_socket() {
     let manifest = dylos_core::manifest::SnapshotManifest::from_json_str(&manifest_json).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
 
-    // 5. Teardown
+    // 7. Teardown
     Lab::request_teardown(&socket, Duration::from_secs(5))
         .await
         .unwrap();
