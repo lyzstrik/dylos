@@ -1,14 +1,220 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use dylos_core::LabSpec;
 use dylos_core::manifest::{SnapshotManifest, StepDurations, VmManifest};
+use dylos_fc::FcClient;
 use dylos_fc::snapshot::SnapshotCreateParams;
-use dylos_store::Snapshot;
+use dylos_net::FabricThawHandle;
 use futures_util::future::join_all;
 use tracing::Instrument;
 
 use crate::{Lab, LabError, Vm, pause_all, resume_all};
+
+#[derive(Clone)]
+struct VmResumeClient {
+    lab: String,
+    vm_id: String,
+    client: FcClient,
+}
+
+impl VmResumeClient {
+    async fn resume(&self) -> Result<(), LabError> {
+        self.client.resume().await.map_err(|source| LabError::Api {
+            lab: self.lab.clone(),
+            vm: self.vm_id.clone(),
+            source: Box::new(source),
+        })
+    }
+}
+
+pub struct SnapshotLifecycleGuard<'a> {
+    lab: &'a mut Lab,
+    thaw_handle: Option<FabricThawHandle>,
+    resume_clients: Vec<VmResumeClient>,
+    frozen: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    disarmed: bool,
+}
+
+#[allow(clippy::missing_errors_doc)]
+impl<'a> SnapshotLifecycleGuard<'a> {
+    pub fn new(lab: &'a mut Lab) -> Self {
+        let thaw_handle = lab.network().map(dylos_net::LabNetwork::thaw_handle);
+        let resume_clients = lab
+            .vms()
+            .iter()
+            .map(|vm| VmResumeClient {
+                lab: lab.id().to_string(),
+                vm_id: vm.paths().id.clone(),
+                client: vm.client().clone(),
+            })
+            .collect();
+
+        Self {
+            lab,
+            thaw_handle,
+            resume_clients,
+            frozen: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            disarmed: false,
+        }
+    }
+
+    pub async fn freeze(&mut self) -> Result<(), LabError> {
+        if let Some(net) = self.lab.network_mut() {
+            net.freeze().await?;
+            self.frozen.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    pub async fn pause(&mut self) -> Result<std::time::Duration, LabError> {
+        let pause_res = pause_all(self.lab).await;
+        match pause_res {
+            Ok(skew) => {
+                self.paused.store(true, Ordering::SeqCst);
+                Ok(skew)
+            }
+            Err(pause_err) => {
+                // pause_all already attempted to resume every VM.
+                // Thaw network on rollback.
+                if let Err(thaw_err) = self.thaw().await {
+                    return Err(LabError::Rollback {
+                        operation: Box::new(pause_err),
+                        cleanup: Box::new(thaw_err),
+                    });
+                }
+                Err(pause_err)
+            }
+        }
+    }
+
+    pub async fn resume(&mut self) -> Result<(), LabError> {
+        if !self.paused.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let res = resume_all(self.lab).await;
+        match res {
+            Ok(()) => {
+                self.paused.store(false, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(resume_err) => {
+                // Attempt retry / recovery of still-paused VMs concurrently
+                let results = futures_util::future::join_all(
+                    self.resume_clients.iter().map(VmResumeClient::resume),
+                )
+                .await;
+                if results.into_iter().all(|r| r.is_ok()) {
+                    self.paused.store(false, Ordering::SeqCst);
+                    Ok(())
+                } else {
+                    // Do NOT thaw! Return error while retaining paused state
+                    Err(resume_err)
+                }
+            }
+        }
+    }
+
+    pub async fn thaw(&mut self) -> Result<(), LabError> {
+        if !self.frozen.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Some(net) = self.lab.network_mut() {
+            net.thaw().await?;
+        }
+        self.frozen.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub async fn resume_and_thaw(&mut self) -> Option<LabError> {
+        let mut cleanup = None;
+        if let Err(e) = self.resume().await {
+            cleanup = Some(e);
+        }
+        // Invariant: only thaw if all VMs are confirmed resumed!
+        if self.paused.load(Ordering::SeqCst) {
+            tracing::error!(
+                lab = %self.lab.id(),
+                "VMs remained paused after resume failure; fabric remains frozen to preserve invariant"
+            );
+        } else if let Err(e) = self.thaw().await {
+            cleanup = Some(match cleanup {
+                Some(c) => LabError::Rollback {
+                    operation: Box::new(c),
+                    cleanup: Box::new(e),
+                },
+                None => e,
+            });
+        }
+        cleanup
+    }
+
+    pub fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for SnapshotLifecycleGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let paused = self.paused.load(Ordering::SeqCst);
+        let frozen = self.frozen.load(Ordering::SeqCst);
+        if !paused && !frozen {
+            return;
+        }
+
+        let lab_id = self.lab.id().to_string();
+        let resume_clients = self.resume_clients.clone();
+        let thaw_handle = self.thaw_handle.clone();
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut resume_ok = true;
+                if paused {
+                    tracing::warn!(lab = %lab_id, "snapshot cancelled or panicked while paused; recovering VMs");
+                    let results = futures_util::future::join_all(
+                        resume_clients.iter().map(VmResumeClient::resume)
+                    )
+                    .await;
+                    for (client, res) in resume_clients.iter().zip(results) {
+                        if let Err(e) = res {
+                            tracing::error!(lab = %lab_id, vm = %client.vm_id, error = %e, "failed to resume VM on cancel");
+                            resume_ok = false;
+                        }
+                    }
+                }
+                if frozen && resume_ok {
+                    tracing::warn!(lab = %lab_id, "snapshot cancelled or panicked while frozen; thawing fabric");
+                    if let Some(thaw) = thaw_handle {
+                        let res = thaw.thaw().await;
+                        if let Err(e) = res {
+                            tracing::error!(lab = %lab_id, error = %e, "failed to thaw fabric on cancel");
+                        }
+                    }
+                }
+            });
+        } else {
+            tracing::error!(lab = %lab_id, "snapshot guard dropped outside tokio runtime; cannot background recover");
+        }
+    }
+}
+
+fn clean_jail_snapshot_files(vms: &[Vm]) {
+    for vm in vms {
+        let root = &vm.paths().root;
+        if let Ok(dir) = dylos_store::directory(root, false) {
+            for file in ["vm.state", "vm.mem"] {
+                let _ = nix::unistd::unlinkat(&dir, file, nix::unistd::UnlinkatFlags::NoRemoveDir);
+            }
+        }
+    }
+}
 
 /// Assembles the consistent lab snapshot sequence per ADR-0001:
 /// 1. Freeze fabric
@@ -25,75 +231,140 @@ use crate::{Lab, LabError, Vm, pause_all, resume_all};
 #[allow(clippy::too_many_lines)]
 pub async fn snapshot_lab(lab: &mut Lab, snapshot_id: &str) -> Result<SnapshotManifest, LabError> {
     let lab_id = lab.id().to_string();
+    dylos_core::validate_name(snapshot_id, 32)
+        .map_err(|e| LabError::Store(dylos_store::Error::InvalidId(e.to_string())))?;
     let span = tracing::info_span!("snapshot_lab", lab = %lab_id, snapshot = %snapshot_id);
 
     async {
+        let mut guard = SnapshotLifecycleGuard::new(lab);
+
         // Step 1: Freeze fabric
         let started_freeze = Instant::now();
-        if let Some(net) = lab.network_mut() {
-            net.freeze().await?;
-        }
+        guard.freeze().await?;
         let freeze_ms = u64::try_from(started_freeze.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         // Step 2: Pause all VMs
         let started_pause = Instant::now();
-        let pause_res = pause_all(lab).await;
+        guard.pause().await?;
         let pause_ms = u64::try_from(started_pause.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        if let Err(pause_err) = pause_res {
-            if let Some(net) = lab.network_mut()
-                && let Err(thaw_err) = net.thaw().await
-            {
-                return Err(LabError::Rollback {
-                    operation: Box::new(pause_err),
-                    cleanup: Box::new(LabError::from(thaw_err)),
-                });
-            }
-            return Err(pause_err);
-        }
-
         // Create snapshot directory layout
-        let store = lab.store().cloned().unwrap_or_default();
+        let store = guard.lab.store().cloned().unwrap_or_default();
         let mut snapshot = match store.create_snapshot(&lab_id, snapshot_id) {
             Ok(s) => s,
             Err(e) => {
-                let cleanup = resume_and_thaw(lab).await;
+                let cleanup = guard.resume_and_thaw().await;
+                clean_jail_snapshot_files(guard.lab.vms());
                 return Err(combine_rollback(LabError::Store(e), cleanup));
             }
         };
 
         // Step 3: Snapshot each VM & clone disks in parallel
         let started_snapshot = Instant::now();
-        let results = join_all(
-            lab.vms()
-                .iter()
-                .map(|vm| snapshot_vm(&lab_id, vm, lab.storage(), &snapshot)),
-        )
+
+        // 3a. Concurrent Firecracker API snapshot requests
+        let api_results = join_all(guard.lab.vms().iter().map(|vm| async {
+            let node = vm.node();
+            let api = vm.client();
+            let params = SnapshotCreateParams::full("/vm.state", "/vm.mem");
+            api.create_snapshot(&params)
+                .await
+                .map_err(|source| LabError::Api {
+                    lab: lab_id.clone(),
+                    vm: node.to_string(),
+                    source: Box::new(source),
+                })
+        }))
         .await;
+
+        if let Some(err) = api_results.into_iter().find_map(std::result::Result::err) {
+            let cleanup = guard.resume_and_thaw().await;
+            clean_jail_snapshot_files(guard.lab.vms());
+            if let Err(e) = snapshot.remove() {
+                tracing::error!(%e, "failed to remove partial snapshot");
+            }
+            return Err(combine_rollback(err, cleanup));
+        }
+
+        // 3b. Concurrent owned blocking storage tasks
+        let snapshot_arc = Arc::new(snapshot);
+        let storage = guard.lab.storage();
+        let mut storage_tasks = Vec::new();
+
+        for vm in guard.lab.vms() {
+            let snap = Arc::clone(&snapshot_arc);
+            let node = vm.node().to_string();
+            let state_src = vm.paths().root.join("vm.state");
+            let mem_src = vm.paths().root.join("vm.mem");
+            let disk_src = storage
+                .map(|s| s.vm_paths(&node).map(|p| p.rootfs))
+                .transpose()?;
+            let task = tokio::task::spawn_blocking(move || {
+                let state_file = snap.save_vm_file(&state_src, &node, "vm.state")?;
+                let memory_file = snap.save_vm_file(&mem_src, &node, "vm.mem")?;
+                let mut disks = Vec::new();
+                if let Some(disk_path) = disk_src {
+                    let disk_meta = snap.clone_disk(&disk_path, &node, "rootfs.ext4")?;
+                    disks.push(disk_meta);
+                }
+                Ok::<_, LabError>((
+                    node,
+                    VmManifest {
+                        state_file,
+                        memory_file,
+                        disks,
+                    },
+                ))
+            });
+            storage_tasks.push(task);
+        }
+
+        let results = join_all(storage_tasks).await;
         let snapshot_ms = u64::try_from(started_snapshot.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let mut first_error = None;
         let mut vms_manifest = BTreeMap::new();
         for result in results {
             match result {
-                Ok((node, manifest)) => {
+                Ok(Ok((node, manifest))) => {
                     vms_manifest.insert(node, manifest);
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     if first_error.is_none() {
                         first_error = Some(err);
+                    }
+                }
+                Err(join_err) => {
+                    if first_error.is_none() {
+                        first_error = Some(LabError::Task {
+                            lab: lab_id.clone(),
+                            source: join_err,
+                        });
                     }
                 }
             }
         }
 
         if let Some(err) = first_error {
-            let cleanup = resume_and_thaw(lab).await;
-            let _ = snapshot.remove();
+            let cleanup = guard.resume_and_thaw().await;
+            clean_jail_snapshot_files(guard.lab.vms());
+            drop(snapshot_arc);
             return Err(combine_rollback(err, cleanup));
         }
 
-        // Step 4: Write manifest
+        let Ok(snapshot) = Arc::try_unwrap(snapshot_arc) else {
+            let cleanup = guard.resume_and_thaw().await;
+            clean_jail_snapshot_files(guard.lab.vms());
+            return Err(combine_rollback(
+                LabError::Invalid {
+                    lab: lab_id.clone(),
+                    message: "snapshot handle leaked".into(),
+                },
+                cleanup,
+            ));
+        };
+
+        // Step 4: Write initial manifest in spawn_blocking
         let created_at_unix_ms = u64::try_from(
             SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -104,7 +375,7 @@ pub async fn snapshot_lab(lab: &mut Lab, snapshot_id: &str) -> Result<SnapshotMa
 
         let mut manifest = SnapshotManifest {
             format_version: 1,
-            lab_spec: lab.spec().cloned().unwrap_or_else(|| LabSpec {
+            lab_spec: guard.lab.spec().cloned().unwrap_or_else(|| LabSpec {
                 nodes: vec![],
                 segments: vec![],
             }),
@@ -121,49 +392,75 @@ pub async fn snapshot_lab(lab: &mut Lab, snapshot_id: &str) -> Result<SnapshotMa
             },
         };
 
-        if let Err(err) = snapshot.write_manifest(&manifest) {
-            let cleanup = resume_and_thaw(lab).await;
-            let _ = snapshot.remove();
-            return Err(combine_rollback(LabError::Store(err), cleanup));
-        }
+        let manifest_clone = manifest.clone();
+        let write_res = tokio::task::spawn_blocking(move || {
+            snapshot.write_manifest(&manifest_clone)?;
+            Ok::<_, LabError>(snapshot)
+        })
+        .await;
+
+        let mut snapshot = match write_res {
+            Ok(Ok(s)) => s,
+            Ok(Err(err)) => {
+                let cleanup = guard.resume_and_thaw().await;
+                clean_jail_snapshot_files(guard.lab.vms());
+                return Err(combine_rollback(err, cleanup));
+            }
+            Err(join_err) => {
+                let cleanup = guard.resume_and_thaw().await;
+                clean_jail_snapshot_files(guard.lab.vms());
+                return Err(combine_rollback(
+                    LabError::Task {
+                        lab: lab_id.clone(),
+                        source: join_err,
+                    },
+                    cleanup,
+                ));
+            }
+        };
 
         // Step 5: Resume all VMs
         let started_resume = Instant::now();
-        let resume_res = resume_all(lab).await;
+        let resume_res = guard.resume().await;
         let resume_ms = u64::try_from(started_resume.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         if let Err(resume_err) = resume_res {
-            let cleanup = if let Some(net) = lab.network_mut() {
-                net.thaw().await.err().map(LabError::from)
-            } else {
-                None
-            };
-            let _ = snapshot.remove();
-            return Err(combine_rollback(resume_err, cleanup));
+            if let Err(e) = snapshot.remove() {
+                tracing::error!(%e, "failed to remove snapshot after resume error");
+            }
+            clean_jail_snapshot_files(guard.lab.vms());
+            return Err(resume_err);
         }
 
         // Step 6: Thaw fabric
         let started_thaw = Instant::now();
-        let thaw_res = if let Some(net) = lab.network_mut() {
-            net.thaw().await.map_err(LabError::from)
-        } else {
-            Ok(())
-        };
+        let thaw_res = guard.thaw().await;
         let thaw_ms = u64::try_from(started_thaw.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         if let Err(thaw_err) = thaw_res {
-            let _ = snapshot.remove();
+            if let Err(e) = snapshot.remove() {
+                tracing::error!(%e, "failed to remove snapshot after thaw error");
+            }
+            clean_jail_snapshot_files(guard.lab.vms());
             return Err(thaw_err);
         }
 
-        // Update step durations in manifest and commit
+        // Step 7: Update step durations in manifest and commit atomically
         manifest.step_durations_ms.resume = resume_ms;
         manifest.step_durations_ms.thaw = thaw_ms;
-        if let Err(err) = snapshot.write_manifest(&manifest) {
-            let _ = snapshot.remove();
-            return Err(LabError::Store(err));
-        }
-        snapshot.commit();
+        let final_manifest = manifest.clone();
+        tokio::task::spawn_blocking(move || {
+            snapshot.write_manifest(&final_manifest)?;
+            snapshot.commit();
+            Ok::<_, LabError>(())
+        })
+        .await
+        .map_err(|join_err| LabError::Task {
+            lab: lab_id.clone(),
+            source: join_err,
+        })??;
+
+        guard.disarm();
 
         tracing::info!(
             lab = %lab_id,
@@ -183,53 +480,6 @@ pub async fn snapshot_lab(lab: &mut Lab, snapshot_id: &str) -> Result<SnapshotMa
     .await
 }
 
-async fn snapshot_vm(
-    lab_id: &str,
-    vm: &Vm,
-    storage: Option<&dylos_store::Lab>,
-    snapshot: &Snapshot,
-) -> Result<(String, VmManifest), LabError> {
-    let node = vm.node();
-    let api = vm.client();
-
-    let params = SnapshotCreateParams::full("/vm.state", "/vm.mem");
-    api.create_snapshot(&params)
-        .await
-        .map_err(|source| LabError::Api {
-            lab: lab_id.to_string(),
-            vm: node.to_string(),
-            source: Box::new(source),
-        })?;
-
-    let state_src = vm.paths().root.join("vm.state");
-    let state_file = snapshot
-        .save_vm_file(&state_src, node, "vm.state")
-        .map_err(LabError::from)?;
-
-    let mem_src = vm.paths().root.join("vm.mem");
-    let memory_file = snapshot
-        .save_vm_file(&mem_src, node, "vm.mem")
-        .map_err(LabError::from)?;
-
-    let mut disks = Vec::new();
-    if let Some(storage) = storage {
-        let vm_paths = storage.vm_paths(node).map_err(LabError::from)?;
-        let disk_meta = snapshot
-            .clone_disk(&vm_paths.rootfs, node, "rootfs.ext4")
-            .map_err(LabError::from)?;
-        disks.push(disk_meta);
-    }
-
-    Ok((
-        node.to_string(),
-        VmManifest {
-            state_file,
-            memory_file,
-            disks,
-        },
-    ))
-}
-
 fn host_cpu_model() -> String {
     if let Ok(info) = std::fs::read_to_string("/proc/cpuinfo") {
         for line in info.lines() {
@@ -241,26 +491,6 @@ fn host_cpu_model() -> String {
         }
     }
     std::env::consts::ARCH.to_string()
-}
-
-async fn resume_and_thaw(lab: &mut Lab) -> Option<LabError> {
-    let mut cleanup = None;
-    if let Err(e) = resume_all(lab).await {
-        cleanup = Some(e);
-    }
-    if let Some(net) = lab.network_mut()
-        && let Err(e) = net.thaw().await
-    {
-        let e = LabError::from(e);
-        cleanup = Some(match cleanup {
-            Some(c) => LabError::Rollback {
-                operation: Box::new(c),
-                cleanup: Box::new(e),
-            },
-            None => e,
-        });
-    }
-    cleanup
 }
 
 fn combine_rollback(operation: LabError, cleanup: Option<LabError>) -> LabError {

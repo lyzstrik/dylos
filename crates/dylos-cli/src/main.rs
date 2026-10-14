@@ -325,7 +325,7 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     }
 
     let config = build_config();
-    let timeout = Duration::from_secs(60);
+    let timeout = Duration::from_secs(120);
 
     let pinned = pin_control_socket(&config.store.base, &args.id);
     let socket_file = match pinned {
@@ -344,7 +344,7 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     let res = Lab::request_snapshot(&socket_path, args.snapshot_id.as_deref(), timeout).await;
     drop(socket_file);
 
-    res.with_context(|| format!("failed to snapshot lab '{}'", args.id))?;
-    println!("lab {} snapshotted successfully", args.id);
+    let snap_id = res.with_context(|| format!("failed to snapshot lab '{}'", args.id))?;
+    println!("lab {} snapshotted successfully as {}", args.id, snap_id);
     Ok(())
 }

@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -143,6 +144,7 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         kernel,
         netns_dir: dir.path().join("netns"),
         boot_timeout: Duration::from_secs(30),
+        extra_boot_args: Some("write_churn=1".into()),
         ..LabConfig::default()
     };
 
@@ -153,17 +155,42 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         .expect("lab bring-up failed");
     assert_eq!(lab.vms().len(), 1);
 
-    // Wait bounded to ensure the VM is running stably and actively churning writes
-    let mut state = lab.vms()[0].state();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            state.wait_for(|s| *s != ProcessState::Running),
-        )
-        .await
-        .is_err(),
-        "VM exited unexpectedly"
-    );
+    // Verify continuous writes are actively churning by flushing and polling Firecracker metrics
+    let client = lab.vms()[0].client();
+    let metrics_path = lab.vms()[0]
+        .paths()
+        .host_path(dylos_runtime::jailer::METRICS_FILE);
+    let mut wrote = false;
+    for _ in 0..50 {
+        let _ = client
+            .put::<_, serde_json::Value>(
+                "/actions",
+                &dylos_fc::config::InstanceActionInfo::new(
+                    dylos_fc::config::ActionType::FlushMetrics,
+                ),
+            )
+            .await;
+        if let Ok(content) = fs::read_to_string(&metrics_path) {
+            for line in content.lines().rev() {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                    let write_count = val["block"]["write_count"].as_u64().unwrap_or(0);
+                    let write_bytes = val["block"]["write_bytes"].as_u64().unwrap_or(0);
+                    if write_count > 0 || write_bytes > 0 {
+                        eprintln!(
+                            "Observed active guest write churn: write_count={write_count}, write_bytes={write_bytes}"
+                        );
+                        wrote = true;
+                        break;
+                    }
+                }
+            }
+            if wrote {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(wrote, "timed out waiting for active writes in guest VM");
 
     // Snapshot during continuous writes
     let manifest = lab.snapshot("snap-writer").await.expect("snapshot failed");
@@ -181,28 +208,28 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         cloned_disk.display()
     );
 
-    // Run e2fsck on the cloned disk image on the host.
-    // -fy replays journal and preens any pending metadata updates non-interactively.
-    // Exit codes 0 (no errors) and 1 (journal recovered / errors corrected) indicate a consistent filesystem.
+    // Run e2fsck on the cloned disk image on the host with -p -E journal_only.
+    // This permits only standard journal replay and preening, strictly refusing repairs of corrupted filesystem structures.
     let status = Command::new("e2fsck")
-        .args(["-fy", cloned_disk.to_str().unwrap()])
+        .args(["-p", "-E", "journal_only", cloned_disk.to_str().unwrap()])
         .status()
-        .expect("failed to run e2fsck");
+        .expect("failed to run e2fsck -p -E journal_only");
 
-    eprintln!("e2fsck -fy on cloned disk during continuous writes: exit={status:?}");
+    eprintln!("e2fsck -p -E journal_only on cloned disk: exit={status:?}");
     assert!(
-        matches!(status.code(), Some(0 | 1)),
-        "e2fsck reported inconsistency on cloned disk: exit {status:?}"
+        matches!(status.code(), Some(0..=2)),
+        "e2fsck journal recovery failed: exit {status:?}"
     );
 
-    // Verify subsequent read-only check confirms clean filesystem (exit 0)
+    // Verify subsequent read-only check confirms clean filesystem with exit code 0
     let ro_status = Command::new("e2fsck")
         .args(["-fn", cloned_disk.to_str().unwrap()])
         .status()
         .expect("failed to run e2fsck -fn");
-    assert!(
-        ro_status.success() || ro_status.code() == Some(0),
-        "e2fsck -fn reported errors after journal replay: exit {ro_status:?}"
+    assert_eq!(
+        ro_status.code(),
+        Some(0),
+        "e2fsck -fn reported corruption on cloned disk after journal recovery: exit {ro_status:?}"
     );
 
     // Clean teardown

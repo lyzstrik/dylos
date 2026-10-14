@@ -66,6 +66,7 @@ pub struct LabConfig {
     pub netns_dir: PathBuf,
     pub timeouts: Timeouts,
     pub boot_timeout: Duration,
+    pub extra_boot_args: Option<String>,
 }
 
 impl Default for LabConfig {
@@ -77,6 +78,7 @@ impl Default for LabConfig {
             netns_dir: "/run/netns".into(),
             timeouts: Timeouts::default(),
             boot_timeout: Duration::from_secs(30),
+            extra_boot_args: None,
         }
     }
 }
@@ -240,12 +242,9 @@ impl Lab {
         );
         let started = Instant::now();
         complete(
-            join_all(
-                self.vms
-                    .iter()
-                    .zip(&spec.nodes)
-                    .map(|(vm, node)| configure_vm(&self.id, spec, node, vm)),
-            )
+            join_all(self.vms.iter().zip(&spec.nodes).map(|(vm, node)| {
+                configure_vm(&self.id, spec, node, vm, config.extra_boot_args.as_deref())
+            }))
             .await,
         )?;
         tracing::info!(
@@ -328,8 +327,18 @@ impl Lab {
         self.storage.as_ref()
     }
 
+    #[must_use]
+    pub fn network(&self) -> Option<&LabNetwork> {
+        self.network.as_ref()
+    }
+
     pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
         self.network.as_mut()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn set_network(&mut self, net: LabNetwork) {
+        self.network = Some(net);
     }
 
     /// Runs the consistent snapshot sequence per ADR-0001:
@@ -347,6 +356,7 @@ impl Lab {
     /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
     /// # Errors
     /// Reports socket, VM exit, and cleanup failures. A response is sent only after cleanup.
+    #[allow(clippy::too_many_lines)]
     pub async fn supervise(mut self) -> Result<()> {
         let span = self.span.clone();
         let result = async {
@@ -390,20 +400,51 @@ impl Lab {
                             let trimmed = line.trim();
                             if trimmed == "teardown" {
                                 break Ok(stream);
-                            } else if let Some(rest) = trimmed.strip_prefix("snapshot") {
-                                let snap_id = rest.trim();
-                                let snap_id = if snap_id.is_empty() {
-                                    format!("snap-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis())
-                                } else {
-                                    snap_id.to_string()
+                            } else if trimmed == "snapshot"
+                                || trimmed.starts_with("snapshot ")
+                                || trimmed.starts_with("snapshot\t")
+                            {
+                                let mut parts = trimmed.split_whitespace();
+                                let _cmd = parts.next();
+                                let maybe_id = parts.next();
+                                if parts.next().is_some() {
+                                    let _ = stream
+                                        .write_all(b"err invalid command: too many arguments\n")
+                                        .await;
+                                    continue;
+                                }
+                                let snap_id = match maybe_id {
+                                    Some(id) => {
+                                        if let Err(e) = dylos_core::validate_name(id, 32) {
+                                            let _ = stream
+                                                .write_all(
+                                                    format!("err invalid snapshot id: {e}\n")
+                                                        .as_bytes(),
+                                                )
+                                                .await;
+                                            continue;
+                                        }
+                                        id.to_string()
+                                    }
+                                    None => format!(
+                                        "snap-{}",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    ),
                                 };
                                 let res = self.snapshot(&snap_id).await;
                                 match res {
                                     Ok(_) => {
-                                        let _ = stream.write_all(b"ok\n").await;
+                                        let _ = stream
+                                            .write_all(format!("ok {snap_id}\n").as_bytes())
+                                            .await;
                                     }
                                     Err(e) => {
-                                        let _ = stream.write_all(format!("err {e}\n").as_bytes()).await;
+                                        let _ = stream
+                                            .write_all(format!("err {e}\n").as_bytes())
+                                            .await;
                                     }
                                 }
                             }
@@ -607,7 +648,7 @@ impl Lab {
         socket: &Path,
         snapshot_id: Option<&str>,
         timeout: Duration,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let id = socket.to_string_lossy();
         tokio::time::timeout(timeout, async {
             let mut stream = UnixStream::connect(socket).await.map_err(|e| io(&id, e))?;
@@ -632,9 +673,16 @@ impl Lab {
                 }
             }
             let reply = String::from_utf8_lossy(&reply_buf);
-            if reply.trim() == "ok" {
-                Ok(())
-            } else if let Some(err_msg) = reply.strip_prefix("err ") {
+            let trimmed = reply.trim();
+            if let Some(rest) = trimmed.strip_prefix("ok") {
+                let snap = rest.trim();
+                let actual_id = if snap.is_empty() {
+                    snapshot_id.unwrap_or("").to_string()
+                } else {
+                    snap.to_string()
+                };
+                Ok(actual_id)
+            } else if let Some(err_msg) = trimmed.strip_prefix("err ") {
                 Err(invalid(&id, err_msg.trim()))
             } else {
                 Err(invalid(&id, &format!("invalid snapshot response: {reply}")))
@@ -771,7 +819,13 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm) -> Result<()> {
+async fn configure_vm(
+    id: &str,
+    spec: &LabSpec,
+    node: &dylos_core::Node,
+    vm: &Vm,
+    extra_boot: Option<&str>,
+) -> Result<()> {
     let vcpus = u8::try_from(node.vcpus).map_err(|_| invalid(id, "invalid vCPU count"))?;
     let boot_args = guest_net::boot_args(spec, node)?;
     async {
@@ -780,10 +834,9 @@ async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm
             api.put_machine_config(&MachineConfiguration::new(vcpus, node.memory as usize))
                 .await?;
             let mut boot = BootSource::new("/vmlinux.bin");
-            let extra_boot_args = if node.name.contains("writer") {
-                " write_churn=1"
-            } else {
-                ""
+            let extra_boot_args = match extra_boot {
+                Some(args) => format!(" {args}"),
+                None => String::new(),
             };
             boot.boot_args = Some(format!(
                 "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda {boot_args}{extra_boot_args}"
