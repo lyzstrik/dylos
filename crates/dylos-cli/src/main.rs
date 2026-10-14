@@ -95,10 +95,21 @@ struct LabArgs {
 enum LabCommands {
     /// Bring up a lab and supervise it until teardown
     Up(UpArgs),
+    /// Restore a snapshot directory into a new supervised lab
+    Restore(RestoreArgs),
     /// Tear down a running or crashed lab
     Down(DownArgs),
     /// Snapshot a running lab's microVMs and disks
     Snapshot(SnapshotArgs),
+}
+
+#[derive(Args, Debug)]
+struct RestoreArgs {
+    /// Snapshot directory containing manifest.json
+    snapshot: PathBuf,
+    /// New lab identifier (defaults to `restore-<snapshot directory name>`)
+    #[arg(long)]
+    id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -158,6 +169,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Lab(lab_args) => match lab_args.command {
             LabCommands::Up(up_args) => lab_up(up_args).await,
+            LabCommands::Restore(args) => lab_restore(args).await,
             LabCommands::Down(down_args) => lab_down(down_args).await,
             LabCommands::Snapshot(snapshot_args) => lab_snapshot(snapshot_args).await,
         },
@@ -246,6 +258,46 @@ async fn lab_up(args: UpArgs) -> Result<()> {
             tracing::info!(lab = %id, "received SIGTERM, requesting teardown");
             handle_signal_teardown(&id, &socket, supervisor).await
         }
+    }
+}
+
+async fn lab_restore(args: RestoreArgs) -> Result<()> {
+    let id = args.id.unwrap_or_else(|| {
+        format!(
+            "restore-{}",
+            args.snapshot
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("snapshot")
+        )
+    });
+    validate_lab_id(&id)?;
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .context("failed to register SIGINT handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("failed to register SIGTERM handler")?;
+    let config = build_config();
+    let restore = Lab::restore_with(&config, &args.snapshot, &id);
+    tokio::pin!(restore);
+    let mut interrupted = false;
+    let lab = loop {
+        tokio::select! {
+            biased;
+            _ = sigint.recv() => interrupted = true,
+            _ = sigterm.recv() => interrupted = true,
+            result = &mut restore => break result.with_context(|| format!("failed to restore lab '{id}'"))?,
+        }
+    };
+    let socket = lab.control_socket();
+    let mut supervisor = tokio::spawn(lab.supervise());
+    if interrupted {
+        return handle_signal_teardown(&id, &socket, supervisor).await;
+    }
+    println!("lab {id} restored, press Ctrl+C or run `dylos lab down {id}`");
+    tokio::select! {
+        result = &mut supervisor => result.context("supervisor task panicked")?.context("restored lab supervision failed"),
+        _ = sigint.recv() => handle_signal_teardown(&id, &socket, supervisor).await,
+        _ = sigterm.recv() => handle_signal_teardown(&id, &socket, supervisor).await,
     }
 }
 

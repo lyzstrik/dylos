@@ -40,17 +40,39 @@ impl LabNetwork {
         user_id: u32,
         group_id: u32,
     ) -> Result<Self, Error> {
+        Self::create_with_state(plan, netns_dir, user_id, group_id, false).await
+    }
+
+    /// Creates bridges and TAPs down, with thaw restoring them to up.
+    /// # Errors
+    /// As [`Self::create`].
+    pub async fn create_frozen(
+        plan: FabricPlan,
+        netns_dir: &Path,
+        user_id: u32,
+        group_id: u32,
+    ) -> Result<Self, Error> {
+        Self::create_with_state(plan, netns_dir, user_id, group_id, true).await
+    }
+
+    async fn create_with_state(
+        plan: FabricPlan,
+        netns_dir: &Path,
+        user_id: u32,
+        group_id: u32,
+        frozen: bool,
+    ) -> Result<Self, Error> {
         let span = info_span!("lab_network", lab = plan.lab_id());
         let netns_path = netns_dir.join(plan.netns_name());
         let started = Instant::now();
         let lab = plan.lab_id().to_owned();
         let net = blocking(&lab, move || {
-            let ns = create_blocking(&plan, &netns_path, user_id, group_id)?;
+            let (ns, state) = create_blocking(&plan, &netns_path, user_id, group_id, frozen)?;
             Ok(Self {
                 plan,
                 netns_path,
                 ns: Some(Arc::new(ns)),
-                fabric_state: Arc::default(),
+                fabric_state: Arc::new(Mutex::new(state)),
             })
         })
         .instrument(span.clone())
@@ -247,11 +269,12 @@ fn create_blocking(
     path: &Path,
     user_id: u32,
     group_id: u32,
-) -> Result<File, Error> {
+    frozen: bool,
+) -> Result<(File, crate::freeze::State), Error> {
     let lab = plan.lab_id();
     let created = on_fresh_thread_blocking(lab, {
         let (plan, path) = (plan.clone(), path.to_owned());
-        move || create_fabric(&plan, &path, user_id, group_id)
+        move || create_fabric(&plan, &path, user_id, group_id, frozen)
     });
     match created {
         Err(e) if !matches!(e, Error::NetnsExists { .. }) => {
@@ -273,17 +296,16 @@ fn create_fabric(
     path: &Path,
     user_id: u32,
     group_id: u32,
-) -> Result<File, Error> {
+    frozen: bool,
+) -> Result<(File, crate::freeze::State), Error> {
     let lab = plan.lab_id();
     let ns = netns::create_and_enter(lab, path)?;
-    with_netlink(lab, async |handle| {
+    let state = with_netlink(lab, async |handle| {
         for bridge in plan.bridges() {
             // ADR-0002: a restored bridge has forgotten the guests' multicast memberships, so
             // snooping would starve IPv6 neighbor discovery; flood multicast instead.
-            let msg = LinkBridge::new(&bridge.name)
-                .mcast_snooping(false)
-                .up()
-                .build();
+            let builder = LinkBridge::new(&bridge.name).mcast_snooping(false);
+            let msg = if frozen { builder.down() } else { builder.up() }.build();
             let res = handle.link().add(msg).execute().await;
             res.map_err(nl_err(lab, "create bridge", &bridge.name))?;
         }
@@ -295,16 +317,18 @@ fn create_fabric(
             ))?;
             let index = require_index(lab, handle, &tap.name).await?;
             let bridge = require_index(lab, handle, &tap.bridge).await?;
-            let msg = LinkUnspec::new_with_index(index)
-                .controller(bridge)
-                .up()
-                .build();
+            let builder = LinkUnspec::new_with_index(index).controller(bridge);
+            let msg = if frozen { builder.down() } else { builder.up() }.build();
             let res = handle.link().change(msg).execute().await;
             res.map_err(nl_err(lab, "attach tap", &tap.name))?;
         }
-        Ok(())
+        if frozen {
+            crate::freeze::initially_frozen(plan, handle).await
+        } else {
+            Ok(crate::freeze::State::default())
+        }
     })?;
-    Ok(ns)
+    Ok((ns, state))
 }
 
 /// With `owned`, deletes the devices in that netns, and unpins `path` only if it still pins it.
@@ -371,7 +395,7 @@ async fn link_index(handle: &Handle, name: &str) -> Result<Option<u32>, rtnetlin
     }
 }
 
-async fn require_index(lab: &str, handle: &Handle, name: &str) -> Result<u32, Error> {
+pub(crate) async fn require_index(lab: &str, handle: &Handle, name: &str) -> Result<u32, Error> {
     link_index(handle, name)
         .await
         .map_err(nl_err(lab, "find", name))?

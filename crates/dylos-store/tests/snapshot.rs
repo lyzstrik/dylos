@@ -394,3 +394,114 @@ fn save_vm_file_bounded_rejection_on_file_growth_with_copy_fallback() {
         "destination must be cleaned up after bounded rejection"
     );
 }
+
+fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) {
+    use dylos_core::manifest::FileMeta;
+    use sha2::{Digest, Sha256};
+    let mut snapshot = store.create_snapshot("source", "restore-test").unwrap();
+    let mut vms = BTreeMap::new();
+    for node in &spec.nodes {
+        let root = snapshot.root().join("vms").join(&node.name);
+        fs::create_dir(&root).unwrap();
+        let meta = |name: &str| {
+            let bytes = format!("{} {name}", node.name);
+            fs::write(root.join(name), &bytes).unwrap();
+            FileMeta {
+                path: PathBuf::from(format!("vms/{}/{name}", node.name)),
+                size: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes.as_bytes())),
+            }
+        };
+        vms.insert(
+            node.name.clone(),
+            VmManifest {
+                state_file: meta("vm.state"),
+                memory_file: meta("vm.mem"),
+                disks: vec![meta("rootfs.ext4")],
+            },
+        );
+    }
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: spec,
+        vms,
+        firecracker_version: "1.17.0".into(),
+        host_cpu_model: "test".into(),
+        created_at_unix_ms: 0,
+        step_durations_ms: StepDurations {
+            freeze: 0,
+            pause: 0,
+            snapshot: 0,
+            resume: 0,
+            thaw: 0,
+        },
+    };
+    snapshot.write_manifest(&manifest).unwrap();
+    let path = snapshot.root().to_owned();
+    snapshot.commit();
+    (path, manifest)
+}
+
+#[test]
+fn restore_verifies_before_creation_and_reflinks_independent_files() {
+    use std::os::unix::fs::MetadataExt;
+    let (_temp, store, spec) = setup();
+    let (path, manifest) = restore_fixture(&store, spec);
+    let mut lab = match store.restore("clone", &path) {
+        Ok((lab, _)) => lab,
+        Err(dylos_store::Error::Reflink { source, .. })
+            if matches!(
+                source.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
+            ) =>
+        {
+            assert!(!store.base.join("clone").exists());
+            eprintln!("SKIPPED restore store test: reflinks unsupported: {source}");
+            return;
+        }
+        Err(e) => panic!("restore failed: {e}"),
+    };
+    for node in &manifest.lab_spec.nodes {
+        for name in ["rootfs.ext4", "vm.state", "vm.mem"] {
+            let source = path.join("vms").join(&node.name).join(name);
+            let clone = lab.root().join("vms").join(&node.name).join(name);
+            assert_eq!(fs::read(&source).unwrap(), fs::read(&clone).unwrap());
+            assert_ne!(
+                fs::metadata(&source).unwrap().ino(),
+                fs::metadata(&clone).unwrap().ino()
+            );
+            fs::write(clone, b"changed clone").unwrap();
+        }
+    }
+    manifest
+        .verify(SnapshotOpener::new(&path).unwrap().verify_opener())
+        .unwrap();
+    lab.remove().unwrap();
+    lab.remove().unwrap();
+    assert!(!store.base.join("clone").exists());
+    assert!(store.restore("source", &path).is_err());
+    fs::write(path.join("vms/a/vm.mem"), b"tampered").unwrap();
+    assert!(store.restore("clone", &path).is_err());
+    assert!(!store.base.join("clone").exists());
+}
+
+#[test]
+fn restore_rejects_missing_vm_and_symlink_files_without_creating_lab() {
+    use std::os::unix::fs::symlink;
+    let (_temp, store, spec) = setup();
+    let (path, mut manifest) = restore_fixture(&store, spec);
+    manifest.vms.remove("a");
+    fs::write(
+        path.join("manifest.json"),
+        manifest.to_json_string().unwrap(),
+    )
+    .unwrap();
+    assert!(store.restore("clone", &path).is_err());
+    assert!(!store.base.join("clone").exists());
+    let (_temp, store, spec) = setup();
+    let (path, _manifest) = restore_fixture(&store, spec);
+    fs::remove_file(path.join("vms/a/vm.mem")).unwrap();
+    symlink("/etc/passwd", path.join("vms/a/vm.mem")).unwrap();
+    assert!(store.restore("clone", &path).is_err());
+    assert!(!store.base.join("clone").exists());
+}

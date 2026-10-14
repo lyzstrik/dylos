@@ -391,3 +391,65 @@ async fn unexpected_vm_exit_tears_down_the_entire_lab() {
     );
     assert_removed(&sandbox, &config);
 }
+
+#[tokio::test]
+async fn restore_loads_frozen_then_resumes_and_supervises() {
+    if !sandboxed("restore_loads_frozen_then_resumes_and_supervises") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
+    let manifest = source.snapshot("saved").await.unwrap();
+    let snapshot = config.store.snapshot_dir("src", "saved");
+    let lab = Lab::restore_with(&config, &snapshot, "lab").await.unwrap();
+    for vm in lab.vms() {
+        let requests = fs::read_to_string(vm.paths().root.join("requests")).unwrap();
+        assert!(requests.contains("PUT /snapshot/load "));
+        assert!(requests.contains("Resumed"));
+        assert!(!requests.contains("InstanceStart"));
+        assert!(!requests.contains("PUT /machine-config"));
+    }
+    let socket = lab.control_socket();
+    let server = tokio::spawn(lab.supervise());
+    Lab::request_teardown(&socket, Duration::from_secs(5))
+        .await
+        .unwrap();
+    server.await.unwrap().unwrap();
+    source.teardown().await.unwrap();
+    manifest
+        .verify(
+            dylos_store::SnapshotOpener::new(&snapshot)
+                .unwrap()
+                .verify_opener(),
+        )
+        .unwrap();
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn restore_load_and_resume_failures_roll_back_all_resources() {
+    if !sandboxed("restore_load_and_resume_failures_roll_back_all_resources") {
+        return;
+    }
+    for stage in ["load", "resume"] {
+        let (sandbox, config, spec) = setup(Mode::LabReady);
+        if !supported(&config, &spec).unwrap() {
+            return;
+        }
+        let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
+        source.snapshot("saved").await.unwrap();
+        source.teardown().await.unwrap();
+        fs::write(sandbox.dir.path().join("fail-restore"), stage).unwrap();
+        assert!(
+            Lab::restore_with(&config, &config.store.snapshot_dir("src", "saved"), "lab")
+                .await
+                .is_err()
+        );
+        assert_removed(&sandbox, &config);
+        Lab::teardown_by_name(&config, "lab").await.unwrap();
+        assert_removed(&sandbox, &config);
+    }
+}
