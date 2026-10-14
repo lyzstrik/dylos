@@ -28,6 +28,8 @@ jobs:
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+          # udevadm trigger is asynchronous: wait until the rule is applied before checking access.
+          sudo udevadm settle --timeout=30
           if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             echo "::error::Current user does not have read/write access to /dev/kvm" >&2
             exit 1
