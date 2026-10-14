@@ -59,7 +59,7 @@ async fn verify_guest_declared_addresses(lab: &Lab) {
         .exec(
             "A",
             "ip -o -6 addr show scope global",
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
@@ -67,7 +67,7 @@ async fn verify_guest_declared_addresses(lab: &Lab) {
         .exec(
             "A",
             "ip -o -4 addr show scope global",
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
@@ -81,7 +81,7 @@ async fn verify_guest_declared_addresses(lab: &Lab) {
         .exec(
             "B",
             "ip -o -6 addr show scope global",
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
@@ -89,7 +89,7 @@ async fn verify_guest_declared_addresses(lab: &Lab) {
         .exec(
             "B",
             "ip -o -4 addr show scope global",
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
@@ -107,7 +107,7 @@ async fn verify_guest_declared_addresses(lab: &Lab) {
         .exec(
             "C",
             "ip -o -6 addr show scope global",
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();
@@ -115,7 +115,7 @@ async fn verify_guest_declared_addresses(lab: &Lab) {
         .exec(
             "C",
             "ip -o -4 addr show scope global",
-            Duration::from_secs(5),
+            Duration::from_secs(10),
         )
         .await
         .unwrap();

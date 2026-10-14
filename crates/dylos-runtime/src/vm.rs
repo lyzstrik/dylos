@@ -368,10 +368,11 @@ impl Vm {
         let start_marker = format!("__DYLOS_START_{id}__");
         let end_prefix = format!("__DYLOS_END_{id}__ ");
 
-        // We use printf with %s format substitutions so that terminal input echo
+        // We send a leading newline to clear any pending prompt on the console,
+        // and use printf with %s format substitutions so that terminal input echo
         // does not produce the literal marker strings on their own line.
         let payload = format!(
-            "printf '__DYLOS_%s__\\n' START_{id}; {{ {cmd} ; }}; printf '__DYLOS_%s__ %d\\n' END_{id} $?\n"
+            "\nprintf '__DYLOS_%s__\\n' START_{id}; {{ {cmd} ; }}; printf '__DYLOS_%s__ %d\\n' END_{id} $?\n"
         );
 
         stdin
@@ -398,13 +399,18 @@ impl Vm {
                     Ok(line) => {
                         let clean = line.trim_end_matches('\r');
                         if !seen_start {
-                            if clean == start_marker {
+                            if clean.ends_with(&start_marker) {
                                 seen_start = true;
                             }
                             continue;
                         }
-                        if let Some(rest) = clean.strip_prefix(&end_prefix) {
-                            let exit_code = rest.trim().parse::<i32>().unwrap_or(-1);
+                        if let Some(pos) = clean.find(&end_prefix) {
+                            let rest = &clean[pos + end_prefix.len()..];
+                            let exit_code = rest
+                                .split_whitespace()
+                                .next()
+                                .and_then(|c| c.parse::<i32>().ok())
+                                .unwrap_or(-1);
                             return Ok(ExecOutput {
                                 exit_code,
                                 stdout: output_lines.join("\n"),
@@ -434,6 +440,7 @@ impl Vm {
             .map_err(|_| Error::ExecTimeout {
                 id: self.paths.id.clone(),
                 timeout,
+                output: self.output(),
             })?
     }
 

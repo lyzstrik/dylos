@@ -63,8 +63,12 @@ pub enum Error {
     KillTimeout { id: String, timeout: Duration },
     #[error("VM {id}: exec failed: {message}")]
     ExecFailed { id: String, message: String },
-    #[error("VM {id}: exec command timed out after {timeout:?}")]
-    ExecTimeout { id: String, timeout: Duration },
+    #[error("VM {id}: exec command timed out after {timeout:?}; last output: {output:?}")]
+    ExecTimeout {
+        id: String,
+        timeout: Duration,
+        output: Vec<String>,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
