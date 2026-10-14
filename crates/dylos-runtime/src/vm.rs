@@ -111,9 +111,7 @@ pub struct Vm {
     readiness: watch::Receiver<Readiness>,
     boot_start: Instant,
     output_tasks_done: mpsc::Receiver<()>,
-    #[cfg(feature = "test-support")]
     stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
-    #[cfg(feature = "test-support")]
     lines_tx: tokio::sync::broadcast::Sender<String>,
 }
 
@@ -136,11 +134,6 @@ impl Vm {
             let start = std::time::Instant::now();
             let mut jail = jailer::prepare_chroot(config, &paths, &spec.files).await?;
             let boot_start = Instant::now();
-            let stdin_mode = if cfg!(feature = "test-support") {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            };
             let child = Command::new(&config.jailer)
                 .args(jailer::jailer_args(
                     config,
@@ -149,7 +142,7 @@ impl Vm {
                     spec.vcpu_count,
                     spec.mem_size_mib,
                 ))
-                .stdin(stdin_mode)
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
@@ -167,9 +160,7 @@ impl Vm {
                     });
                 }
             };
-            #[cfg(feature = "test-support")]
             let mut child = child;
-            #[cfg(feature = "test-support")]
             let child_stdin = child
                 .stdin
                 .take()
@@ -179,7 +170,6 @@ impl Vm {
                 jail,
                 spec.timeouts,
                 boot_start,
-                #[cfg(feature = "test-support")]
                 child_stdin,
                 spec.node.clone(),
             );
@@ -203,9 +193,7 @@ impl Vm {
         jail: Jail,
         timeouts: Timeouts,
         boot_start: Instant,
-        #[cfg(feature = "test-support")] child_stdin: Option<
-            Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
-        >,
+        child_stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
         node: String,
     ) -> Self {
         let paths = jail.paths().clone();
@@ -216,7 +204,6 @@ impl Vm {
         ));
         let (readiness_tx, readiness) = watch::channel(Readiness::Pending);
         let (done_tx, done_rx) = mpsc::channel(1);
-        #[cfg(feature = "test-support")]
         let (lines_tx, _) = tokio::sync::broadcast::channel(2048);
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
         // is not daemonized.
@@ -228,7 +215,6 @@ impl Vm {
                     Arc::clone(&output),
                     readiness_tx.clone(),
                     done_tx.clone(),
-                    #[cfg(feature = "test-support")]
                     lines_tx.clone(),
                 )
                 .in_current_span(),
@@ -242,7 +228,6 @@ impl Vm {
                     Arc::clone(&output),
                     readiness_tx.clone(),
                     done_tx.clone(),
-                    #[cfg(feature = "test-support")]
                     lines_tx.clone(),
                 )
                 .in_current_span(),
@@ -276,9 +261,7 @@ impl Vm {
             readiness,
             boot_start,
             output_tasks_done: done_rx,
-            #[cfg(feature = "test-support")]
             stdin: child_stdin,
-            #[cfg(feature = "test-support")]
             lines_tx,
         }
     }
@@ -359,12 +342,9 @@ impl Vm {
         &self.node
     }
 
-    #[cfg(feature = "test-support")]
     const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
-    #[cfg(feature = "test-support")]
     const MAX_EXEC_OUTPUT_LINES: usize = 1000;
 
-    #[cfg(feature = "test-support")]
     fn random_nonce() -> u64 {
         static FALLBACK_COUNTER: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(1);
@@ -385,7 +365,6 @@ impl Vm {
         time ^ count
     }
 
-    #[cfg(feature = "test-support")]
     async fn collect_exec_output(
         &self,
         mut rx: tokio::sync::broadcast::Receiver<String>,
@@ -512,7 +491,6 @@ impl Vm {
     /// total output exceeds the output budget (1 MiB), or marker parsing encounters an invalid
     /// record; [`Error::ExecTimeout`] if the deadline expires before completion; or [`Error::Io`]
     /// if writing to stdin fails.
-    #[cfg(feature = "test-support")]
     pub async fn exec(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
         use tokio::io::AsyncWriteExt;
 
@@ -892,7 +870,7 @@ async fn forward_lines(
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     readiness: watch::Sender<Readiness>,
     _done_tx: mpsc::Sender<()>,
-    #[cfg(feature = "test-support")] lines_tx: tokio::sync::broadcast::Sender<String>,
+    lines_tx: tokio::sync::broadcast::Sender<String>,
 ) {
     let mut reader = BufReader::new(stream);
     loop {
@@ -914,7 +892,6 @@ async fn forward_lines(
                         }
                     });
                 }
-                #[cfg(feature = "test-support")]
                 let _ = lines_tx.send(trimmed.clone());
                 tracing::info!(target: "dylos::firecracker", source, "{trimmed}");
                 let mut q = output

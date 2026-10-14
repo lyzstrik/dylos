@@ -225,7 +225,6 @@ impl Lab {
             }))
             .await,
         )?;
-        #[cfg(feature = "test-support")]
         self.verify_readiness(spec).await?;
         let socket = self.control_socket();
         self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
@@ -262,7 +261,6 @@ impl Lab {
     ///
     /// # Errors
     /// Returns [`LabError::Invalid`] if the node is not found, or any error from `Vm::exec`.
-    #[cfg(feature = "test-support")]
     pub async fn exec(
         &self,
         node: &str,
@@ -276,7 +274,6 @@ impl Lab {
         vm.exec(cmd, timeout).await.map_err(LabError::from)
     }
 
-    #[cfg(feature = "test-support")]
     async fn verify_readiness(&self, spec: &LabSpec) -> Result<()> {
         let mut v6_probes = Vec::new();
         let mut v4_probes = Vec::new();
@@ -351,7 +348,6 @@ impl Lab {
         Ok(())
     }
 
-    #[cfg(feature = "test-support")]
     async fn probe_peer(&self, node: &str, family: &str, target: &str) -> Result<()> {
         let cmd = format!("ping {family} -c 1 -W 1 {target}");
         let mut last_err = String::new();
