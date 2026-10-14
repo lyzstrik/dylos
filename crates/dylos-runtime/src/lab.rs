@@ -955,7 +955,9 @@ async fn configure_vm(
 
 impl Drop for Lab {
     fn drop(&mut self) {
-        if !self.cleanup_on_drop || self.storage.is_none() {
+        if !self.cleanup_on_drop
+            || (self.storage.is_none() && self.vms.is_empty() && !self.has_active_snapshot())
+        {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
