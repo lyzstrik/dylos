@@ -7,6 +7,7 @@ on:
         description: "Run in reduced mode (--quick)"
         type: boolean
         default: true
+  pull_request:
 
 permissions:
   contents: read
