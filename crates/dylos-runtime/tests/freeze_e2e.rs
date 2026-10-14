@@ -71,7 +71,8 @@ async fn wait_for_rx(lab: &Lab, before: u64) {
 
 async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) {
     guest(lab, "C", "iperf3 -s -D").await;
-    guest(lab, "A", &format!("iperf3 {family} -c {address} -P 4 -t 90 > /tmp/freeze-iperf.log 2>&1 & echo $! > /tmp/freeze-iperf.pid")).await;
+    guest(lab, "A", &format!("ping {family} -c 1 -W 2 {address}")).await;
+    guest(lab, "A", &format!("sh -c 'iperf3 {family} -c {address} -P 4 -t 90 > /tmp/freeze-iperf.log 2>&1 & echo $! > /tmp/freeze-iperf.pid'")).await;
     wait_for_rx(lab, guest_rx(lab).await[3]).await;
     lab.network_mut().unwrap().freeze().await.unwrap();
     let frozen_at = Instant::now();
@@ -108,7 +109,7 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
         .trim()
         .parse()
         .unwrap();
-    guest(lab, "A", &format!("rm -f /tmp/freeze-ping.status; (ping {family} -c 2 -W 1 {address} > /tmp/freeze-ping.log 2>&1; echo $? > /tmp/freeze-ping.status) &")).await;
+    guest(lab, "A", &format!("sh -c 'rm -f /tmp/freeze-ping.status; (ping {family} -c 2 -W 1 {address} > /tmp/freeze-ping.log 2>&1; echo $? > /tmp/freeze-ping.status) &'")).await;
     let held = Instant::now();
     while held.elapsed() < Duration::from_secs(2) {
         assert_eq!(guest_rx(lab).await, stable, "guest RX during frozen hold");
@@ -136,6 +137,10 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     assert!(
         tx_after > tx_before,
         "no post-T guest transmission observed"
+    );
+
+    eprintln!(
+        "{family}: post-T guest TX {tx_before} -> {tx_after}; frozen TAP RX {taps:?}; settled guest RX {stable:?}"
     );
 
     // Exercise pause skew with A and B running; guest counters become readable on resume.
