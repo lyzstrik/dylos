@@ -288,32 +288,54 @@ async fn parallel_pause_reply(
     false
 }
 
-fn assert_taps_down(sandbox: &Path, barrier_msg: &str) {
+pub fn assert_taps_down(sandbox: &Path, barrier_msg: &str) {
     let netns_dir = sandbox.join("netns");
-    if netns_dir.exists()
-        && let Ok(entries) = std::fs::read_dir(&netns_dir)
-    {
-        for entry in entries.flatten() {
-            let netns_path = entry.path();
-            if let Ok(output) = std::process::Command::new("nsenter")
-                .args([
-                    format!("--net={}", netns_path.display()).as_str(),
-                    "ip",
-                    "link",
-                    "show",
-                ])
-                .output()
-            {
-                let link_out = String::from_utf8_lossy(&output.stdout);
-                for line in link_out.lines() {
-                    if line.contains("tap-") {
-                        assert!(
-                            !line.contains(",UP") && !line.contains("<UP,"),
-                            "{barrier_msg}: {line}"
-                        );
-                    }
+    if !netns_dir.exists() {
+        return;
+    }
+    let entries = std::fs::read_dir(&netns_dir)
+        .expect("failed to read netns directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to read netns directory entry");
+    assert!(
+        !entries.is_empty(),
+        "netns directory exists but contains no netns entries"
+    );
+    for entry in entries {
+        let netns_path = entry.path();
+        let output = std::process::Command::new("nsenter")
+            .args([
+                format!("--net={}", netns_path.display()).as_str(),
+                "ip",
+                "link",
+                "show",
+            ])
+            .output()
+            .expect("failed to run nsenter ip link show");
+        assert!(
+            output.status.success(),
+            "nsenter ip link show failed on {}: status {:?}, stderr: {}",
+            netns_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let link_out = String::from_utf8_lossy(&output.stdout);
+        for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+            let mut found = false;
+            for line in link_out.lines() {
+                if line.contains(tap) {
+                    found = true;
+                    assert!(
+                        !line.contains(",UP") && !line.contains("<UP,"),
+                        "{barrier_msg}: {line}"
+                    );
                 }
             }
+            assert!(
+                found,
+                "missing expected TAP interface {tap} in netns {}: output:\n{link_out}",
+                netns_path.display()
+            );
         }
     }
 }

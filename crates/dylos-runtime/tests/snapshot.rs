@@ -130,6 +130,7 @@ async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
     if !sandboxed("snapshot_with_network_observes_freeze_thaw_barrier_order") {
         return;
@@ -169,6 +170,12 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
         ])
         .output()
         .expect("failed to run nsenter");
+    assert!(
+        output.status.success(),
+        "nsenter failed: status {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let link_out = String::from_utf8_lossy(&output.stdout);
     for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
         assert!(
@@ -205,6 +212,12 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
         ])
         .output()
         .expect("failed to run nsenter");
+    assert!(
+        output_thawed.status.success(),
+        "nsenter after thaw failed: status {:?}, stderr: {}",
+        output_thawed.status,
+        String::from_utf8_lossy(&output_thawed.stderr)
+    );
     let link_out_thawed = String::from_utf8_lossy(&output_thawed.stdout);
     let mut found_taps = 0;
     for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
@@ -1072,6 +1085,7 @@ async fn teardown_cancellation_during_pending_storage_retains_ownership_for_drop
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume() {
     if !sandboxed("snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume") {
         return;
@@ -1123,16 +1137,28 @@ async fn snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume() {
         ])
         .output()
         .expect("failed to run nsenter");
+    assert!(
+        output.status.success(),
+        "nsenter failed: status {:?}, stderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
     let link_out = String::from_utf8_lossy(&output.stdout);
     for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        let mut tap_found = false;
         for line in link_out.lines() {
             if line.contains(tap) {
+                tap_found = true;
                 assert!(
                     !line.contains(",UP") && !line.contains("<UP,"),
                     "TAP device {tap} must be DOWN during resume boundary, got: {line}"
                 );
             }
         }
+        assert!(
+            tap_found,
+            "expected TAP interface {tap} in netns during resume boundary, output:\n{link_out}"
+        );
     }
 
     // Release resume stall so all VMs finish resuming and fabric is thawed
@@ -1152,11 +1178,19 @@ async fn snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume() {
         ])
         .output()
         .expect("failed to run nsenter");
+    assert!(
+        output_thawed.status.success(),
+        "nsenter after thaw failed: status {:?}, stderr: {}",
+        output_thawed.status,
+        String::from_utf8_lossy(&output_thawed.stderr)
+    );
     let link_out_thawed = String::from_utf8_lossy(&output_thawed.stdout);
     let mut found_taps = 0;
     for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        let mut tap_found = false;
         for line in link_out_thawed.lines() {
             if line.contains(tap) {
+                tap_found = true;
                 assert!(
                     line.contains("UP"),
                     "TAP device {tap} must be UP after thaw, got: {line}"
@@ -1164,9 +1198,66 @@ async fn snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume() {
                 found_taps += 1;
             }
         }
+        assert!(
+            tap_found,
+            "expected TAP interface {tap} in netns after thaw, output:\n{link_out_thawed}"
+        );
     }
     assert_eq!(found_taps, 3);
 
     lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn tap_boundary_assertion_fails_closed_when_tap_is_missing() {
+    if !sandboxed("tap_boundary_assertion_fails_closed_when_tap_is_missing") {
+        return;
+    }
+    let (sandbox, _store, spec, mut lab) = setup_lab("ls-neg").await;
+    let netns_dir = sandbox.dir.path().join("netns");
+    fs::create_dir_all(&netns_dir).unwrap();
+    let plan = dylos_net::FabricPlan::new("ls-neg", &spec).unwrap();
+    let mut network = dylos_net::LabNetwork::create(plan, &netns_dir, 0, 0)
+        .await
+        .unwrap();
+    let netns_path = network.netns_path().to_path_buf();
+
+    // Freeze network so TAPs are DOWN
+    network.freeze().await.unwrap();
+
+    // Baseline check succeeds when all 3 TAPs are present and DOWN
+    support::assert_taps_down(
+        sandbox.dir.path(),
+        "baseline check should succeed when all TAPs are present and DOWN",
+    );
+
+    // Delete one of the expected TAP devices inside the netns
+    let status = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "del",
+            "tap-A-eth0",
+        ])
+        .status()
+        .expect("failed to run nsenter ip link del");
+    assert!(status.success());
+
+    // Boundary assertion must fail closed because tap-A-eth0 is absent
+    let result = std::panic::catch_unwind(|| {
+        support::assert_taps_down(
+            sandbox.dir.path(),
+            "barrier violation: fabric must be frozen but TAP is UP",
+        );
+    });
+    assert!(
+        result.is_err(),
+        "assert_taps_down must fail closed when an expected TAP is missing"
+    );
+
+    lab.teardown().await.unwrap();
+    network.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }

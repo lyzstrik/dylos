@@ -243,26 +243,58 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
 
     // Replay the ext4 journal on the cloned disk image using journal-only replay.
     // -E journal_only replays the journal transactions without performing arbitrary filesystem repairs.
-    let journal_status = Command::new("e2fsck")
-        .args(["-fy", "-E", "journal_only", cloned_disk.to_str().unwrap()])
-        .status()
-        .expect("failed to run e2fsck -fy -E journal_only");
+    let journal_output = Command::new("e2fsck")
+        .args(["-y", "-E", "journal_only", cloned_disk.to_str().unwrap()])
+        .output()
+        .expect("failed to run e2fsck -y -E journal_only");
 
-    eprintln!("e2fsck -E journal_only on cloned disk: exit={journal_status:?}");
+    let stdout = String::from_utf8_lossy(&journal_output.stdout);
+    let stderr = String::from_utf8_lossy(&journal_output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    eprintln!(
+        "e2fsck -E journal_only on cloned disk: exit={:?}\n{combined}",
+        journal_output.status
+    );
+
     assert!(
-        matches!(journal_status.code(), Some(0..=2)),
-        "e2fsck journal_only failed: exit {journal_status:?}"
+        matches!(journal_output.status.code(), Some(0..=2)),
+        "e2fsck journal_only failed: exit {:?}\n{combined}",
+        journal_output.status
+    );
+
+    // Verify the first pass only replayed the journal and did not perform structural checks or repairs
+    assert!(
+        !combined.contains("Pass 1")
+            && !combined.contains("Pass 2")
+            && !combined.contains("Pass 3")
+            && !combined.contains("Pass 4")
+            && !combined.contains("Pass 5")
+            && !combined.contains("Fix?")
+            && !combined.contains("FIXED")
+            && !combined.contains("Free blocks count wrong")
+            && !combined.contains("Free inodes count wrong"),
+        "e2fsck first pass performed structural checks or repairs beyond journal replay:\n{combined}"
     );
 
     // Verify subsequent read-only check confirms clean filesystem with exit code 0
-    let ro_status = Command::new("e2fsck")
+    let ro_output = Command::new("e2fsck")
         .args(["-fn", cloned_disk.to_str().unwrap()])
-        .status()
+        .output()
         .expect("failed to run e2fsck -fn");
+    let ro_combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&ro_output.stdout),
+        String::from_utf8_lossy(&ro_output.stderr)
+    );
+    eprintln!(
+        "e2fsck -fn on cloned disk: exit={:?}\n{ro_combined}",
+        ro_output.status
+    );
     assert_eq!(
-        ro_status.code(),
+        ro_output.status.code(),
         Some(0),
-        "e2fsck -fn reported corruption on cloned disk after journal recovery: exit {ro_status:?}"
+        "e2fsck -fn reported corruption on cloned disk after journal recovery: exit {:?}\n{ro_combined}",
+        ro_output.status
     );
 
     // Clean teardown
