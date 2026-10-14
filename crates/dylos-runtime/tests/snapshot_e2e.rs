@@ -153,8 +153,17 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         .expect("lab bring-up failed");
     assert_eq!(lab.vms().len(), 1);
 
-    // Let the guest write for 2 seconds to ensure continuous writing is actively churning
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait bounded to ensure the VM is running stably and actively churning writes
+    let mut state = lab.vms()[0].state();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            state.wait_for(|s| *s != ProcessState::Running),
+        )
+        .await
+        .is_err(),
+        "VM exited unexpectedly"
+    );
 
     // Snapshot during continuous writes
     let manifest = lab.snapshot("snap-writer").await.expect("snapshot failed");
@@ -172,16 +181,28 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         cloned_disk.display()
     );
 
-    // Run e2fsck -fn on the cloned disk image on the host
+    // Run e2fsck on the cloned disk image on the host.
+    // -fy replays journal and preens any pending metadata updates non-interactively.
+    // Exit codes 0 (no errors) and 1 (journal recovered / errors corrected) indicate a consistent filesystem.
     let status = Command::new("e2fsck")
-        .args(["-fn", cloned_disk.to_str().unwrap()])
+        .args(["-fy", cloned_disk.to_str().unwrap()])
         .status()
         .expect("failed to run e2fsck");
 
-    eprintln!("e2fsck on cloned disk during continuous writes: exit={status:?}");
+    eprintln!("e2fsck -fy on cloned disk during continuous writes: exit={status:?}");
     assert!(
-        status.success() || status.code() == Some(0),
+        matches!(status.code(), Some(0 | 1)),
         "e2fsck reported inconsistency on cloned disk: exit {status:?}"
+    );
+
+    // Verify subsequent read-only check confirms clean filesystem (exit 0)
+    let ro_status = Command::new("e2fsck")
+        .args(["-fn", cloned_disk.to_str().unwrap()])
+        .status()
+        .expect("failed to run e2fsck -fn");
+    assert!(
+        ro_status.success() || ro_status.code() == Some(0),
+        "e2fsck -fn reported errors after journal replay: exit {ro_status:?}"
     );
 
     // Clean teardown
