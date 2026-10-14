@@ -326,6 +326,30 @@ impl Lab {
         &self.vms
     }
 
+    /// Returns a reference to the VM with the given node name, if present.
+    #[must_use]
+    pub fn vm(&self, node: &str) -> Option<&Vm> {
+        self.vms.iter().find(|vm| vm.node() == node)
+    }
+
+    /// Executes a command in the specified guest VM.
+    ///
+    /// # Errors
+    /// Returns [`LabError::Invalid`] if the node is not found, or any error from `Vm::exec`.
+    #[cfg(feature = "test-support")]
+    pub async fn exec(
+        &self,
+        node: &str,
+        cmd: &str,
+        timeout: Duration,
+    ) -> Result<crate::vm::ExecOutput> {
+        let vm = self.vm(node).ok_or_else(|| LabError::Invalid {
+            lab: self.id.clone(),
+            message: format!("VM node '{node}' not found"),
+        })?;
+        vm.exec(cmd, timeout).await.map_err(LabError::from)
+    }
+
     #[must_use]
     pub fn store(&self) -> Option<&dylos_store::Store> {
         self.store.as_ref()

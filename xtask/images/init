@@ -13,6 +13,8 @@ if grep -q "write_churn=1" /proc/cmdline; then
         done
     ) &
 fi
+# Disable console echo for test execution over serial
+stty -F /dev/ttyS0 -echo 2>/dev/null || true
 # PID 1 must survive console logout; Alpine BusyBox provides setsid -c, not cttyhack.
 while :; do
     setsid -c /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1

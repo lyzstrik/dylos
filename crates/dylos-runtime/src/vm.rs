@@ -67,6 +67,19 @@ pub enum ProcessState {
     Lost,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+}
+
+impl ExecOutput {
+    #[must_use]
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Readiness {
     Pending,
@@ -84,6 +97,7 @@ enum Readiness {
 /// synchronously; a cgroup whose process is not reaped yet stays behind.
 pub struct Vm {
     paths: JailPaths,
+    node: String,
     client: FcClient,
     timeouts: Timeouts,
     signals: mpsc::UnboundedSender<Signal>,
@@ -97,7 +111,10 @@ pub struct Vm {
     readiness: watch::Receiver<Readiness>,
     boot_start: Instant,
     output_tasks_done: mpsc::Receiver<()>,
-    node: String,
+    #[cfg(feature = "test-support")]
+    stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
+    #[cfg(feature = "test-support")]
+    lines_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 impl Vm {
@@ -119,6 +136,11 @@ impl Vm {
             let start = std::time::Instant::now();
             let mut jail = jailer::prepare_chroot(config, &paths, &spec.files).await?;
             let boot_start = Instant::now();
+            let stdin_mode = if cfg!(feature = "test-support") {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            };
             let child = Command::new(&config.jailer)
                 .args(jailer::jailer_args(
                     config,
@@ -127,7 +149,7 @@ impl Vm {
                     spec.vcpu_count,
                     spec.mem_size_mib,
                 ))
-                .stdin(Stdio::null())
+                .stdin(stdin_mode)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
@@ -145,7 +167,22 @@ impl Vm {
                     });
                 }
             };
-            let mut vm = Self::start(child, jail, spec.timeouts, boot_start, spec.node.clone());
+            #[cfg(feature = "test-support")]
+            let mut child = child;
+            #[cfg(feature = "test-support")]
+            let child_stdin = child
+                .stdin
+                .take()
+                .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
+            let mut vm = Self::start(
+                child,
+                jail,
+                spec.timeouts,
+                boot_start,
+                #[cfg(feature = "test-support")]
+                child_stdin,
+                spec.node.clone(),
+            );
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
                 vm.send_signal(Signal::SIGKILL);
@@ -166,6 +203,9 @@ impl Vm {
         jail: Jail,
         timeouts: Timeouts,
         boot_start: Instant,
+        #[cfg(feature = "test-support")] child_stdin: Option<
+            Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+        >,
         node: String,
     ) -> Self {
         let paths = jail.paths().clone();
@@ -176,6 +216,8 @@ impl Vm {
         ));
         let (readiness_tx, readiness) = watch::channel(Readiness::Pending);
         let (done_tx, done_rx) = mpsc::channel(1);
+        #[cfg(feature = "test-support")]
+        let (lines_tx, _) = tokio::sync::broadcast::channel(2048);
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
         // is not daemonized.
         if let Some(out) = child.stdout.take() {
@@ -186,6 +228,8 @@ impl Vm {
                     Arc::clone(&output),
                     readiness_tx.clone(),
                     done_tx.clone(),
+                    #[cfg(feature = "test-support")]
+                    lines_tx.clone(),
                 )
                 .in_current_span(),
             ));
@@ -198,6 +242,8 @@ impl Vm {
                     Arc::clone(&output),
                     readiness_tx.clone(),
                     done_tx.clone(),
+                    #[cfg(feature = "test-support")]
+                    lines_tx.clone(),
                 )
                 .in_current_span(),
             ));
@@ -217,6 +263,7 @@ impl Vm {
         Self {
             client: FcClient::new(paths.api_socket()),
             paths,
+            node,
             timeouts,
             signals,
             state,
@@ -229,13 +276,11 @@ impl Vm {
             readiness,
             boot_start,
             output_tasks_done: done_rx,
-            node,
+            #[cfg(feature = "test-support")]
+            stdin: child_stdin,
+            #[cfg(feature = "test-support")]
+            lines_tx,
         }
-    }
-
-    #[must_use]
-    pub fn node(&self) -> &str {
-        &self.node
     }
 
     #[must_use]
@@ -307,6 +352,188 @@ impl Vm {
     #[must_use]
     pub fn paths(&self) -> &JailPaths {
         &self.paths
+    }
+
+    #[must_use]
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    #[cfg(feature = "test-support")]
+    const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
+
+    #[cfg(feature = "test-support")]
+    fn random_nonce() -> u64 {
+        static FALLBACK_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let mut buf = [0u8; 8];
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            if f.read_exact(&mut buf).is_ok() {
+                let n = u64::from_ne_bytes(buf);
+                if n != 0 {
+                    return n;
+                }
+            }
+        }
+        let count = FALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        time ^ count
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn collect_exec_output(
+        &self,
+        mut rx: tokio::sync::broadcast::Receiver<String>,
+        start_marker: &str,
+        end_prefix: &str,
+    ) -> Result<ExecOutput> {
+        let mut seen_start = false;
+        let mut output_lines = Vec::new();
+        let mut total_bytes = 0usize;
+
+        loop {
+            match rx.recv().await {
+                Ok(line) => {
+                    let clean = line.trim_end_matches('\r');
+                    if !seen_start {
+                        if clean == start_marker
+                            || clean.ends_with(&format!(" {start_marker}"))
+                            || clean.ends_with(&format!("# {start_marker}"))
+                            || clean.ends_with(&format!("$ {start_marker}"))
+                        {
+                            seen_start = true;
+                        }
+                        continue;
+                    }
+
+                    if let Some(pos) = clean.find(end_prefix) {
+                        let prefix = &clean[..pos];
+                        let rest = clean[pos + end_prefix.len()..].trim();
+                        if let Ok(exit_code) = rest.parse::<i32>() {
+                            let trimmed_prefix = prefix.trim();
+                            if !trimmed_prefix.is_empty()
+                                && trimmed_prefix != "#"
+                                && trimmed_prefix != "$"
+                                && !trimmed_prefix.ends_with("/ #")
+                            {
+                                output_lines.push(prefix.to_string());
+                            }
+                            return Ok(ExecOutput {
+                                exit_code,
+                                stdout: output_lines.join("\n"),
+                            });
+                        }
+                        return Err(Error::ExecFailed {
+                            id: self.paths.id.clone(),
+                            message: format!("malformed exit status in end marker: {clean}"),
+                        });
+                    }
+
+                    if total_bytes + clean.len() > Self::MAX_EXEC_OUTPUT_BYTES {
+                        return Err(Error::ExecFailed {
+                            id: self.paths.id.clone(),
+                            message: format!(
+                                "exec output exceeded budget of {} bytes",
+                                Self::MAX_EXEC_OUTPUT_BYTES
+                            ),
+                        });
+                    }
+                    total_bytes += clean.len();
+                    output_lines.push(clean.to_string());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Err(Error::ExecFailed {
+                        id: self.paths.id.clone(),
+                        message: format!(
+                            "exec subscriber lagged behind console output ({skipped} lines dropped)"
+                        ),
+                    });
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(Error::ExecFailed {
+                        id: self.paths.id.clone(),
+                        message: "console output closed before command completed".into(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Executes a command inside the guest via the serial console shell.
+    ///
+    /// The entire operation — acquiring the console lock, writing the payload, and awaiting
+    /// the exit sentinel marker — is bounded by `timeout`.
+    ///
+    /// # Security note
+    ///
+    /// Command execution uses sentinel markers written to and read from the Firecracker serial
+    /// console. This transport is intended for trusted test workloads; guest-reported command
+    /// results cannot authenticate an adversarial guest that possesses arbitrary code execution,
+    /// because the guest can inspect its environment/stdin and attempt to forge markers. A random
+    /// nonce is included in each invocation to prevent accidental marker collisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ExecFailed`] if stdin is unavailable, the output channel closes or lags,
+    /// total output exceeds the output budget (1 MiB), or marker parsing encounters an invalid
+    /// record; [`Error::ExecTimeout`] if the deadline expires before completion; or [`Error::Io`]
+    /// if writing to stdin fails.
+    #[cfg(feature = "test-support")]
+    pub async fn exec(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
+        use tokio::io::AsyncWriteExt;
+
+        let nonce = format!("{:016x}", Self::random_nonce());
+        let start_marker = format!("__DYLOS_START_{nonce}__");
+        let end_prefix = format!("__DYLOS_END_{nonce}__ ");
+
+        // We send a leading newline to clear any pending prompt on the console,
+        // and use printf with %s format substitutions so that terminal input echo
+        // does not produce the literal marker strings on their own line.
+        let payload = format!(
+            "\nprintf '__DYLOS_%s__\\n' START_{nonce}; {{ {cmd} ; }}; printf '__DYLOS_%s__ %d\\n' END_{nonce} $?\n"
+        );
+
+        let exec_fut = async {
+            let Some(stdin_mutex) = &self.stdin else {
+                return Err(Error::ExecFailed {
+                    id: self.paths.id.clone(),
+                    message: "guest stdin is not available".into(),
+                });
+            };
+
+            let mut stdin = stdin_mutex.lock().await;
+            let rx = self.lines_tx.subscribe();
+
+            stdin
+                .write_all(payload.as_bytes())
+                .await
+                .map_err(|e| Error::Io {
+                    id: self.paths.id.clone(),
+                    op: "write to stdin",
+                    path: PathBuf::from("stdin"),
+                    source: e,
+                })?;
+            stdin.flush().await.map_err(|e| Error::Io {
+                id: self.paths.id.clone(),
+                op: "flush stdin",
+                path: PathBuf::from("stdin"),
+                source: e,
+            })?;
+
+            self.collect_exec_output(rx, &start_marker, &end_prefix)
+                .await
+        };
+
+        tokio::time::timeout(timeout, exec_fut)
+            .await
+            .map_err(|_| Error::ExecTimeout {
+                id: self.paths.id.clone(),
+                timeout,
+                output: self.output(),
+            })?
     }
 
     /// Changes once, when the process exits for any reason. An exit that was not requested
@@ -590,18 +817,58 @@ async fn supervise(
     res
 }
 
+const MAX_CONSOLE_LINE_BYTES: usize = 4096;
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if line.len() + pos >= max_len {
+                let take = max_len - line.len();
+                line.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        if line.len() + available.len() >= max_len {
+            let take = max_len - line.len();
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        line.extend_from_slice(available);
+        let len = available.len();
+        reader.consume(len);
+    }
+}
+
 async fn forward_lines(
     stream: impl AsyncRead + Unpin,
     source: &'static str,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     readiness: watch::Sender<Readiness>,
     _done_tx: mpsc::Sender<()>,
+    #[cfg(feature = "test-support")] lines_tx: tokio::sync::broadcast::Sender<String>,
 ) {
-    let mut lines = BufReader::new(stream).lines();
+    let mut reader = BufReader::new(stream);
     loop {
-        match lines.next_line().await {
+        match read_bounded_line(&mut reader, MAX_CONSOLE_LINE_BYTES).await {
             Ok(Some(line)) => {
-                let marker = match line.as_str() {
+                let trimmed = line.trim_end_matches('\r').to_string();
+                let marker = match trimmed.as_str() {
                     "dylos: ready" => Some(Readiness::Ready(Instant::now())),
                     "dylos: network setup failed" => Some(Readiness::Failed(Instant::now())),
                     _ => None,
@@ -616,14 +883,16 @@ async fn forward_lines(
                         }
                     });
                 }
-                tracing::info!(target: "dylos::firecracker", source, "{line}");
+                #[cfg(feature = "test-support")]
+                let _ = lines_tx.send(trimmed.clone());
+                tracing::info!(target: "dylos::firecracker", source, "{trimmed}");
                 let mut q = output
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if q.len() >= 20 {
                     q.pop_front();
                 }
-                q.push_back(line);
+                q.push_back(trimmed);
             }
             Ok(None) => break,
             Err(e) => {

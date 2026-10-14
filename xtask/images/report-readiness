@@ -2,6 +2,49 @@
 MARKER="${DYLOS_NET_MARKER:-/run/dylos-net-failed}"
 if [ -f "$MARKER" ]; then
     echo 'dylos: network setup failed'
-else
-    echo 'dylos: ready'
+    exit 0
 fi
+
+check_gateway() {
+    family="$1"
+    gw="$2"
+    tries=0
+    max_tries="${DYLOS_GATEWAY_TRIES:-5}"
+    while [ "$tries" -lt "$max_tries" ]; do
+        if ping "$family" -c 1 -W 1 "$gw" >/dev/null 2>&1; then
+            return 0
+        fi
+        tries=$((tries + 1))
+        sleep 0.2 2>/dev/null || sleep 1
+    done
+    return 1
+}
+
+CMDLINE_FILE="${DYLOS_CMDLINE_FILE:-${1:-/proc/cmdline}}"
+if [ -f "$CMDLINE_FILE" ]; then
+    CMDLINE=$(cat "$CMDLINE_FILE" 2>/dev/null || true)
+    for arg in $CMDLINE; do
+        case "$arg" in
+            dylos.rt=*)
+                val="${arg#dylos.rt=}"
+                gw="${val#*,}"
+                case "$gw" in
+                    *:*)
+                        if ! check_gateway -6 "$gw"; then
+                            echo 'dylos: network setup failed'
+                            exit 0
+                        fi
+                        ;;
+                    *.*)
+                        if ! check_gateway -4 "$gw"; then
+                            echo 'dylos: network setup failed'
+                            exit 0
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    done
+fi
+
+echo 'dylos: ready'
