@@ -263,15 +263,38 @@ impl Lab {
         Ok(lab)
     }
 
+    /// Maximum number of clones allowed in a single fork operation.
+    pub const MAX_CLONES: usize = 1024;
+
     /// Generates `count` deterministic clone identifiers formatted as `<prefix>-c1..cN`.
     ///
     /// # Errors
-    /// Returns an error if `count` is 0 or if any generated identifier exceeds maximum length or is invalid.
+    /// Returns an error if `count` is 0 or exceeds [`Self::MAX_CLONES`], or if any generated identifier exceeds maximum length or is invalid.
     pub fn generate_clone_ids(prefix: &str, count: usize) -> Result<Vec<String>> {
         if count == 0 {
             return Err(invalid(prefix, "clone count must be at least 1"));
         }
-        let mut ids = Vec::with_capacity(count);
+        if count > Self::MAX_CLONES {
+            return Err(invalid(
+                prefix,
+                &format!(
+                    "clone count {count} exceeds maximum allowed limit of {}",
+                    Self::MAX_CLONES
+                ),
+            ));
+        }
+        // Validate longest generated identifier first before allocating memory
+        let longest_id = format!("{prefix}-c{count}");
+        dylos_core::validate_name(&longest_id, 32)
+            .map_err(|reason| invalid(&longest_id, &format!("invalid clone id: {reason}")))?;
+
+        let mut ids = Vec::new();
+        ids.try_reserve(count).map_err(|e| {
+            invalid(
+                prefix,
+                &format!("failed to allocate memory for clone ids: {e}"),
+            )
+        })?;
         for i in 1..=count {
             let id = format!("{prefix}-c{i}");
             dylos_core::validate_name(&id, 32)
@@ -339,12 +362,26 @@ impl Lab {
         }
 
         if let Some(err) = first_error {
-            join_all(labs.into_iter().map(|mut lab| async move {
-                if let Err(cleanup_err) = lab.teardown().await {
-                    tracing::error!(lab = %lab.id(), error = %cleanup_err, "rollback teardown failed");
-                }
+            let mut cleanup_error = None;
+            let cleanup_results = join_all(labs.into_iter().map(|mut lab| async move {
+                let id = lab.id().to_string();
+                (id, lab.teardown().await)
             }))
             .await;
+            for (id, res) in cleanup_results {
+                if let Err(cleanup_err) = res {
+                    tracing::error!(lab = %id, error = %cleanup_err, "rollback teardown failed");
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(cleanup_err);
+                    }
+                }
+            }
+            if let Some(cleanup) = cleanup_error {
+                return Err(LabError::Rollback {
+                    operation: Box::new(err),
+                    cleanup: Box::new(cleanup),
+                });
+            }
             return Err(err);
         }
 
@@ -388,10 +425,13 @@ impl Lab {
                 )];
                 if restoring {
                     for name in ["vm.state", "vm.mem"] {
-                        files.push(ChrootFile::new(
-                            self.root().join("vms").join(&node.name).join(name),
-                            name,
-                        ));
+                        let path = self.root().join("vms").join(&node.name).join(name);
+                        let read_only = name == "vm.mem";
+                        files.push(if read_only {
+                            ChrootFile::read_only(path, name)
+                        } else {
+                            ChrootFile::new(path, name)
+                        });
                     }
                 } else {
                     files.push(ChrootFile::new(&config.kernel, "vmlinux.bin"));
