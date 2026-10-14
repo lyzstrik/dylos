@@ -67,6 +67,19 @@ pub enum ProcessState {
     Lost,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+}
+
+impl ExecOutput {
+    #[must_use]
+    pub fn success(&self) -> bool {
+        self.exit_code == 0
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Readiness {
     Pending,
@@ -84,6 +97,7 @@ enum Readiness {
 /// synchronously; a cgroup whose process is not reaped yet stays behind.
 pub struct Vm {
     paths: JailPaths,
+    node: String,
     client: FcClient,
     timeouts: Timeouts,
     signals: mpsc::UnboundedSender<Signal>,
@@ -97,6 +111,8 @@ pub struct Vm {
     readiness: watch::Receiver<Readiness>,
     boot_start: Instant,
     output_tasks_done: mpsc::Receiver<()>,
+    stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
+    lines_tx: tokio::sync::broadcast::Sender<String>,
 }
 
 impl Vm {
@@ -126,12 +142,12 @@ impl Vm {
                     spec.vcpu_count,
                     spec.mem_size_mib,
                 ))
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn();
-            let child = match child {
+            let mut child = match child {
                 Ok(child) => child,
                 Err(source) => {
                     if let Err(e) = jail.release().await {
@@ -144,7 +160,18 @@ impl Vm {
                     });
                 }
             };
-            let mut vm = Self::start(child, jail, spec.timeouts, boot_start);
+            let child_stdin = child
+                .stdin
+                .take()
+                .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
+            let mut vm = Self::start(
+                child,
+                jail,
+                spec.timeouts,
+                boot_start,
+                child_stdin,
+                spec.node.clone(),
+            );
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
                 vm.send_signal(Signal::SIGKILL);
@@ -160,7 +187,14 @@ impl Vm {
         .await
     }
 
-    fn start(mut child: Child, jail: Jail, timeouts: Timeouts, boot_start: Instant) -> Self {
+    fn start(
+        mut child: Child,
+        jail: Jail,
+        timeouts: Timeouts,
+        boot_start: Instant,
+        child_stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
+        node: String,
+    ) -> Self {
         let paths = jail.paths().clone();
         let pid = child.id();
         let mut tasks = Vec::new();
@@ -169,6 +203,7 @@ impl Vm {
         ));
         let (readiness_tx, readiness) = watch::channel(Readiness::Pending);
         let (done_tx, done_rx) = mpsc::channel(1);
+        let (lines_tx, _) = tokio::sync::broadcast::channel(2048);
         // Without `--log-path`, Firecracker logs to stdout; the jailer keeps our pipes since it
         // is not daemonized.
         if let Some(out) = child.stdout.take() {
@@ -179,6 +214,7 @@ impl Vm {
                     Arc::clone(&output),
                     readiness_tx.clone(),
                     done_tx.clone(),
+                    lines_tx.clone(),
                 )
                 .in_current_span(),
             ));
@@ -191,6 +227,7 @@ impl Vm {
                     Arc::clone(&output),
                     readiness_tx.clone(),
                     done_tx.clone(),
+                    lines_tx.clone(),
                 )
                 .in_current_span(),
             ));
@@ -210,6 +247,7 @@ impl Vm {
         Self {
             client: FcClient::new(paths.api_socket()),
             paths,
+            node,
             timeouts,
             signals,
             state,
@@ -222,6 +260,8 @@ impl Vm {
             readiness,
             boot_start,
             output_tasks_done: done_rx,
+            stdin: child_stdin,
+            lines_tx,
         }
     }
 
@@ -294,6 +334,107 @@ impl Vm {
     #[must_use]
     pub fn paths(&self) -> &JailPaths {
         &self.paths
+    }
+
+    #[must_use]
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// Executes a command inside the guest via the serial console shell.
+    ///
+    /// # Errors
+    /// Returns [`Error::ExecFailed`] if stdin is unavailable or the channel closes,
+    /// [`Error::ExecTimeout`] if the command does not complete within `timeout`, or
+    /// [`Error::Io`] if writing to stdin fails.
+    #[cfg(feature = "test-support")]
+    pub async fn exec(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tokio::io::AsyncWriteExt;
+
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+
+        let Some(stdin_mutex) = &self.stdin else {
+            return Err(Error::ExecFailed {
+                id: self.paths.id.clone(),
+                message: "guest stdin is not available".into(),
+            });
+        };
+
+        let mut stdin = stdin_mutex.lock().await;
+        let mut rx = self.lines_tx.subscribe();
+
+        let start_marker = format!("__DYLOS_START_{id}__");
+        let end_prefix = format!("__DYLOS_END_{id}__ ");
+
+        // We use printf with %s format substitutions so that terminal input echo
+        // does not produce the literal marker strings on their own line.
+        let payload = format!(
+            "printf '__DYLOS_%s__\\n' START_{id}; {{ {cmd} ; }}; printf '__DYLOS_%s__ %d\\n' END_{id} $?\n"
+        );
+
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| Error::Io {
+                id: self.paths.id.clone(),
+                op: "write to stdin",
+                path: PathBuf::from("stdin"),
+                source: e,
+            })?;
+        stdin.flush().await.map_err(|e| Error::Io {
+            id: self.paths.id.clone(),
+            op: "flush stdin",
+            path: PathBuf::from("stdin"),
+            source: e,
+        })?;
+
+        let wait_fut = async {
+            let mut seen_start = false;
+            let mut output_lines = Vec::new();
+            loop {
+                match rx.recv().await {
+                    Ok(line) => {
+                        let clean = line.trim_end_matches('\r');
+                        if !seen_start {
+                            if clean == start_marker {
+                                seen_start = true;
+                            }
+                            continue;
+                        }
+                        if let Some(rest) = clean.strip_prefix(&end_prefix) {
+                            let exit_code = rest.trim().parse::<i32>().unwrap_or(-1);
+                            return Ok(ExecOutput {
+                                exit_code,
+                                stdout: output_lines.join("\n"),
+                            });
+                        }
+                        output_lines.push(clean.to_string());
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            vm = %self.paths.id,
+                            skipped,
+                            "exec subscriber lagged behind console output"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(Error::ExecFailed {
+                            id: self.paths.id.clone(),
+                            message: "console output closed before command completed".into(),
+                        });
+                    }
+                }
+            }
+        };
+
+        tokio::time::timeout(timeout, wait_fut)
+            .await
+            .map_err(|_| Error::ExecTimeout {
+                id: self.paths.id.clone(),
+                timeout,
+            })?
     }
 
     /// Changes once, when the process exits for any reason. An exit that was not requested
@@ -583,12 +724,14 @@ async fn forward_lines(
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     readiness: watch::Sender<Readiness>,
     _done_tx: mpsc::Sender<()>,
+    lines_tx: tokio::sync::broadcast::Sender<String>,
 ) {
     let mut lines = BufReader::new(stream).lines();
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
-                let marker = match line.as_str() {
+                let trimmed = line.trim_end_matches('\r').to_string();
+                let marker = match trimmed.as_str() {
                     "dylos: ready" => Some(Readiness::Ready(Instant::now())),
                     "dylos: network setup failed" => Some(Readiness::Failed(Instant::now())),
                     _ => None,
@@ -603,14 +746,15 @@ async fn forward_lines(
                         }
                     });
                 }
-                tracing::info!(target: "dylos::firecracker", source, "{line}");
+                let _ = lines_tx.send(trimmed.clone());
+                tracing::info!(target: "dylos::firecracker", source, "{trimmed}");
                 let mut q = output
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if q.len() >= 20 {
                     q.pop_front();
                 }
-                q.push_back(line);
+                q.push_back(trimmed);
             }
             Ok(None) => break,
             Err(e) => {

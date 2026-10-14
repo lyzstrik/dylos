@@ -22,6 +22,7 @@ pub const ENTRY: &str = "fake_jailer_entry";
 pub enum Mode {
     /// Serves the API; exits 0 on `SendCtrlAltDel`, 7 after `FlushMetrics` if `crash_on_flush`.
     Serve,
+    Echo,
     CrashOnFlush,
     /// Answers `SendCtrlAltDel` but keeps running; dies on SIGTERM.
     IgnoreCtrlAltDel,
@@ -185,6 +186,7 @@ pub fn run_fake_jailer_if_requested() {
     std::process::exit(code);
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
     match mode {
@@ -202,9 +204,14 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         None
     };
     let listener = UnixListener::bind(&sock).unwrap();
-    if mode == "EarlyReadiness" {
+    if mode == "EarlyReadiness" || mode == "Echo" {
         println!("dylos: ready");
-        println!("early marker forwarded");
+        if mode == "EarlyReadiness" {
+            println!("early marker forwarded");
+        }
+    }
+    if mode == "Echo" {
+        spawn_echo_responder();
     }
     let mut stalled = Vec::new();
     loop {
@@ -265,7 +272,9 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             hold_stderr(sandbox).await;
             return 0;
         }
-        if request.contains("SendCtrlAltDel") && (mode == "Serve" || mode.starts_with("Lab")) {
+        if request.contains("SendCtrlAltDel")
+            && (mode == "Serve" || mode == "Echo" || mode.starts_with("Lab"))
+        {
             return 0;
         }
         if request.contains("FlushMetrics") {
@@ -484,4 +493,23 @@ fn normalize_lab_request(mode: &str, request: String) -> String {
     } else {
         request
     }
+}
+
+fn spawn_echo_responder() {
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines().map_while(Result::ok) {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .output();
+            if let Ok(out) = output {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(&out.stdout);
+                let _ = stdout.write_all(&out.stderr);
+                let _ = stdout.flush();
+            }
+        }
+    });
 }

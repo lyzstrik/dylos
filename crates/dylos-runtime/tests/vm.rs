@@ -426,3 +426,25 @@ async fn readiness_timeout_cleans_up() {
         Err(Error::ReadinessTimeout { .. })
     ));
 }
+
+#[tokio::test]
+async fn exec_runs_commands_and_returns_output_and_exit_code() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let out = vm
+        .exec("echo hello_world", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout.trim(), "hello_world");
+    assert!(out.success());
+
+    let out = vm
+        .exec("sh -c 'exit 42'", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 42);
+    assert!(!out.success());
+
+    vm.shutdown().await.unwrap();
+}

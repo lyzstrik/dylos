@@ -61,6 +61,10 @@ pub enum Error {
     ZeroMetricsPoll { id: String },
     #[error("VM {id}: process still alive {timeout:?} after SIGKILL")]
     KillTimeout { id: String, timeout: Duration },
+    #[error("VM {id}: exec failed: {message}")]
+    ExecFailed { id: String, message: String },
+    #[error("VM {id}: exec command timed out after {timeout:?}")]
+    ExecTimeout { id: String, timeout: Duration },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
