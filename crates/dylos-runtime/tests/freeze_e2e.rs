@@ -269,7 +269,14 @@ async fn abc_fabric_freeze_under_real_traffic() {
     }
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
-    jailer.jailer = bin.join("jailer");
+    // Keep expected TAP-down errors separate from serial command sentinels.
+    jailer.jailer = PathBuf::from("/bin/sh");
+    jailer.launcher_args = vec![
+        workspace
+            .join("crates/dylos-runtime/tests/fixtures/freeze-jailer.sh")
+            .into(),
+        bin.join("jailer").into(),
+    ];
     jailer.firecracker = bin.join("firecracker");
     let config = LabConfig {
         store: dylos_store::Store {
@@ -294,24 +301,6 @@ async fn abc_fabric_freeze_under_real_traffic() {
     let run = tokio::spawn(async move {
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(async {
-            // TAP-down errors otherwise interleave with the serial command sentinels.
-            for vm in lab.vms() {
-                let log = vm.paths().root.join("run/freeze.log");
-                tokio::fs::write(&log, b"").await.unwrap();
-                tokio::task::spawn_blocking(move || {
-                    nix::unistd::chown(&log, Some(nix::unistd::Uid::from_raw(65534)), None)
-                })
-                .await
-                .unwrap()
-                .unwrap();
-                vm.client()
-                    .put::<_, Value>(
-                        "/logger",
-                        &serde_json::json!({"log_path": "/run/freeze.log"}),
-                    )
-                    .await
-                    .unwrap();
-            }
             exercise(&mut lab, &namespace, "-6", "fd64:796c:6f73:2::2").await;
             exercise(&mut lab, &namespace, "-4", "10.0.2.2").await;
         })
