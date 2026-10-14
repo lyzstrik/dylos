@@ -23,7 +23,7 @@ jobs:
         working-directory: fuzz
         run: |
           rustup toolchain install nightly-2026-10-13 --profile minimal
-          cargo install --locked cargo-fuzz
+          cargo install --locked cargo-fuzz --version 0.13.2
       - name: Build harnesses
         run: just fuzz-check
       - name: Fuzz LabSpec

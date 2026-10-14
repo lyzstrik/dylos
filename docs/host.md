@@ -70,7 +70,7 @@ install -m 0755 actionlint ~/.local/bin/
 
 # fuzzing (independent of the stable workspace)
 rustup toolchain install nightly-2026-10-13 --profile minimal
-cargo install --locked cargo-fuzz
+cargo install --locked cargo-fuzz --version 0.13.2
 
 # zizmor
 cargo install --locked zizmor --version 1.30.1
