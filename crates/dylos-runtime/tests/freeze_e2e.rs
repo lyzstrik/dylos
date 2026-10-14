@@ -17,16 +17,34 @@ async fn guest(lab: &Lab, node: &str, command: &str) -> String {
     out.stdout
 }
 
+async fn guest_counter(lab: &Lab, node: &str, path: &str) -> u64 {
+    // Serial output can include asynchronous console messages alongside command output.
+    let output = guest(
+        lab,
+        node,
+        &format!("printf 'DYLOS_COUNTER=%s\\n' \"$(cat {path})\""),
+    )
+    .await;
+    let values: Vec<u64> = output
+        .lines()
+        .filter_map(|line| line.strip_prefix("DYLOS_COUNTER="))
+        .map(|value| value.parse().expect("invalid guest counter"))
+        .collect();
+    assert_eq!(values.len(), 1, "{node}: {path}: {output}");
+    values[0]
+}
+
 async fn guest_rx(lab: &Lab) -> Vec<u64> {
     let mut counters = Vec::new();
     for (node, interface) in [("A", "eth0"), ("B", "eth0"), ("B", "eth1"), ("C", "eth0")] {
-        let output = guest(
-            lab,
-            node,
-            &format!("cat /sys/class/net/{interface}/statistics/rx_packets"),
-        )
-        .await;
-        counters.push(output.trim().parse().unwrap());
+        counters.push(
+            guest_counter(
+                lab,
+                node,
+                &format!("/sys/class/net/{interface}/statistics/rx_packets"),
+            )
+            .await,
+        );
     }
     counters
 }
@@ -115,11 +133,7 @@ async fn hold_frozen(
     stable: &[u64],
 ) {
     // ICMP echo is originated only after T; background TCP also keeps retransmitting.
-    let tx_before: u64 = guest(lab, "A", "cat /sys/class/net/eth0/statistics/tx_packets")
-        .await
-        .trim()
-        .parse()
-        .unwrap();
+    let tx_before = guest_counter(lab, "A", "/sys/class/net/eth0/statistics/tx_packets").await;
     guest(lab, "A", &format!("sh -c 'rm -f /tmp/freeze-ping.status; (ping {family} -c 2 -W 1 {address} > /tmp/freeze-ping.log 2>&1; echo $? > /tmp/freeze-ping.status) &'")).await;
     marker(lab, family, address, "AFTER_T_HOLD").await;
     let held = Instant::now();
@@ -134,18 +148,14 @@ async fn hold_frozen(
                 .await
                 .unwrap();
             if out.exit_code == 0 {
-                break out.stdout;
+                break guest_counter(lab, "A", "/tmp/freeze-ping.status").await;
             }
         }
     })
     .await
     .unwrap();
-    assert_ne!(status.trim(), "0", "post-T echo received while frozen");
-    let tx_after: u64 = guest(lab, "A", "cat /sys/class/net/eth0/statistics/tx_packets")
-        .await
-        .trim()
-        .parse()
-        .unwrap();
+    assert_ne!(status, 0, "post-T echo received while frozen");
+    let tx_after = guest_counter(lab, "A", "/sys/class/net/eth0/statistics/tx_packets").await;
     assert!(
         tx_after > tx_before,
         "no post-T guest transmission observed"
