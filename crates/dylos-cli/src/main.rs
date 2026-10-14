@@ -9,7 +9,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
 use dylos_runtime::{Lab, LabConfig, LabError};
@@ -320,12 +320,13 @@ async fn lab_down(args: DownArgs) -> Result<()> {
 async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     validate_lab_id(&args.id)?;
     if let Some(ref snap_id) = args.snapshot_id {
-        dylos_core::validate_name(snap_id, 64)
+        dylos_core::validate_name(snap_id, 32)
             .map_err(|reason| anyhow!("invalid snapshot id '{snap_id}': {reason}"))?;
     }
 
     let config = build_config();
-    let timeout = Duration::from_secs(120);
+    // Total deadline gives 60s budget beyond the 120s Firecracker API snapshot deadline
+    let timeout = Duration::from_secs(180);
 
     let pinned = pin_control_socket(&config.store.base, &args.id);
     let socket_file = match pinned {
@@ -344,7 +345,17 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     let res = Lab::request_snapshot(&socket_path, args.snapshot_id.as_deref(), timeout).await;
     drop(socket_file);
 
-    let snap_id = res.with_context(|| format!("failed to snapshot lab '{}'", args.id))?;
+    let snap_id = match res {
+        Ok(id) => id,
+        Err(err) => {
+            if err.to_string().contains("timed out") || err.to_string().contains("TimedOut") {
+                bail!(
+                    "snapshot request timed out after {timeout:?}; supervisor outcome is unknown (do not assume rollback): {err}"
+                );
+            }
+            return Err(err).with_context(|| format!("failed to snapshot lab '{}'", args.id));
+        }
+    };
     println!("lab {} snapshotted successfully as {}", args.id, snap_id);
     Ok(())
 }
