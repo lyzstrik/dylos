@@ -68,6 +68,10 @@ host-check:
 e2e: host-check
     cargo xtask e2e
 
+# Build end-to-end test binaries without running them
+e2e-build:
+    cargo nextest run --workspace --run-ignored only --no-run --locked
+
 # Build guest images (rootfs) with rootless podman
 images:
     cargo xtask images

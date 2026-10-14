@@ -16,7 +16,7 @@ concurrency:
 jobs:
   E2E:
     name: E2E
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Verify and configure KVM
@@ -122,8 +122,9 @@ jobs:
         if: steps.cache-rootfs.outputs.cache-hit != 'true'
         run: just images
 
-      - name: Verify rootfs image
+      - name: Check rootfs checksum (informational)
         run: |
+          # Rootfs is not byte-reproducible across package mirror updates; this comparison is informational.
           EXPECTED_SHA="$(grep -E 'Rootfs SHA-256' docs/host.md | grep -oE '[a-fA-F0-9]{64}')"
           ACTUAL_SHA="$(sha256sum target/images/rootfs.ext4 | cut -d' ' -f1)"
           echo "Expected rootfs SHA-256: $EXPECTED_SHA"
@@ -135,7 +136,7 @@ jobs:
           fi
 
       - name: Precompile tests
-        run: cargo nextest run --workspace --run-ignored only --no-run
+        run: just e2e-build
 
       - name: Run end-to-end tests
         run: |
