@@ -18,7 +18,7 @@ RUN apk add --no-cache e2fsprogs \
     && mkdir -p /rootfs \
     && apk --root /rootfs --initdb --keys-dir /etc/apk/keys \
         --repositories-file /etc/apk/repositories add --no-cache \
-        alpine-base iperf3 socat iproute2 \
+        alpine-base iperf3 socat iproute2 python3 \
     && mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev /rootfs/sbin \
     && rm -f /rootfs/sbin/init \
     && : > /rootfs/var/log/apk.log
