@@ -81,12 +81,23 @@ impl LabNetwork {
         self.transition(true).await
     }
 
+    /// Returns a detached handle that can thaw the network from a background task or guard.
+    #[must_use]
+    pub fn thaw_handle(&self) -> FabricThawHandle {
+        FabricThawHandle {
+            plan: self.plan.clone(),
+            netns_path: self.netns_path.clone(),
+            ns: self.ns.clone(),
+            fabric_state: self.fabric_state.clone(),
+        }
+    }
+
     /// Restores pre-freeze TAP administrative states; also safe before freeze.
     ///
     /// # Errors
     /// Reports failed interfaces and rollback failures; retains recovery state for a retry.
     pub async fn thaw(&mut self) -> Result<(), Error> {
-        self.transition(false).await
+        self.thaw_handle().thaw().await
     }
 
     async fn transition(&self, frozen: bool) -> Result<(), Error> {
@@ -168,6 +179,57 @@ impl Drop for LabNetwork {
         if let Err(error) = spawned {
             warn!(lab = self.plan.lab_id(), %error, "lab network teardown on drop not started");
         }
+    }
+}
+
+/// Detached handle to thaw a frozen fabric, safe to use in background tasks or RAII guards.
+#[derive(Debug, Clone)]
+pub struct FabricThawHandle {
+    plan: FabricPlan,
+    netns_path: PathBuf,
+    ns: Option<Arc<File>>,
+    fabric_state: Arc<Mutex<crate::freeze::State>>,
+}
+
+impl FabricThawHandle {
+    /// Restores pre-freeze TAP administrative states.
+    ///
+    /// # Errors
+    /// Reports failed interfaces and rollback failures.
+    pub async fn thaw(&self) -> Result<(), Error> {
+        let ns = self.ns.clone().ok_or_else(|| Error::NetworkRemoved {
+            lab: self.plan.lab_id().to_owned(),
+        })?;
+        let (plan, path, state) = (
+            self.plan.clone(),
+            self.netns_path.clone(),
+            self.fabric_state.clone(),
+        );
+        let lab_id = plan.lab_id().to_owned();
+        let span = info_span!("fabric_step", lab = %lab_id, step = "thaw");
+        let mut state = state.lock_owned().await;
+        on_fresh_thread(&lab_id, move || {
+            let started = Instant::now();
+            let result = span.in_scope(|| {
+                if !netns::enter_file(plan.lab_id(), &ns, &path)? {
+                    return Err(Error::NetworkRemoved {
+                        lab: plan.lab_id().to_owned(),
+                    });
+                }
+                with_netlink(plan.lab_id(), async |handle| {
+                    crate::freeze::transition(&plan, handle, &mut state, false).await
+                })
+            });
+            span.in_scope(|| {
+                info!(
+                    elapsed_us = started.elapsed().as_micros(),
+                    success = result.is_ok(),
+                    "fabric step completed"
+                );
+            });
+            result
+        })
+        .await
     }
 }
 

@@ -23,6 +23,6 @@ mod plan;
 mod tap;
 
 pub use error::Error;
-pub use fabric::{LabNetwork, teardown};
+pub use fabric::{FabricThawHandle, LabNetwork, teardown};
 pub use netns::DEFAULT_NETNS_DIR;
 pub use plan::{Bridge, FabricPlan, IFNAME_MAX_LEN, Tap};
