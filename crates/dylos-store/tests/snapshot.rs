@@ -25,23 +25,23 @@ fn snapshot_create_raii_commit_and_remove() {
     // 1. RAII cleanup when not committed
     {
         let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
-        assert_eq!(snapshot.root(), store.base.join("snapshots/lab-1-snap-1"));
+        assert_eq!(snapshot.root(), store.base.join("snapshots/lab-1/snap-1"));
         assert!(snapshot.root().exists());
         assert!(snapshot.root().join("vms").exists());
         // Dropping without commit cleans up
     }
-    assert!(!store.base.join("snapshots/lab-1-snap-1").exists());
+    assert!(!store.base.join("snapshots/lab-1/snap-1").exists());
 
     // 2. Commit preserves snapshot
     {
         let mut snapshot = store.create_snapshot("lab-1", "snap-2").unwrap();
         snapshot.commit();
     }
-    assert!(store.base.join("snapshots/lab-1-snap-2").exists());
+    assert!(store.base.join("snapshots/lab-1/snap-2").exists());
 
     // 3. remove_snapshot cleans it up
     store.remove_snapshot("lab-1", "snap-2").unwrap();
-    assert!(!store.base.join("snapshots/lab-1-snap-2").exists());
+    assert!(!store.base.join("snapshots/lab-1/snap-2").exists());
 }
 
 #[test]
@@ -141,4 +141,97 @@ fn snapshot_rejects_invalid_ids() {
         assert!(store.remove_snapshot("lab", id).is_err());
         assert!(store.remove_snapshot(id, "snap").is_err());
     }
+}
+
+#[test]
+fn snapshot_unambiguous_identity_avoids_collisions() {
+    let (_temp, store, _spec) = setup();
+
+    // Create (lab="a-b", snapshot="c") and (lab="a", snapshot="b-c")
+    let mut snap1 = store.create_snapshot("a-b", "c").unwrap();
+    snap1.commit();
+
+    let mut snap2 = store.create_snapshot("a", "b-c").unwrap();
+    snap2.commit();
+
+    assert_eq!(snap1.root(), store.base.join("snapshots/a-b/c"));
+    assert_eq!(snap2.root(), store.base.join("snapshots/a/b-c"));
+    assert!(snap1.root().exists());
+    assert!(snap2.root().exists());
+
+    // Removing snap1 does not affect snap2
+    store.remove_snapshot("a-b", "c").unwrap();
+    assert!(!snap1.root().exists());
+    assert!(snap2.root().exists());
+
+    store.remove_snapshot("a", "b-c").unwrap();
+    assert!(!snap2.root().exists());
+}
+
+#[test]
+fn save_vm_file_rejects_symlink_source_without_outside_read() {
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let target = temp.path().join("secret_target.txt");
+    fs::write(&target, b"secret content").unwrap();
+
+    let symlink_path = temp.path().join("evil_symlink");
+    std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
+
+    let err = snapshot.save_vm_file(&symlink_path, "node1", "vm.state");
+    assert!(err.is_err(), "expected symlink to be rejected");
+
+    // Ensure target was not deleted or modified
+    assert_eq!(fs::read(&target).unwrap(), b"secret content");
+    assert!(!snapshot.root().join("vms/node1/vm.state").exists());
+}
+
+#[test]
+fn save_vm_file_rejects_ancestor_symlink() {
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let real_dir = temp.path().join("real_dir");
+    fs::create_dir(&real_dir).unwrap();
+    let file = real_dir.join("vm.state");
+    fs::write(&file, b"content").unwrap();
+
+    let symlink_dir = temp.path().join("symlink_dir");
+    std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
+
+    let err = snapshot.save_vm_file(&symlink_dir.join("vm.state"), "node1", "vm.state");
+    assert!(err.is_err(), "expected ancestor symlink to be rejected");
+}
+
+#[test]
+fn save_vm_file_rejects_fifo_without_hanging() {
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let fifo_path = temp.path().join("test_fifo");
+    nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+
+    let err = snapshot.save_vm_file(&fifo_path, "node1", "vm.state");
+    assert!(err.is_err(), "expected FIFO to be rejected");
+    assert!(!snapshot.root().join("vms/node1/vm.state").exists());
+}
+
+#[test]
+fn save_vm_file_fails_closed_on_exdev_without_copying() {
+    let (_temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let shm_dir = std::path::Path::new("/dev/shm");
+    if !shm_dir.exists() {
+        return;
+    }
+    let shm_file = shm_dir.join(format!("dylos-test-exdev-{}", std::process::id()));
+    fs::write(&shm_file, b"memory content on another device").unwrap();
+
+    let res = snapshot.save_vm_file(&shm_file, "node1", "vm.mem");
+    let _ = fs::remove_file(&shm_file);
+
+    assert!(res.is_err(), "expected EXDEV to fail closed");
+    assert!(!snapshot.root().join("vms/node1/vm.mem").exists());
 }

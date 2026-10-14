@@ -19,7 +19,7 @@ use dylos_core::manifest::{FileMeta, SnapshotManifest};
 use nix::{
     dir::Dir,
     errno::Errno,
-    fcntl::{OFlag, openat},
+    fcntl::{OFlag, openat, renameat},
     sys::stat::{Mode, mkdirat},
     unistd::{UnlinkatFlags, unlinkat},
 };
@@ -282,10 +282,11 @@ impl Snapshot {
         })
     }
 
-    /// Moves or copies a VM state or memory file into the snapshot directory.
+    /// Moves or reflinks a VM state or memory file into the snapshot directory.
     ///
     /// # Errors
-    /// Returns [`Error::Io`].
+    /// Returns [`Error::Io`] or [`Error::Reflink`].
+    #[allow(clippy::too_many_lines)]
     pub fn save_vm_file(
         &self,
         source_path: &Path,
@@ -294,28 +295,128 @@ impl Snapshot {
     ) -> Result<FileMeta, Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
+
+        // 1. Pin every ancestor of source_path
+        let source_parent = source_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let source_dir = directory(source_parent, false).map_err(|e| contextual(source_path, e))?;
+        let source_name = source_path
+            .file_name()
+            .ok_or_else(|| contextual(source_path, io::ErrorKind::InvalidInput.into()))?;
+
+        // 2. Open source no-follow and nonblocking
+        let source_file = open(
+            &source_dir,
+            source_name,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+        )
+        .map_err(|e| contextual(source_path, e))?;
+
+        // 3. Verify it is a regular file via descriptor
+        let source_meta = source_file
+            .metadata()
+            .map_err(|e| contextual(source_path, e))?;
+        if !source_meta.is_file() {
+            return Err(contextual(
+                source_path,
+                io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file"),
+            ));
+        }
+
+        // 4. Open/create destination vm directory
         let vms = open(&self.directory, "vms".as_ref(), dirs())
             .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let _vm_dir = match open(&vms, node.as_ref(), dirs()) {
+        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
             Ok(dir) => dir,
             Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
                 .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
             Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
         };
 
+        // 5. Exclusively create destination file
         let dest_path = self.root.join("vms").join(node).join(file_name);
-        if let Err(e) = std::fs::rename(source_path, &dest_path) {
-            if e.raw_os_error() == Some(libc::EXDEV) {
-                std::fs::copy(source_path, &dest_path).map_err(|e| contextual(&dest_path, e))?;
-                let _ = std::fs::remove_file(source_path);
-            } else {
-                return Err(contextual(&dest_path, e));
-            }
+        let dest_file = open(
+            &vm_dir,
+            file_name.as_ref(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        )
+        .map_err(|e| contextual(&dest_path, e))?;
+
+        let dest_meta = dest_file
+            .metadata()
+            .map_err(|e| contextual(&dest_path, e))?;
+
+        // 6. Check for cross-device: fail closed on EXDEV, NEVER copy!
+        if source_meta.dev() != dest_meta.dev() {
+            let _ = unlinkat(&vm_dir, file_name, UnlinkatFlags::NoRemoveDir);
+            return Err(contextual(
+                source_path,
+                io::Error::from_raw_os_error(libc::EXDEV),
+            ));
         }
 
-        let file = File::open(&dest_path).map_err(|e| contextual(&dest_path, e))?;
-        let (sha256, size) =
-            compute_file_sha256_and_size(&file).map_err(|e| contextual(&dest_path, e))?;
+        // 7. Reflink source into dest_file; if reflink is unsupported on the same device, renameat.
+        let verified_dest_file = match reflink(&source_file, &dest_file) {
+            Ok(()) => {
+                unlinkat(&source_dir, source_name, UnlinkatFlags::NoRemoveDir).map_err(|e| {
+                    Error::Io {
+                        path: source_path.into(),
+                        source: e.into(),
+                    }
+                })?;
+                dest_file
+            }
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+                ) =>
+            {
+                // Fall back to renameat on the same device without copying
+                drop(dest_file);
+                let _ = unlinkat(&vm_dir, file_name, UnlinkatFlags::NoRemoveDir);
+                renameat(
+                    &source_dir,
+                    Path::new(source_name),
+                    &vm_dir,
+                    Path::new(file_name),
+                )
+                .map_err(|e| contextual(&dest_path, e.into()))?;
+                let file = open(
+                    &vm_dir,
+                    file_name.as_ref(),
+                    OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+                )
+                .map_err(|e| contextual(&dest_path, e))?;
+                if !file
+                    .metadata()
+                    .map_err(|e| contextual(&dest_path, e))?
+                    .is_file()
+                {
+                    return Err(contextual(
+                        &dest_path,
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "destination is not a regular file",
+                        ),
+                    ));
+                }
+                file
+            }
+            Err(err) => {
+                let _ = unlinkat(&vm_dir, file_name, UnlinkatFlags::NoRemoveDir);
+                return Err(Error::Reflink {
+                    path: dest_path.clone(),
+                    source: err,
+                });
+            }
+        };
+
+        // 8. Compute sha256 and size from the verified destination descriptor
+        let (sha256, size) = compute_file_sha256_and_size(&verified_dest_file)
+            .map_err(|e| contextual(&dest_path, e))?;
 
         Ok(FileMeta {
             path: PathBuf::from(format!("vms/{node}/{file_name}")),
@@ -324,22 +425,32 @@ impl Snapshot {
         })
     }
 
-    /// Writes the snapshot manifest to `manifest.json`.
+    /// Writes the snapshot manifest to `manifest.json` atomically.
     ///
     /// # Errors
     /// Returns [`Error::Io`] or [`Error::Spec`].
     pub fn write_manifest(&self, manifest: &SnapshotManifest) -> Result<(), Error> {
         let json = manifest.to_json_string_pretty()?;
         let manifest_path = self.manifest_path();
+        let tmp_name = "manifest.json.tmp";
+        let tmp_path = self.root.join(tmp_name);
         let mut file = open(
             &self.directory,
-            "manifest.json".as_ref(),
+            tmp_name.as_ref(),
             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
         )
-        .map_err(|e| contextual(&manifest_path, e))?;
+        .map_err(|e| contextual(&tmp_path, e))?;
         file.write_all(json.as_bytes())
-            .map_err(|e| contextual(&manifest_path, e))?;
-        file.sync_all().map_err(|e| contextual(&manifest_path, e))?;
+            .map_err(|e| contextual(&tmp_path, e))?;
+        file.sync_all().map_err(|e| contextual(&tmp_path, e))?;
+        drop(file);
+        renameat(
+            &self.directory,
+            Path::new(tmp_name),
+            &self.directory,
+            Path::new("manifest.json"),
+        )
+        .map_err(|e| contextual(&manifest_path, e.into()))?;
         Ok(())
     }
 
@@ -354,8 +465,7 @@ impl Snapshot {
     /// Returns [`Error::Io`] if removal fails.
     pub fn remove(&mut self) -> Result<(), Error> {
         if self.owned {
-            let name = Store::snapshot_name(&self.lab_id, &self.id);
-            remove_owned(&self.parent, &self.directory, &name)
+            remove_owned(&self.parent, &self.directory, &self.id)
                 .map_err(|e| contextual(&self.root, e))?;
             self.owned = false;
         }
@@ -479,14 +589,12 @@ impl Store {
 
     #[must_use]
     pub fn snapshot_name(lab_id: &str, snapshot_id: &str) -> String {
-        format!("{lab_id}-{snapshot_id}")
+        format!("{lab_id}/{snapshot_id}")
     }
 
     #[must_use]
     pub fn snapshot_dir(&self, lab_id: &str, snapshot_id: &str) -> PathBuf {
-        self.base
-            .join("snapshots")
-            .join(Self::snapshot_name(lab_id, snapshot_id))
+        self.base.join("snapshots").join(lab_id).join(snapshot_id)
     }
 
     /// Creates a snapshot directory layout exclusively.
@@ -496,19 +604,28 @@ impl Store {
     pub fn create_snapshot(&self, lab_id: &str, snapshot_id: &str) -> Result<Snapshot, Error> {
         valid_id(lab_id)?;
         valid_id(snapshot_id)?;
-        let name = Self::snapshot_name(lab_id, snapshot_id);
         let snapshots_base = self.base.join("snapshots");
-        let parent =
+        let snapshots_parent =
             directory(&snapshots_base, true).map_err(|e| contextual(&snapshots_base, e))?;
-        let root = snapshots_base.join(&name);
 
-        mkdirat(&parent, name.as_str(), Mode::from_bits_truncate(0o700))
+        let lab_dir = match open(&snapshots_parent, lab_id.as_ref(), dirs()) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                make_directory(&snapshots_parent, lab_id)
+                    .map_err(|e| contextual(&snapshots_base.join(lab_id), e))?
+            }
+            Err(e) => return Err(contextual(&snapshots_base.join(lab_id), e)),
+        };
+
+        let root = self.snapshot_dir(lab_id, snapshot_id);
+
+        mkdirat(&lab_dir, snapshot_id, Mode::from_bits_truncate(0o700))
             .map_err(|e| contextual(&root, e.into()))?;
 
-        let pinned = match open(&parent, name.as_ref(), dirs()) {
+        let pinned = match open(&lab_dir, snapshot_id.as_ref(), dirs()) {
             Ok(file) => file,
             Err(error) => {
-                unlinkat(&parent, name.as_str(), UnlinkatFlags::RemoveDir)
+                unlinkat(&lab_dir, snapshot_id, UnlinkatFlags::RemoveDir)
                     .map_err(|e| contextual(&root, e.into()))?;
                 return Err(contextual(&root, error));
             }
@@ -516,7 +633,7 @@ impl Store {
 
         let mut snapshot = Snapshot {
             root,
-            parent,
+            parent: lab_dir,
             directory: pinned,
             lab_id: lab_id.into(),
             id: snapshot_id.into(),
@@ -524,7 +641,9 @@ impl Store {
         };
 
         if let Err(err) = make_directory(&snapshot.directory, "vms") {
-            let _ = snapshot.remove();
+            if let Err(remove_err) = snapshot.remove() {
+                tracing::error!(%remove_err, "failed to clean up snapshot after vms directory failure");
+            }
             return Err(contextual(&snapshot.root.join("vms"), err));
         }
 
@@ -538,15 +657,15 @@ impl Store {
     pub fn remove_snapshot(&self, lab_id: &str, snapshot_id: &str) -> Result<(), Error> {
         valid_id(lab_id)?;
         valid_id(snapshot_id)?;
-        let name = Self::snapshot_name(lab_id, snapshot_id);
-        let snapshots_base = self.base.join("snapshots");
+        let snap_path = self.snapshot_dir(lab_id, snapshot_id);
+        let lab_base = self.base.join("snapshots").join(lab_id);
         let result = (|| {
-            let parent = directory(&snapshots_base, false)?;
-            remove_entry(&parent, name.as_ref())
+            let parent = directory(&lab_base, false)?;
+            remove_entry(&parent, snapshot_id.as_ref())
         })();
         match result {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other.map_err(|e| contextual(&snapshots_base.join(name), e)),
+            other => other.map_err(|e| contextual(&snap_path, e)),
         }
     }
 }
@@ -555,7 +674,7 @@ fn compute_file_sha256_and_size(file: &File) -> io::Result<(String, u64)> {
     let mut reader = file.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 16 * 1024];
+    let mut buffer = vec![0u8; 1024 * 1024];
     let mut total_size = 0u64;
     loop {
         let n = match reader.read(&mut buffer) {
@@ -586,7 +705,11 @@ fn make_directory(parent: &File, name: &str) -> io::Result<File> {
     open(parent, name.as_ref(), dirs())
 }
 // Pin every ancestor; O_NOFOLLOW on only the final component would still allow escape.
-fn directory(path: &Path, create: bool) -> io::Result<File> {
+/// Safely opens a directory by pinning every ancestor with `O_NOFOLLOW`.
+///
+/// # Errors
+/// Returns [`std::io::Error`] if any component cannot be opened or is not a directory.
+pub fn directory(path: &Path, create: bool) -> io::Result<File> {
     let mut parent = File::open(if path.is_absolute() { "/" } else { "." })?;
     for component in path.components() {
         let name = match component {
