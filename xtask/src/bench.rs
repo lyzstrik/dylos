@@ -570,8 +570,8 @@ pub(crate) fn setup_private_bench_dir(parent_dir: &Path) -> anyhow::Result<PathB
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let run_name = format!("bench-run-{}-{}", std::process::id(), timestamp);
+        .map_or(0, |d| (d.as_millis() % 1_000_000) as u64);
+    let run_name = format!("r{}-{}", std::process::id(), timestamp);
     let run_dir = parent_dir.join(run_name);
 
     fs::create_dir(&run_dir).with_context(|| {
@@ -625,7 +625,7 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
     let parent_dir = options
         .tmp_dir
         .clone()
-        .unwrap_or_else(|| workspace.join("target/bench-run"));
+        .unwrap_or_else(|| workspace.join("target/b"));
 
     let parent_dir_setup = parent_dir.clone();
     let bench_dir = tokio::task::spawn_blocking(move || setup_private_bench_dir(&parent_dir_setup))
@@ -668,9 +668,9 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
     );
     println!("================================================================================\n");
 
-    let jail_dir = bench_dir.join("jails");
-    let store_dir = bench_dir.join("labs");
-    let netns_dir = bench_dir.join("netns");
+    let jail_dir = bench_dir.join("j");
+    let store_dir = bench_dir.join("s");
+    let netns_dir = bench_dir.join("n");
     let j_dir = jail_dir.clone();
     let s_dir = store_dir.clone();
     let n_dir = netns_dir.clone();
@@ -706,7 +706,7 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
         println!("--- [1/3] Benchmarking Cold Boot Time (5 VMs, 256 MiB each) ---");
         let mut cold_boot_ms = MetricSamples::new();
         for rep in 1..=options.repetitions {
-            let lab_id = format!("bench-boot-{rep}");
+            let lab_id = format!("b-boot-{rep}");
             let start = Instant::now();
             let mut lab = Lab::up_with(&lab_config, &prereqs.spec, &lab_id)
                 .await
@@ -728,7 +728,7 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
 
         // 2. Snapshot Measurements (Freeze duration, Pause skew, Total snapshot duration)
         println!("--- [2/3] Benchmarking Snapshot Timings (Freeze, Pause Skew, Total Duration) ---");
-        let source_lab_id = "bench-source";
+        let source_lab_id = "b-src";
         let mut source_lab = Lab::up_with(&lab_config, &prereqs.spec, source_lab_id)
             .await
             .context("failed to start source lab for snapshot benchmarking")?;
@@ -1574,6 +1574,20 @@ mod tests {
         assert!(parent.exists());
         assert!(sentinel.exists());
 
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn test_directory_path_length_fits_sun_len() {
+        let parent = std::env::temp_dir().join(format!("dylos-b-{}", std::process::id()));
+        let child = setup_private_bench_dir(&parent).unwrap();
+        let sock_path = child.join("s/b-boot-1/control.sock");
+        assert!(
+            sock_path.as_os_str().len() < 108,
+            "socket path exceeds SUN_LEN (108): {}",
+            sock_path.display()
+        );
+        cleanup_private_bench_dir(&child).unwrap();
         let _ = fs::remove_dir_all(&parent);
     }
 }
