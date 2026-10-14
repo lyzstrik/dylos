@@ -334,6 +334,72 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         if check_lab_request(mode, sandbox, &sock, &request, &mut stream).await {
             continue;
         }
+        if request.starts_with("PUT /snapshot/load ") {
+            let root = sock.parent().unwrap().parent().unwrap();
+            assert!(request.contains("\"backend_type\":\"File\""));
+            assert!(request.contains("\"resume_vm\":false"));
+            let netns = std::fs::read_to_string(root.join("netns-arg")).unwrap();
+            let output = std::process::Command::new("nsenter")
+                .arg(format!("--net={netns}"))
+                .args(["ip", "-j", "link", "show"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            for link in links
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["ifname"] != "lo")
+            {
+                assert!(
+                    !link["flags"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|flag| flag == "UP"),
+                    "fabric was up during load: {link}"
+                );
+            }
+            std::fs::write(root.join("load-done"), b"").unwrap();
+        }
+        if request.starts_with("PATCH /vm ") && request.contains("Resumed") {
+            let root = sock.parent().unwrap().parent().unwrap();
+            if root.join("load-done").exists() {
+                let jail = root.parent().unwrap();
+                let prefix = jail
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .rsplit_once('-')
+                    .unwrap()
+                    .0;
+                for node in ["A", "B", "C"] {
+                    assert!(
+                        jail.parent()
+                            .unwrap()
+                            .join(format!("{prefix}-{node}/root/load-done"))
+                            .exists(),
+                        "resume before every load"
+                    );
+                }
+            }
+        }
+        if let Ok(stage) = std::fs::read_to_string(sandbox.join("fail-restore")) {
+            let fail = stage == "load" && request.starts_with("PUT /snapshot/load ")
+                || stage == "resume"
+                    && request.starts_with("PATCH /vm ")
+                    && request.contains("Resumed");
+            if fail {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                continue;
+            }
+        }
         if request.contains("InstanceStart") {
             if mode == "LabReady" || mode == "LabPartialLaunch" || mode == "LabCrashOnFlush" {
                 println!("dylos: ready");

@@ -316,3 +316,22 @@ fn check_signal_rollback(wait_for_signal: bool) {
         assert!(!store.join("signal-lab/control.sock").exists());
     }
 }
+
+#[test]
+fn restore_command_requires_snapshot_and_rejects_invalid_id() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_status(&run(dir.path(), &["lab", "restore"]), false, "<SNAPSHOT>");
+    assert_status(
+        &run(
+            dir.path(),
+            &["lab", "restore", "missing", "--id", "../escape"],
+        ),
+        false,
+        "invalid lab id",
+    );
+    assert_status(
+        &run(dir.path(), &["lab", "restore", "--help"]),
+        true,
+        "--id",
+    );
+}
