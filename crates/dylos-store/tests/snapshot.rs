@@ -317,16 +317,80 @@ fn save_vm_file_cleanup_error_propagation() {
     let shm_file = shm_dir.join(format!("dylos-test-cleanup-{}", std::process::id()));
     fs::write(&shm_file, b"content").unwrap();
 
-    // Create vms/node1 directory and make it read-only so unlinkat fails on error unwind
     let vm_dir = snapshot.root().join("vms/node1");
-    fs::create_dir_all(&vm_dir).unwrap();
-    let dest = vm_dir.join("vm.mem");
-    fs::write(&dest, b"").unwrap();
-    fs::set_permissions(&vm_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let vm_dir_for_hook = vm_dir.clone();
 
-    let res = snapshot.save_vm_file(&shm_file, "node1", "vm.mem", 1024 * 1024);
+    let res = snapshot.save_vm_file_with_hooks(
+        &shm_file,
+        "node1",
+        "vm.mem",
+        1024 * 1024,
+        dylos_store::SaveVmHooks {
+            before_cleanup: Some(Box::new(move || {
+                // Make vm_dir read-only immediately before cleanup_dest runs
+                let _ = fs::set_permissions(&vm_dir_for_hook, fs::Permissions::from_mode(0o555));
+            })),
+            ..Default::default()
+        },
+    );
     let _ = fs::set_permissions(&vm_dir, fs::Permissions::from_mode(0o755));
     let _ = fs::remove_file(&shm_file);
 
-    assert!(res.is_err(), "expected failure");
+    let err = res.expect_err("expected failure with EXDEV and cleanup error");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("Invalid cross-device link") || err_msg.contains("cross-device"),
+        "expected EXDEV primary error, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("additionally"),
+        "expected cleanup cause to be joined, got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Permission denied"),
+        "expected cleanup cause Permission denied, got: {err_msg}"
+    );
+}
+
+#[test]
+fn save_vm_file_bounded_rejection_on_file_growth_with_copy_fallback() {
+    use std::io::Write;
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let source = temp.path().join("grow.state");
+    // Start with 100 bytes (within bound of 200 bytes)
+    fs::write(&source, vec![b'x'; 100]).unwrap();
+
+    let source_clone = source.clone();
+    let res = snapshot.save_vm_file_with_hooks(
+        &source,
+        "node1",
+        "vm.state",
+        200,
+        dylos_store::SaveVmHooks {
+            after_open: Some(Box::new(move || {
+                // Deterministically grow the file after initial metadata check to exceed 200 bytes
+                let mut f = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source_clone)
+                    .unwrap();
+                f.write_all(&vec![b'y'; 300]).unwrap();
+            })),
+            force_copy: true,
+            ..Default::default()
+        },
+    );
+
+    let err = res.expect_err("expected bounded copy rejection");
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("exceeded maximum allowed bound of 200 bytes"),
+        "expected bounded rejection, got: {err_msg}"
+    );
+    let dest = snapshot.root().join("vms/node1/vm.state");
+    assert!(
+        !dest.exists(),
+        "destination must be cleaned up after bounded rejection"
+    );
 }

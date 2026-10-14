@@ -187,6 +187,15 @@ pub struct DiskCloneTimings {
     pub hash_ms: u64,
 }
 
+/// Test hooks for `save_vm_file_with_hooks`.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct SaveVmHooks {
+    pub after_open: Option<Box<dyn FnOnce()>>,
+    pub before_cleanup: Option<Box<dyn FnOnce()>>,
+    pub force_copy: bool,
+}
+
 impl Snapshot {
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -335,10 +344,13 @@ impl Snapshot {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<(FileMeta, u64), Error> {
-        let t_start = Instant::now();
-        let meta = self.save_vm_file(source_path, node, file_name, max_bytes)?;
-        let hash_ms = u64::try_from(t_start.elapsed().as_millis()).unwrap_or(0);
-        Ok((meta, hash_ms))
+        self.save_vm_file_impl(
+            source_path,
+            node,
+            file_name,
+            max_bytes,
+            SaveVmHooks::default(),
+        )
     }
 
     /// Moves or reflinks a VM state or memory file into the snapshot directory.
@@ -352,7 +364,14 @@ impl Snapshot {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(source_path, node, file_name, max_bytes, None)
+        self.save_vm_file_impl(
+            source_path,
+            node,
+            file_name,
+            max_bytes,
+            SaveVmHooks::default(),
+        )
+        .map(|(meta, _)| meta)
     }
 
     /// Moves or reflinks a VM file with an optional test hook called immediately after opening source.
@@ -371,8 +390,27 @@ impl Snapshot {
             node,
             file_name,
             max_bytes,
-            Some(Box::new(after_open)),
+            SaveVmHooks {
+                after_open: Some(Box::new(after_open)),
+                ..Default::default()
+            },
         )
+        .map(|(meta, _)| meta)
+    }
+
+    /// Moves or reflinks a VM file with test hooks for error injection and copy fallback.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn save_vm_file_with_hooks(
+        &self,
+        source_path: &Path,
+        node: &str,
+        file_name: &str,
+        max_bytes: u64,
+        hooks: SaveVmHooks,
+    ) -> Result<FileMeta, Error> {
+        self.save_vm_file_impl(source_path, node, file_name, max_bytes, hooks)
+            .map(|(meta, _)| meta)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -382,8 +420,8 @@ impl Snapshot {
         node: &str,
         file_name: &str,
         max_bytes: u64,
-        after_open: Option<Box<dyn FnOnce()>>,
-    ) -> Result<FileMeta, Error> {
+        mut hooks: SaveVmHooks,
+    ) -> Result<(FileMeta, u64), Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
 
@@ -429,7 +467,7 @@ impl Snapshot {
             ));
         }
 
-        if let Some(hook) = after_open {
+        if let Some(hook) = hooks.after_open.take() {
             hook();
         }
 
@@ -458,7 +496,12 @@ impl Snapshot {
 
         // 6. Check for cross-device: fail closed on EXDEV, NEVER copy!
         if source_meta.dev() != dest_meta.dev() {
-            let cleanup_err = cleanup_dest(&vm_dir, file_name, &dest_path);
+            let cleanup_err = {
+                if let Some(hook) = hooks.before_cleanup.take() {
+                    hook();
+                }
+                cleanup_dest(&vm_dir, file_name, &dest_path)
+            };
             let mut err = io::Error::from_raw_os_error(libc::EXDEV);
             if let Err(c_err) = cleanup_err {
                 err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
@@ -468,7 +511,15 @@ impl Snapshot {
 
         // 7. Reflink source into dest_file; if reflink is unsupported on the same device,
         // copy from the already verified descriptor into the new exclusively created destination.
-        let verified_dest_file = match reflink(&source_file, &dest_file) {
+        let skip_reflink = hooks.force_copy;
+
+        let reflink_res = if skip_reflink {
+            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+        } else {
+            reflink(&source_file, &dest_file)
+        };
+
+        let verified_dest_file = match reflink_res {
             Ok(()) => {
                 safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
                     Error::Io {
@@ -485,7 +536,12 @@ impl Snapshot {
                 ) =>
             {
                 if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
-                    let cleanup_err = cleanup_dest(&vm_dir, file_name, &dest_path);
+                    let cleanup_err = {
+                        if let Some(hook) = hooks.before_cleanup.take() {
+                            hook();
+                        }
+                        cleanup_dest(&vm_dir, file_name, &dest_path)
+                    };
                     let mut err = copy_err;
                     if let Err(c_err) = cleanup_err {
                         err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
@@ -501,7 +557,12 @@ impl Snapshot {
                 dest_file
             }
             Err(err) => {
-                let cleanup_err = cleanup_dest(&vm_dir, file_name, &dest_path);
+                let cleanup_err = {
+                    if let Some(hook) = hooks.before_cleanup.take() {
+                        hook();
+                    }
+                    cleanup_dest(&vm_dir, file_name, &dest_path)
+                };
                 if let Err(c_err) = cleanup_err {
                     return Err(contextual(
                         &dest_path,
@@ -516,14 +577,19 @@ impl Snapshot {
         };
 
         // 8. Compute sha256 and size from the verified destination descriptor with bounded read
+        let t_hash = Instant::now();
         let (sha256, size) = compute_file_sha256_and_size(&verified_dest_file, max_bytes)
             .map_err(|e| contextual(&dest_path, e))?;
+        let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
 
-        Ok(FileMeta {
-            path: PathBuf::from(format!("vms/{node}/{file_name}")),
-            sha256,
-            size,
-        })
+        Ok((
+            FileMeta {
+                path: PathBuf::from(format!("vms/{node}/{file_name}")),
+                sha256,
+                size,
+            },
+            hash_ms,
+        ))
     }
 
     /// Writes the snapshot manifest to `manifest.json` atomically.

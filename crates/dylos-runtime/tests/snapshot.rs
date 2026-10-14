@@ -206,6 +206,7 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
         .output()
         .expect("failed to run nsenter");
     let link_out_thawed = String::from_utf8_lossy(&output_thawed.stdout);
+    let mut found_taps = 0;
     for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
         for line in link_out_thawed.lines() {
             if line.contains(tap) {
@@ -213,9 +214,14 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
                     line.contains("UP"),
                     "TAP device {tap} must be UP after thaw, got: {line}"
                 );
+                found_taps += 1;
             }
         }
     }
+    assert_eq!(
+        found_taps, 3,
+        "all 3 TAP devices must be verified present and UP after thaw"
+    );
 
     let snap_dir = store.snapshot_dir("ls-net", "snap-net");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
@@ -564,7 +570,14 @@ async fn snapshot_in_flight_cancellation_during_pause() {
         } => {}
     }
 
-    // Release stall so background recovery can complete VM resume
+    // HOLD OPERATION PENDING: Assert resume cannot overtake in-flight pause
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !sandbox.dir.path().join(format!("{vm_id}.resumed")).exists(),
+        "resume must not overtake pending pause"
+    );
+
+    // Release stall so background task can complete VM resume
     let _ = fs::remove_file(vm0_root.join("stall-pause"));
 
     wait_until(
@@ -583,7 +596,7 @@ async fn snapshot_in_flight_cancellation_during_pause() {
 
 #[tokio::test]
 async fn snapshot_in_flight_cancellation_during_capture() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lca").await;
+    let (sandbox, _store, _spec, mut lab) = setup_lab("lca").await;
     let vm0_root = lab.vms()[0].paths().root.clone();
     let vm_id = lab.vms()[0].paths().id.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
@@ -598,7 +611,14 @@ async fn snapshot_in_flight_cancellation_during_capture() {
         } => {}
     }
 
-    // Release stall so in-flight API request completes and background recovery finishes
+    // HOLD OPERATION PENDING: Assert resume cannot overtake in-flight capture
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !sandbox.dir.path().join(format!("{vm_id}.resumed")).exists(),
+        "resume must not overtake pending capture"
+    );
+
+    // Release stall so in-flight API request completes and background finishes
     let _ = fs::remove_file(vm0_root.join("stall-snapshot"));
 
     wait_until(
@@ -609,7 +629,49 @@ async fn snapshot_in_flight_cancellation_during_capture() {
                 && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
                 && !vm0_root.join("vm.state").exists()
                 && !vm0_root.join("vm.mem").exists()
-                && !store.snapshot_dir("lca", "snap-cancel-cap").exists()
+        },
+    )
+    .await;
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_in_flight_cancellation_during_storage() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("lcs").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    let vm_id = lab.vms()[0].paths().id.clone();
+    fs::write(vm0_root.join("stall-storage"), b"").unwrap();
+
+    tokio::select! {
+        _ = lab.snapshot("snap-cancel-storage") => {}
+        () = async {
+            wait_until("storage started", Duration::from_secs(5), || {
+                vm0_root.join("storage-started").exists()
+            })
+            .await;
+        } => {}
+    }
+
+    // HOLD OPERATION PENDING: Assert resume cannot overtake in-flight storage
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !sandbox.dir.path().join(format!("{vm_id}.resumed")).exists(),
+        "resume must not overtake pending storage"
+    );
+
+    // Release stall so storage completes
+    let _ = fs::remove_file(vm0_root.join("stall-storage"));
+
+    wait_until(
+        "VM is resumed after storage cancellation",
+        Duration::from_secs(5),
+        || {
+            !vm0_root.join("is-paused").exists()
+                && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
+                && !vm0_root.join("vm.state").exists()
+                && !vm0_root.join("vm.mem").exists()
         },
     )
     .await;
@@ -620,13 +682,143 @@ async fn snapshot_in_flight_cancellation_during_capture() {
 
 #[tokio::test]
 async fn snapshot_in_flight_cancellation_during_freeze() {
-    let (sandbox, _store, _spec, mut lab) = setup_lab("lcf").await;
-
-    {
-        let mut guard = dylos_runtime::snapshot::SnapshotLifecycleGuard::new(&mut lab);
-        guard.freeze().await.unwrap();
-        // Guard dropped while frozen without pause! Recovery thaws network and succeeds.
+    if !sandboxed("snapshot_in_flight_cancellation_during_freeze") {
+        return;
     }
+    let (sandbox, _store, spec, mut lab) = setup_lab("lcf").await;
+
+    let netns_dir = sandbox.dir.path().join("netns");
+    fs::create_dir_all(&netns_dir).unwrap();
+    let plan = dylos_net::FabricPlan::new("lcf", &spec).unwrap();
+    let network = dylos_net::LabNetwork::create(plan, &netns_dir, 0, 0)
+        .await
+        .unwrap();
+    let netns_path = network.netns_path().to_path_buf();
+    lab.set_network(network);
+
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-pause"), b"").unwrap();
+
+    tokio::select! {
+        _ = lab.snapshot("snap-cancel-freeze") => {}
+        () = async {
+            wait_until("pause reached after freeze", Duration::from_secs(5), || {
+                vm0_root.join("pause-started").exists()
+            })
+            .await;
+        } => {}
+    }
+
+    // HOLD OPERATION PENDING: during freeze and stalled pause, TAPs must be DOWN
+    let output = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "show",
+        ])
+        .output()
+        .expect("failed to run nsenter");
+    let link_out = String::from_utf8_lossy(&output.stdout);
+    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        assert!(
+            link_out.contains(tap),
+            "expected TAP interface {tap} in netns"
+        );
+        for line in link_out.lines() {
+            if line.contains(tap) {
+                assert!(
+                    !line.contains(",UP") && !line.contains("<UP,"),
+                    "TAP device {tap} must be DOWN during freeze barrier, got: {line}"
+                );
+            }
+        }
+    }
+
+    // Release stall so background completes and thaws
+    let _ = fs::remove_file(vm0_root.join("stall-pause"));
+
+    wait_until(
+        "VM is resumed after freeze/pause cancellation",
+        Duration::from_secs(5),
+        || !vm0_root.join("is-paused").exists(),
+    )
+    .await;
+
+    lab.wait_for_active_snapshot().await;
+
+    // After completion, TAPs must be UP
+    let output_thawed = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "show",
+        ])
+        .output()
+        .expect("failed to run nsenter");
+    let link_out_thawed = String::from_utf8_lossy(&output_thawed.stdout);
+    let mut found_taps = 0;
+    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        for line in link_out_thawed.lines() {
+            if line.contains(tap) {
+                assert!(
+                    line.contains("UP"),
+                    "TAP device {tap} must be UP after thaw, got: {line}"
+                );
+                found_taps += 1;
+            }
+        }
+    }
+    assert_eq!(
+        found_taps, 3,
+        "all 3 TAP devices must be verified UP after thaw"
+    );
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_panic_during_capture_recovers_cleanly() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("lpan").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("panic-snapshot"), b"").unwrap();
+
+    dylos_runtime::snapshot::set_snapshot_test_hook(|stage, root| {
+        assert!(
+            !(stage == "api_snapshot" && root.join("panic-snapshot").exists()),
+            "injected panic during firecracker api snapshot"
+        );
+    });
+
+    let err = lab.snapshot("snap-panic").await.unwrap_err();
+    dylos_runtime::snapshot::clear_snapshot_test_hook();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("panicked"),
+        "expected panic error message, got: {err_str}"
+    );
+
+    // Verify VMs are resumed and not left paused
+    assert!(
+        !vm0_root.join("is-paused").exists(),
+        "VM must be resumed after panic recovery"
+    );
+    // Verify no leftover jail snapshot files
+    assert!(
+        !vm0_root.join("vm.state").exists(),
+        "vm.state must be cleaned up on panic"
+    );
+    assert!(
+        !vm0_root.join("vm.mem").exists(),
+        "vm.mem must be cleaned up on panic"
+    );
+    // Verify partial snapshot is removed
+    assert!(
+        !store.snapshot_dir("lpan", "snap-panic").exists(),
+        "partial snapshot must be removed after panic recovery"
+    );
 
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();

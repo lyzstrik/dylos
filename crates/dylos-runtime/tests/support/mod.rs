@@ -246,8 +246,28 @@ async fn parallel_pause_reply(
             stream.shutdown().await.unwrap();
             return true;
         }
-        if action == "resumed" && root.join("is-paused").exists() {
-            std::fs::remove_file(root.join("is-paused")).unwrap();
+        if action == "resumed" {
+            if root.join("is-paused").exists() {
+                std::fs::remove_file(root.join("is-paused")).unwrap();
+            }
+            let jail = root.parent().unwrap();
+            let parent = jail.parent().unwrap();
+            let own_id = jail.file_name().unwrap().to_str().unwrap();
+            if let Some((prefix, _)) = own_id.rsplit_once('-') {
+                let any_captured = ["A", "B", "C"].iter().any(|node| {
+                    let r = parent.join(format!("{prefix}-{node}/root"));
+                    r.join("capture-done").exists() || r.join("snapshot-started").exists()
+                });
+                if any_captured {
+                    for node in ["A", "B", "C"] {
+                        let r = parent.join(format!("{prefix}-{node}/root"));
+                        assert!(
+                            r.join("capture-done").exists(),
+                            "barrier violation: VM resumed before capture finished for {node}"
+                        );
+                    }
+                }
+            }
         }
     }
     false
@@ -353,6 +373,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             }
             std::fs::write(root.join("vm.state"), b"fake vm state content").unwrap();
             std::fs::write(root.join("vm.mem"), b"fake vm memory content").unwrap();
+            std::fs::write(root.join("capture-done"), b"").unwrap();
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
                 .await

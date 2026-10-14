@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dylos_core::{LabSpec, guest_net};
@@ -100,6 +101,7 @@ pub struct Lab {
     lock: Option<Flock<File>>,
     span: tracing::Span,
     cleanup_on_drop: bool,
+    active_snapshot: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Lab {
@@ -122,6 +124,7 @@ impl Lab {
             lock: None,
             span: tracing::info_span!("lab", lab = id),
             cleanup_on_drop: false,
+            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -145,6 +148,7 @@ impl Lab {
             lock: None,
             span: tracing::info_span!("lab", lab = id),
             cleanup_on_drop: false,
+            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -180,6 +184,7 @@ impl Lab {
                 lock: None,
                 span: span.clone(),
                 cleanup_on_drop: true,
+                active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
             };
             let result = lab.bring_up(config, spec, plan).await;
             if let Err(operation) = result {
@@ -376,6 +381,34 @@ impl Lab {
         crate::snapshot::snapshot_lab_with_timings(self, snapshot_id).await
     }
 
+    /// Checks if a snapshot task is currently running on this lab.
+    #[must_use]
+    pub fn has_active_snapshot(&self) -> bool {
+        match self.active_snapshot.try_lock() {
+            Ok(guard) => guard.is_some(),
+            Err(_) => true,
+        }
+    }
+
+    /// Returns a reference to the active snapshot tracker.
+    #[must_use]
+    pub fn active_snapshot_tracker(
+        &self,
+    ) -> Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> {
+        Arc::clone(&self.active_snapshot)
+    }
+
+    /// Waits for any in-flight snapshot task to complete and cleans the tracker.
+    pub async fn wait_for_active_snapshot(&mut self) {
+        let handle = {
+            let mut lock = self.active_snapshot.lock().await;
+            lock.take()
+        };
+        if let Some(handle) = handle {
+            let _ = handle.await;
+        }
+    }
+
     /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
     /// # Errors
     /// Reports socket, VM exit, and cleanup failures. A response is sent only after cleanup.
@@ -510,6 +543,7 @@ impl Lab {
     /// # Errors
     /// Cleanup failures preserve remaining owned resources for a retry.
     pub async fn teardown(&mut self) -> Result<()> {
+        self.wait_for_active_snapshot().await;
         async {
             let started = Instant::now();
             complete(
@@ -922,6 +956,7 @@ impl Drop for Lab {
                 lock: self.lock.take(),
                 span: self.span.clone(),
                 cleanup_on_drop: false,
+                active_snapshot: Arc::clone(&self.active_snapshot),
             };
             runtime.spawn(async move {
                 if let Err(error) = owned.teardown().await {
