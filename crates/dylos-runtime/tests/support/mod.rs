@@ -683,3 +683,148 @@ fn normalize_lab_request(mode: &str, request: String) -> String {
         request
     }
 }
+
+/// Verifies the output of a read-only `e2fsck -fn` invocation on a recovered cloned filesystem.
+///
+/// In ext4, per-CPU counters (`s_freeclusters_counter` and `s_freeinodes_counter`) track
+/// free blocks and inodes in host memory for concurrent allocation performance. Accurate
+/// counts are written to block group descriptors on disk, but the global superblock-wide
+/// summary counters (`s_free_blocks_count` and `s_free_inodes_count`) are only synchronized
+/// on disk during a clean unmount or periodic flush (see Documentation/filesystems/ext4/
+/// and kernel `fs/ext4/super.c`). When a VM disk is snapshotted while mounted under write activity,
+/// the superblock summary counters may disagree with the sum of group descriptors.
+///
+/// During `e2fsck` pass 5 ("Checking group summary information"):
+/// - Discrepancies in block group descriptors or bitmaps indicate structural corruption
+///   (e.g., "Free blocks count wrong for group #<g>...", "Block bitmap differences...").
+///   These are NEVER allowed and immediately cause verification failure.
+/// - The global superblock-level summary counters:
+///   - "Free blocks count wrong (%b, counted=%c)."
+///   - "Free inodes count wrong (%i, counted=%j)."
+///
+///   are expected after crash-consistent snapshots. When running with `-n` (read-only, answer 'no'),
+///   e2fsck follows each with the prompt:
+///   - "Fix? no"
+///
+///   These two superblock summary diagnostics are the ONLY allowlisted mismatches.
+///
+/// Any other diagnostic, warning, pass error, group-descriptor discrepancy, or non-zero exit status
+/// results in an error.
+pub fn verify_e2fsck_readonly_output(output: &str, exit_code: Option<i32>) -> Result<(), String> {
+    if exit_code != Some(0) {
+        return Err(format!(
+            "e2fsck exited with non-zero status: {exit_code:?}\nOutput:\n{output}"
+        ));
+    }
+
+    let mut pending_allowlisted_fix = false;
+
+    for (lineno, raw_line) in output.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        if pending_allowlisted_fix {
+            if is_fix_no_prompt(line) {
+                pending_allowlisted_fix = false;
+                continue;
+            }
+            return Err(format!(
+                "line {}: expected 'Fix? no' after allowlisted superblock counter mismatch, got: {line:?}",
+                lineno + 1
+            ));
+        }
+
+        // Standard benign e2fsck banners and progress lines
+        if line.starts_with("e2fsck ")
+            || line.starts_with("Using EXT2FS Library")
+            || line.starts_with("Pass 1: Checking inodes, blocks, and sizes")
+            || line.starts_with("Pass 2: Checking directory structure")
+            || line.starts_with("Pass 3: Checking directory connectivity")
+            || line.starts_with("Pass 4: Checking reference counts")
+            || line.starts_with("Pass 5: Checking group summary information")
+        {
+            continue;
+        }
+
+        // Filesystem summary or journal recovery notification
+        if (line.contains(": ") && line.contains(" files") && line.ends_with(" blocks"))
+            || line.contains(": recovering journal")
+        {
+            continue;
+        }
+
+        // Allowlisted superblock summary counter mismatches:
+        // "Free blocks count wrong (%b, counted=%c)."
+        // "Free inodes count wrong (%i, counted=%j)."
+        if is_superblock_free_blocks_count_wrong(line)
+            || is_superblock_free_inodes_count_wrong(line)
+        {
+            pending_allowlisted_fix = true;
+            continue;
+        }
+
+        // Any other line is an unallowlisted problem or diagnostic
+        return Err(format!(
+            "line {}: unallowlisted e2fsck diagnostic or error: {line:?}",
+            lineno + 1
+        ));
+    }
+
+    if pending_allowlisted_fix {
+        return Err(
+            "trailing allowlisted counter mismatch without subsequent 'Fix? no' prompt".into(),
+        );
+    }
+
+    Ok(())
+}
+
+fn is_superblock_free_blocks_count_wrong(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Free blocks count wrong (") else {
+        return false;
+    };
+    parse_counter_tuple(rest)
+}
+
+fn is_superblock_free_inodes_count_wrong(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("Free inodes count wrong (") else {
+        return false;
+    };
+    parse_counter_tuple(rest)
+}
+
+fn parse_counter_tuple(rest: &str) -> bool {
+    let Some(rest) = rest.strip_suffix(").") else {
+        return false;
+    };
+    let Some((actual, counted_part)) = rest.split_once(", counted=") else {
+        return false;
+    };
+    !actual.is_empty()
+        && actual.chars().all(|c| c.is_ascii_digit())
+        && !counted_part.is_empty()
+        && counted_part.chars().all(|c| c.is_ascii_digit())
+}
+
+fn is_fix_no_prompt(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == "Fix? no" {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix("Fix") {
+        if let Some(after_q) = rest.strip_prefix("? no") {
+            return after_q.is_empty();
+        }
+        if let Some(bracket_end) = rest.find(">?") {
+            let num = &rest[1..bracket_end];
+            let after_q = rest[bracket_end + 2..].trim_start();
+            return rest.starts_with('<')
+                && !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit())
+                && after_q == "no";
+        }
+    }
+    false
+}
