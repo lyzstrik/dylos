@@ -210,8 +210,8 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             println!("early marker forwarded");
         }
     }
-    if mode == "Echo" {
-        spawn_echo_responder();
+    if mode == "Echo" || mode.starts_with("Lab") {
+        spawn_echo_responder(mode);
     }
     let mut stalled = Vec::new();
     loop {
@@ -495,14 +495,20 @@ fn normalize_lab_request(mode: &str, request: String) -> String {
     }
 }
 
-fn spawn_echo_responder() {
+fn spawn_echo_responder(mode: &str) {
+    let mode = mode.to_string();
     std::thread::spawn(move || {
         use std::io::{BufRead, Write};
         let stdin = std::io::stdin();
         for line in stdin.lock().lines().map_while(Result::ok) {
+            let cmd = if mode.starts_with("Lab") && line.contains("ping ") {
+                line.replace("ping ", ": ")
+            } else {
+                line
+            };
             let output = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(&line)
+                .arg(&cmd)
                 .output();
             if let Ok(out) = output {
                 let mut stdout = std::io::stdout().lock();

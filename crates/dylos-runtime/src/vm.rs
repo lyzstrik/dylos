@@ -361,6 +361,8 @@ impl Vm {
 
     #[cfg(feature = "test-support")]
     const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
+    #[cfg(feature = "test-support")]
+    const MAX_EXEC_OUTPUT_LINES: usize = 1000;
 
     #[cfg(feature = "test-support")]
     fn random_nonce() -> u64 {
@@ -419,6 +421,25 @@ impl Vm {
                                 && trimmed_prefix != "$"
                                 && !trimmed_prefix.ends_with("/ #")
                             {
+                                let line_cost = prefix.len() + 1;
+                                if output_lines.len() >= Self::MAX_EXEC_OUTPUT_LINES {
+                                    return Err(Error::ExecFailed {
+                                        id: self.paths.id.clone(),
+                                        message: format!(
+                                            "exec output exceeded limit of {} lines",
+                                            Self::MAX_EXEC_OUTPUT_LINES
+                                        ),
+                                    });
+                                }
+                                if total_bytes + line_cost > Self::MAX_EXEC_OUTPUT_BYTES {
+                                    return Err(Error::ExecFailed {
+                                        id: self.paths.id.clone(),
+                                        message: format!(
+                                            "exec output exceeded budget of {} bytes",
+                                            Self::MAX_EXEC_OUTPUT_BYTES
+                                        ),
+                                    });
+                                }
                                 output_lines.push(prefix.to_string());
                             }
                             return Ok(ExecOutput {
@@ -432,7 +453,17 @@ impl Vm {
                         });
                     }
 
-                    if total_bytes + clean.len() > Self::MAX_EXEC_OUTPUT_BYTES {
+                    let line_cost = clean.len() + 1;
+                    if output_lines.len() >= Self::MAX_EXEC_OUTPUT_LINES {
+                        return Err(Error::ExecFailed {
+                            id: self.paths.id.clone(),
+                            message: format!(
+                                "exec output exceeded limit of {} lines",
+                                Self::MAX_EXEC_OUTPUT_LINES
+                            ),
+                        });
+                    }
+                    if total_bytes + line_cost > Self::MAX_EXEC_OUTPUT_BYTES {
                         return Err(Error::ExecFailed {
                             id: self.paths.id.clone(),
                             message: format!(
@@ -441,7 +472,7 @@ impl Vm {
                             ),
                         });
                     }
-                    total_bytes += clean.len();
+                    total_bytes += line_cost;
                     output_lines.push(clean.to_string());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

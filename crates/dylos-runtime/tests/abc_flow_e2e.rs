@@ -545,23 +545,31 @@ async fn guest_with_unusable_connectivity_reports_not_ready() {
     let lab_id = "fail-connectivity-e2e";
     let root = config.store.base.join(lab_id);
     let netns = config.netns_dir.join(format!("dylos-{lab_id}"));
-    let jail_paths = JailPaths::new(&config.jailer, lab_id, "A").unwrap();
+    let jail_paths_a = JailPaths::new(&config.jailer, lab_id, "A").unwrap();
+    let jail_paths_b = JailPaths::new(&config.jailer, lab_id, "B").unwrap();
+    let jail_paths_c = JailPaths::new(&config.jailer, lab_id, "C").unwrap();
 
     let test_result = std::panic::AssertUnwindSafe(async {
-        // Guest network setup succeeds in assigning IP addresses and routes,
-        // but gateway ping fails during readiness check. Lab::up_with must fail
-        // with ReadinessFailed and automatically roll back host resources.
+        // Gateways are reachable from each node, but across-lab connectivity
+        // (A to C through B) is broken due to missing return route on C.
+        // Lab::up_with must fail readiness verification with ReadinessFailed
+        // and automatically roll back host resources.
         let res = Lab::up_with(&config, &spec, lab_id).await;
         match res {
             Err(LabError::Vm(Error::ReadinessFailed { line, .. })) => {
-                assert_eq!(line, "dylos: network setup failed");
+                assert!(
+                    line.contains("across-lab connectivity probe failed"),
+                    "Expected across-lab probe failure, got: {line}"
+                );
             }
             Ok(mut lab) => {
                 let _ = lab.teardown().await;
-                panic!("Lab::up_with unexpectedly succeeded despite unreachable gateway");
+                panic!(
+                    "Lab::up_with unexpectedly succeeded despite broken across-lab connectivity"
+                );
             }
             Err(err) => {
-                panic!("Expected ReadinessFailed from unreachable gateway, got: {err:?}");
+                panic!("Expected ReadinessFailed from broken connectivity, got: {err:?}");
             }
         }
     })
@@ -574,16 +582,18 @@ async fn guest_with_unusable_connectivity_reports_not_ready() {
         "Network namespace was not cleaned up: {netns:?}"
     );
     assert!(!root.exists(), "Storage root was not cleaned up: {root:?}");
-    assert!(
-        !jail_paths.jail_dir.exists(),
-        "Jail directory was not cleaned up: {:?}",
-        jail_paths.jail_dir
-    );
-    assert!(
-        !jail_paths.cgroup_dir.exists(),
-        "Cgroup directory was not cleaned up: {:?}",
-        jail_paths.cgroup_dir
-    );
+    for jp in [&jail_paths_a, &jail_paths_b, &jail_paths_c] {
+        assert!(
+            !jp.jail_dir.exists(),
+            "Jail directory was not cleaned up: {:?}",
+            jp.jail_dir
+        );
+        assert!(
+            !jp.cgroup_dir.exists(),
+            "Cgroup directory was not cleaned up: {:?}",
+            jp.cgroup_dir
+        );
+    }
 
     if let Err(payload) = test_result {
         std::panic::resume_unwind(payload);

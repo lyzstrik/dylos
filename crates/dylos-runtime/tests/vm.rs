@@ -496,6 +496,38 @@ async fn exec_fails_when_output_exceeds_budget() {
 }
 
 #[tokio::test]
+async fn exec_fails_when_blank_lines_exceed_limit() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // Blank lines charge the line limit and budget, preventing unbounded accumulator growth
+    let res = vm
+        .exec("yes '' | head -n 1200", Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(res, Err(Error::ExecFailed { ref message, .. }) if message.contains("exceeded limit of 1000 lines")),
+        "Expected limit error on blank line flood, got: {res:?}"
+    );
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_fails_when_many_short_lines_exceed_limit() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // Short lines charge both per-line separators and the line limit
+    let res = vm
+        .exec("yes a | head -n 1200", Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(res, Err(Error::ExecFailed { ref message, .. }) if message.contains("exceeded limit of 1000 lines")),
+        "Expected limit error on short line flood, got: {res:?}"
+    );
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn exec_rejects_forged_markers() {
     let sandbox = Sandbox::new(Mode::Echo);
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
