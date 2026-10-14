@@ -69,40 +69,51 @@ async fn wait_for_rx(lab: &Lab, before: u64) {
     .expect("existing TCP stream did not make progress");
 }
 
-async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) {
-    guest(lab, "C", "iperf3 -s -D").await;
-    guest(lab, "A", &format!("ping {family} -c 1 -W 2 {address}")).await;
-    guest(lab, "A", &format!("sh -c 'iperf3 {family} -c {address} -P 4 -t 90 > /tmp/freeze-iperf.log 2>&1 & echo $! > /tmp/freeze-iperf.pid'")).await;
-    wait_for_rx(lab, guest_rx(lab).await[3]).await;
-    lab.network_mut().unwrap().freeze().await.unwrap();
-    let frozen_at = Instant::now();
-    let initial = guest_rx(lab).await;
-    let taps = tap_rx(namespace).await;
+async fn marker(lab: &Lab, family: &str, address: &str, tag: &str) {
+    let version = family.trim_start_matches('-');
+    let destination = if family == "-6" {
+        format!("[{address}]")
+    } else {
+        address.to_owned()
+    };
+    guest(
+        lab,
+        "A",
+        &format!("printf '%s\\n' {tag} | socat -u - UDP{version}-SENDTO:{destination}:55254"),
+    )
+    .await;
+}
 
-    // Pre-T TAP queues are allowed to drain. Observe this separately from the quiet window.
-    let stable = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut previous = initial.clone();
-        let mut since = Instant::now();
+async fn wait_marker(lab: &Lab, family: &str, address: &str, tag: &str) {
+    tokio::time::timeout(COMMAND_TIMEOUT, async {
         loop {
-            let current = guest_rx(lab).await;
-            assert_eq!(tap_rx(namespace).await, taps, "post-T TAP ingress");
-            if current != previous {
-                since = Instant::now();
-                previous = current;
-            } else if since.elapsed() >= Duration::from_millis(200) {
-                break previous;
+            marker(lab, family, address, tag).await;
+            if lab
+                .exec(
+                    "C",
+                    &format!("grep -q {tag} /tmp/freeze-markers"),
+                    COMMAND_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .success()
+            {
+                break;
             }
         }
     })
     .await
-    .expect("pre-T RX did not settle");
-    eprintln!(
-        "{family}: freeze to settled RX {:?}; pre-T guest RX delta {:?} -> {:?}",
-        frozen_at.elapsed(),
-        initial,
-        stable
-    );
+    .expect("UDP marker receiver did not respond");
+}
 
+async fn hold_frozen(
+    lab: &Lab,
+    namespace: &Path,
+    family: &str,
+    address: &str,
+    taps: &[u64],
+    stable: &[u64],
+) {
     // ICMP echo is originated only after T; background TCP also keeps retransmitting.
     let tx_before: u64 = guest(lab, "A", "cat /sys/class/net/eth0/statistics/tx_packets")
         .await
@@ -110,6 +121,7 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
         .parse()
         .unwrap();
     guest(lab, "A", &format!("sh -c 'rm -f /tmp/freeze-ping.status; (ping {family} -c 2 -W 1 {address} > /tmp/freeze-ping.log 2>&1; echo $? > /tmp/freeze-ping.status) &'")).await;
+    marker(lab, family, address, "AFTER_T_HOLD").await;
     let held = Instant::now();
     while held.elapsed() < Duration::from_secs(2) {
         assert_eq!(guest_rx(lab).await, stable, "guest RX during frozen hold");
@@ -142,9 +154,51 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     eprintln!(
         "{family}: post-T guest TX {tx_before} -> {tx_after}; frozen TAP RX {taps:?}; settled guest RX {stable:?}"
     );
+}
+
+async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) {
+    let version = family.trim_start_matches('-');
+    guest(lab, "C", &format!("sh -c 'socat -u UDP{version}-RECV:55254 - > /tmp/freeze-markers 2>/tmp/freeze-socat.log & echo $! > /tmp/freeze-socat.pid'")).await;
+    wait_marker(lab, family, address, "BEFORE_T").await;
+    guest(lab, "C", "iperf3 -s -D").await;
+    guest(lab, "A", &format!("ping {family} -c 1 -W 2 {address}")).await;
+    guest(lab, "A", &format!("sh -c 'iperf3 {family} -c {address} -P 4 -t 90 > /tmp/freeze-iperf.log 2>&1 & echo $! > /tmp/freeze-iperf.pid'")).await;
+    wait_for_rx(lab, guest_rx(lab).await[3]).await;
+    lab.network_mut().unwrap().freeze().await.unwrap();
+    let frozen_at = Instant::now();
+    marker(lab, family, address, "AFTER_T_EARLY").await;
+    let initial = guest_rx(lab).await;
+    let taps = tap_rx(namespace).await;
+
+    // Pre-T TAP queues are allowed to drain. Observe this separately from the quiet window.
+    let stable = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut previous = initial.clone();
+        let mut since = Instant::now();
+        loop {
+            let current = guest_rx(lab).await;
+            assert_eq!(tap_rx(namespace).await, taps, "post-T TAP ingress");
+            if current != previous {
+                since = Instant::now();
+                previous = current;
+            } else if since.elapsed() >= Duration::from_millis(200) {
+                break previous;
+            }
+        }
+    })
+    .await
+    .expect("pre-T RX did not settle");
+    eprintln!(
+        "{family}: freeze to settled RX {:?}; pre-T guest RX delta {:?} -> {:?}",
+        frozen_at.elapsed(),
+        initial,
+        stable
+    );
+
+    hold_frozen(lab, namespace, family, address, &taps, &stable).await;
 
     // Exercise pause skew with A and B running; guest counters become readable on resume.
     lab.vm("C").unwrap().client().pause().await.unwrap();
+    marker(lab, family, address, "AFTER_T_PAUSED").await;
     let probe = lab
         .exec(
             "A",
@@ -161,10 +215,13 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
         stable,
         "RX changed across receiver pause"
     );
+    guest(lab, "C", "! grep -q AFTER_T /tmp/freeze-markers").await;
     lab.network_mut().unwrap().thaw().await.unwrap();
     wait_for_rx(lab, stable[3]).await;
+    wait_marker(lab, family, address, "THAW").await;
     guest(lab, "A", "kill -0 $(cat /tmp/freeze-iperf.pid)").await;
     guest(lab, "A", "kill $(cat /tmp/freeze-iperf.pid)").await;
+    guest(lab, "C", "kill $(cat /tmp/freeze-socat.pid)").await;
     guest(lab, "C", "pkill iperf3").await;
     eprintln!(
         "{family}: unchanged TAP/guest RX during 2 s hold and receiver pause; original TCP flow resumed"

@@ -1,5 +1,5 @@
 ADR-0001 / LYZ-54 observations and limits:
-- Observed: IPv6 then IPv4 heavy TCP A -> C through B, all four TAP RX and guest interface RX counters unchanged during a two-second settled hold; post-T ICMP probes fail; receiver pause/resume does not change guest RX; existing TCP resumes after thaw.
+- Observed: IPv6 then IPv4 heavy TCP A -> C through B, all four TAP RX and guest interface RX counters unchanged during a two-second settled hold; tagged UDP probes sent immediately after T, during hold, and while paused never reach C before thaw; post-T ICMP probes fail; receiver pause/resume does not change guest RX; existing TCP resumes after thaw.
 - Pre-T captured RX / Net::prepare_save: NOT OBSERVABLE. Aggregate guest RX deltas during settling cannot identify individual pre-T frames or deferred RX; no snapshot preparation is invoked.
 - Post-T captured memory / virtio RX while paused: NOT OBSERVABLE directly. TAP counters and guest RX across resume are evidence of isolation, not inspection of virtio rings or guest-backed deferred RX buffers.
 - TX completion versus serialization: NOT OBSERVABLE. No sender snapshot is created; counters cannot establish that a descriptor completion is serialized rather than pending for replay.
