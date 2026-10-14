@@ -295,7 +295,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                 "add",
                 "fd64:796c:6f73:1::fe/64",
                 "dev",
-                "dylos-left",
+                "br-left",
                 "nodad",
             ])
             .output()
@@ -314,7 +314,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                 "add",
                 "10.0.1.254/24",
                 "dev",
-                "dylos-left",
+                "br-left",
             ])
             .output()
             .await
@@ -338,7 +338,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                     "-W",
                     "1",
                     "-I",
-                    "dylos-left",
+                    "br-left",
                     "fd64:796c:6f73:1::2",
                 ])
                 .output()
@@ -369,7 +369,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                     "-W",
                     "1",
                     "-I",
-                    "dylos-left",
+                    "br-left",
                     "10.0.1.2",
                 ])
                 .output()
