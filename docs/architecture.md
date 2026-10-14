@@ -73,3 +73,22 @@ state before snapshot and after restore. Both pre-existing IPv6 and IPv4 TCP
 connections must retain their endpoints and make further progress. This probes
 timer recovery for established streaming connections, not every TCP timeout
 policy or external peers.
+
+Observed on the Ubuntu 24.04 KVM CI runner with Firecracker 1.17.0
+([E2E run](https://github.com/lyzstrik/dylos/actions/runs/38621523007)):
+the pre-snapshot to post-resync wall-clock samples advanced 120.278 seconds
+(including snapshot work and the deliberate 30-second wait), while monotonic
+and boot-time samples advanced 2.292 seconds each. Both clocks remained
+nondecreasing, but did not account for the host's elapsed downtime. Restored
+applications must therefore not interpret monotonic elapsed time as elapsed
+host wall time. Wall time satisfied the 100 ms bound against both host sampling
+endpoints after resync.
+
+Before snapshot, the sampled IPv6 data socket had a retransmission timer with
+4 ms remaining and zero retransmissions. After restore, both IPv6 and IPv4
+data sockets showed retransmission timers with 892 ms remaining and three
+retransmissions. Their original endpoints survived and both streams subsequently
+progressed. This is evidence of retransmission recovery despite lost fabric
+traffic, consistent with guest timer progression following guest monotonic time
+rather than the stepped wall clock; it is not a measurement of every timer's
+exact remaining deadline at the snapshot cut.
