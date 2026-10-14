@@ -1,0 +1,48 @@
+name: Bug Report
+description: File a bug report for Dylos
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please verify host prerequisites against `docs/host.md` before filing a bug report.
+        For security issues, report privately through [GitHub Private Vulnerability Reporting](https://github.com/lyzstrik/dylos/security/advisories/new).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the unexpected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What you expected to happen instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Steps to reproduce the issue, including exact commands and LabSpec configuration.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Host and software versions.
+      value: |
+        - Host kernel:
+        - Firecracker version:
+        - Dylos commit:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output or tracing logs.
+      render: text

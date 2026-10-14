@@ -1,11 +1,13 @@
 # Dylos
 
-Dylos is an engine for realistic multi-machine environments that can be snapshotted and forked consistently.
-It runs networks of [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs, freezes them at a single logical instant, and clones them N times. Every clone resumes as if nothing had happened.
+[![CI](https://github.com/lyzstrik/dylos/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lyzstrik/dylos/actions/workflows/ci.yml)
+
+Dylos is an engine for realistic multi-machine environments whose goal is consistent snapshot, fork, and transparent clone resumption.
+It aims to run networks of [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs, freeze them at a single logical instant, and clone them N times so that every clone resumes as if nothing had happened.
 
 ## Status
 
-Technical spike. There is no usable code yet.
+Technical spike. `dylos lab up` and `dylos lab down` work for the reference `A -- B -- C` lab (`labs/abc.yaml`). Snapshot and fork are not implemented yet.
 
 The spike must prove that a network of microVMs can be snapshotted consistently and forked quickly. Reference topology: `A -- B -- C`, with B acting as a Linux router between two segments, extended to 5 VMs for measurements.
 
@@ -21,7 +23,7 @@ Out of scope for now: web UI, multi-host, Windows guests, eBPF, public API.
 
 ## How consistency works
 
-The network fabric is frozen before the VMs are paused. No frame can be delivered after the cut; frames in flight are dropped, which Ethernet allows and TCP recovers from by retransmitting. Each clone is then restored into its own network namespace, so clones can reuse the same addresses without conflicting.
+The network fabric is frozen before the VMs are paused. Under the revised freeze contract ([ADR-0001](docs/adr/0001-consistency-by-fabric-freeze.md)), "no frame sent after freeze completion (T) is received by a lab VM before thaw". Frames queued host-side before freeze completion (pre-T) may still be received during the freeze, and captured RX state survives in clones. Frames still host-side at capture are omitted from clones, which use fresh TAP devices in a separate network namespace. Ethernet allows packet loss, and TCP recovers by retransmitting. Capture boundaries, Firecracker device buffers (including deferred RX in `Net::prepare_save`), and the freeze implementation remain unverified on the pinned host with real microVMs. Each clone is then restored into its own network namespace, so clones can reuse the same addresses without conflicting.
 
 ## Planned layout
 
@@ -46,13 +48,16 @@ xtask/            Build and test tooling
 Check the host with:
 
 ```bash
-scripts/host-check.sh
+just host-check
 ```
 
 ## Contributing
 
-Work is tracked as `LYZ-xx` issues in Linear. Every change, including documentation, goes through a pull request against `main`.
-Read [`AGENTS.md`](AGENTS.md) before contributing; it applies to humans and AI agents alike. Reviews follow [`docs/agents/review.md`](docs/agents/review.md).
+Work is tracked as `LYZ-xx` issues in Linear. Every change goes through a pull request against `main`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contributor guidelines and [`AGENTS.md`](AGENTS.md) for detailed rules. Reviews follow [`docs/agents/review.md`](docs/agents/review.md).
+
+## Security
+
+See [`SECURITY.md`](SECURITY.md) for our security policy and vulnerability reporting instructions.
 
 ## License
 
