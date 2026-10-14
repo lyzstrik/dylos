@@ -17,9 +17,11 @@ pub mod error;
 pub mod jailer;
 pub mod lab;
 pub mod pause;
+pub mod snapshot;
 pub mod vm;
 
 pub use error::{Error, Result};
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
+pub use snapshot::snapshot_lab;
 pub use vm::{ProcessState, Timeouts, Vm, VmSpec};

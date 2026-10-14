@@ -85,6 +85,8 @@ impl Default for LabConfig {
 #[must_use]
 pub struct Lab {
     id: String,
+    store: Option<dylos_store::Store>,
+    spec: Option<LabSpec>,
     storage: Option<dylos_store::Lab>,
     network: Option<LabNetwork>,
     vms: Vec<Vm>,
@@ -105,7 +107,32 @@ impl Lab {
     pub fn from_test_vms(id: &str, vms: Vec<Vm>) -> Self {
         Self {
             id: id.into(),
+            store: None,
+            spec: None,
             storage: None,
+            network: None,
+            vms,
+            listener: None,
+            lock: None,
+            span: tracing::info_span!("lab", lab = id),
+            cleanup_on_drop: false,
+        }
+    }
+
+    /// Constructs a VM lab with store, spec and storage for unprivileged snapshot tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn from_test_vms_with_store(
+        id: &str,
+        vms: Vec<Vm>,
+        store: dylos_store::Store,
+        spec: LabSpec,
+        storage: Option<dylos_store::Lab>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            store: Some(store),
+            spec: Some(spec),
+            storage,
             network: None,
             vms,
             listener: None,
@@ -133,6 +160,8 @@ impl Lab {
             let storage = blocking(lab_id, move || Ok(store.create(&id, &spec_copy)?)).await?;
             let mut lab = Self {
                 id: lab_id.into(),
+                store: Some(config.store.clone()),
+                spec: Some(spec.clone()),
                 storage: Some(storage),
                 network: None,
                 vms: Vec::new(),
@@ -245,12 +274,26 @@ impl Lab {
             }))
             .await,
         )?;
+        self.bind_control_socket().await?;
+        Ok(())
+    }
+
+    /// Binds the control socket listener.
+    ///
+    /// # Errors
+    /// Returns [`LabError::Io`] if socket binding fails.
+    pub async fn bind_control_socket(&mut self) -> Result<PathBuf> {
         let socket = self.control_socket();
+        if let Some(parent) = socket.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| io(&self.id, e))?;
+        }
         self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(|e| io(&self.id, e))?;
-        Ok(())
+        Ok(socket)
     }
 
     #[must_use]
@@ -270,36 +313,107 @@ impl Lab {
         &self.vms
     }
 
-    /// Serves root-only teardown requests and tears down if any VM exits unexpectedly.
+    #[must_use]
+    pub fn store(&self) -> Option<&dylos_store::Store> {
+        self.store.as_ref()
+    }
+
+    #[must_use]
+    pub fn spec(&self) -> Option<&LabSpec> {
+        self.spec.as_ref()
+    }
+
+    #[must_use]
+    pub fn storage(&self) -> Option<&dylos_store::Lab> {
+        self.storage.as_ref()
+    }
+
+    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
+        self.network.as_mut()
+    }
+
+    /// Runs the consistent snapshot sequence per ADR-0001:
+    /// fabric freeze -> pause all VMs -> snapshot & clone disks -> write manifest -> resume all VMs -> thaw fabric.
+    ///
+    /// # Errors
+    /// Returns [`LabError`] on failure at any step or rollback.
+    pub async fn snapshot(
+        &mut self,
+        snapshot_id: &str,
+    ) -> Result<dylos_core::manifest::SnapshotManifest> {
+        crate::snapshot::snapshot_lab(self, snapshot_id).await
+    }
+
+    /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
     /// # Errors
     /// Reports socket, VM exit, and cleanup failures. A response is sent only after cleanup.
     pub async fn supervise(mut self) -> Result<()> {
+        let span = self.span.clone();
         let result = async {
-            let listener = self.listener.as_ref().ok_or_else(|| invalid(&self.id, "lab already stopped"))?;
+            let listener = self
+                .listener
+                .take()
+                .ok_or_else(|| invalid(&self.id, "lab already stopped"))?;
+            let states: Vec<_> = self.vms.iter().map(Vm::state).collect();
             let exits = futures_util::stream::FuturesUnordered::new();
-            for vm in &self.vms {
-                let mut state = vm.state();
+            for mut state in states {
                 exits.push(async move {
                     let _exit = state.wait_for(|s| *s != ProcessState::Running).await;
                 });
             }
             tokio::pin!(exits);
-            loop {
+            let has_vms = !self.vms.is_empty();
+            let res = loop {
                 use futures_util::StreamExt;
                 tokio::select! {
-                    _ = exits.next(), if !self.vms.is_empty() => return Err(invalid(&self.id, "VM exited unexpectedly")),
+                    _ = exits.next(), if has_vms => break Err(invalid(&self.id, "VM exited unexpectedly")),
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.map_err(|e| io(&self.id, e))?;
                         let credentials = stream.peer_cred().map_err(|e| io(&self.id, e))?;
                         if credentials.uid() != nix::unistd::geteuid().as_raw() { continue; }
-                        let mut request = [0; 9];
-                        if matches!(tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut request)).await, Ok(Ok(_))) && &request == b"teardown\n" {
-                            return Ok(stream);
+                        let mut buf = Vec::new();
+                        let mut byte = [0u8; 1];
+                        let read_res = tokio::time::timeout(Duration::from_secs(2), async {
+                            loop {
+                                let n = stream.read(&mut byte).await?;
+                                if n == 0 || byte[0] == b'\n' { break; }
+                                buf.push(byte[0]);
+                                if buf.len() > 256 {
+                                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "command too long"));
+                                }
+                            }
+                            Ok::<_, std::io::Error>(())
+                        }).await;
+
+                        if let Ok(Ok(())) = read_res {
+                            let line = String::from_utf8_lossy(&buf);
+                            let trimmed = line.trim();
+                            if trimmed == "teardown" {
+                                break Ok(stream);
+                            } else if let Some(rest) = trimmed.strip_prefix("snapshot") {
+                                let snap_id = rest.trim();
+                                let snap_id = if snap_id.is_empty() {
+                                    format!("snap-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis())
+                                } else {
+                                    snap_id.to_string()
+                                };
+                                let res = self.snapshot(&snap_id).await;
+                                match res {
+                                    Ok(_) => {
+                                        let _ = stream.write_all(b"ok\n").await;
+                                    }
+                                    Err(e) => {
+                                        let _ = stream.write_all(format!("err {e}\n").as_bytes()).await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }.instrument(self.span.clone()).await;
+            };
+            self.listener = Some(listener);
+            res
+        }.instrument(span).await;
         let cleanup = self.teardown().await;
         match (result, cleanup) {
             (Ok(mut stream), Ok(())) => {
@@ -486,6 +600,50 @@ impl Lab {
         .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
     }
 
+    /// Requests a snapshot over the control socket.
+    /// # Errors
+    /// Connection, timeout or protocol failure. A timeout leaves the server outcome unknown.
+    pub async fn request_snapshot(
+        socket: &Path,
+        snapshot_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<()> {
+        let id = socket.to_string_lossy();
+        tokio::time::timeout(timeout, async {
+            let mut stream = UnixStream::connect(socket).await.map_err(|e| io(&id, e))?;
+            let cmd = match snapshot_id {
+                Some(snap) => format!("snapshot {snap}\n"),
+                None => "snapshot\n".to_string(),
+            };
+            stream
+                .write_all(cmd.as_bytes())
+                .await
+                .map_err(|e| io(&id, e))?;
+            let mut reply_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = stream.read(&mut byte).await.map_err(|e| io(&id, e))?;
+                if n == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                reply_buf.push(byte[0]);
+                if reply_buf.len() > 1024 {
+                    return Err(invalid(&id, "response too long"));
+                }
+            }
+            let reply = String::from_utf8_lossy(&reply_buf);
+            if reply.trim() == "ok" {
+                Ok(())
+            } else if let Some(err_msg) = reply.strip_prefix("err ") {
+                Err(invalid(&id, err_msg.trim()))
+            } else {
+                Err(invalid(&id, &format!("invalid snapshot response: {reply}")))
+            }
+        })
+        .await
+        .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
+    }
+
     /// Cleans a crashed supervisor's lab by name, using its persisted spec, never a saved PID.
     /// A live supervisor holds an exclusive directory lock and cannot be bypassed.
     /// # Errors
@@ -622,8 +780,13 @@ async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm
             api.put_machine_config(&MachineConfiguration::new(vcpus, node.memory as usize))
                 .await?;
             let mut boot = BootSource::new("/vmlinux.bin");
+            let extra_boot_args = if node.name.contains("writer") {
+                " dylos.writer=1"
+            } else {
+                ""
+            };
             boot.boot_args = Some(format!(
-                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda {boot_args}"
+                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda {boot_args}{extra_boot_args}"
             ));
             api.put_boot_source(&boot).await?;
             let mut drive = Drive::new("rootfs", true);
@@ -659,6 +822,8 @@ impl Drop for Lab {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let mut owned = Self {
                 id: self.id.clone(),
+                store: self.store.take(),
+                spec: self.spec.take(),
                 storage: self.storage.take(),
                 network: self.network.take(),
                 vms: std::mem::take(&mut self.vms),

@@ -258,6 +258,7 @@ async fn check_lab_request(
     parallel_pause_reply(mode, sandbox, sock, request, stream).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
     match mode {
@@ -324,6 +325,25 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         }
         if mode == "StallActions" && request.starts_with("PUT /actions ") {
             stalled.push(stream);
+            continue;
+        }
+        if request.starts_with("PUT /snapshot/create ") {
+            let root = sock.parent().unwrap().parent().unwrap();
+            if root.join("fail-snapshot").exists() {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                continue;
+            }
+            std::fs::write(root.join("vm.state"), b"fake vm state content").unwrap();
+            std::fs::write(root.join("vm.mem"), b"fake vm memory content").unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
             continue;
         }
         let reply = if mode == "LabConfigureFailure" && request.starts_with("PUT /boot-source ") {
