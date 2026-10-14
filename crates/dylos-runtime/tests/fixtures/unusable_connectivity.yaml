@@ -1,0 +1,20 @@
+segments:
+  - name: left
+    ipv6: fd64:796c:6f73:1::/64
+    ipv4: 10.0.1.0/24
+
+nodes:
+  - name: A
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: left
+        ipv6: fd64:796c:6f73:1::2/64
+        ipv4: 10.0.1.2/24
+    static_routes:
+      - destination: fd64:796c:6f73:2::/64
+        gateway: fd64:796c:6f73:1::99
+      - destination: 10.0.2.0/24
+        gateway: 10.0.1.99
