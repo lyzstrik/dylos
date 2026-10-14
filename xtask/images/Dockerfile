@@ -36,7 +36,6 @@ RUN chmod 0755 /rootfs/sbin/init /rootfs/sbin/net-setup /rootfs/sbin/net-setup-g
     && find /rootfs -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
     && mkdir -p /out \
     && E2FSPROGS_FAKE_TIME="${SOURCE_DATE_EPOCH}" mkfs.ext4 -F -q -d /rootfs \
-        -O ^orphan_file \
         -U 01234567-89ab-cdef-0123-456789abcdef \
         -E hash_seed=01234567-89ab-cdef-0123-456789abcdef,lazy_itable_init=0,lazy_journal_init=0 \
         /out/rootfs.ext4 "${ROOTFS_SIZE}"
