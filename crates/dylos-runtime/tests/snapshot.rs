@@ -697,49 +697,41 @@ async fn snapshot_in_flight_cancellation_during_freeze() {
     lab.set_network(network);
 
     let vm0_root = lab.vms()[0].paths().root.clone();
-    fs::write(vm0_root.join("stall-pause"), b"").unwrap();
+    fs::write(vm0_root.join("stall-freeze"), b"").unwrap();
 
     tokio::select! {
         _ = lab.snapshot("snap-cancel-freeze") => {}
         () = async {
-            wait_until("pause reached after freeze", Duration::from_secs(5), || {
-                vm0_root.join("pause-started").exists()
+            wait_until("freeze started", Duration::from_secs(5), || {
+                vm0_root.join("freeze-started").exists()
             })
             .await;
         } => {}
     }
 
-    // HOLD OPERATION PENDING: during freeze and stalled pause, TAPs must be DOWN
-    let output = Command::new("nsenter")
-        .args([
-            format!("--net={}", netns_path.display()).as_str(),
-            "ip",
-            "link",
-            "show",
-        ])
-        .output()
-        .expect("failed to run nsenter");
-    let link_out = String::from_utf8_lossy(&output.stdout);
-    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
-        assert!(
-            link_out.contains(tap),
-            "expected TAP interface {tap} in netns"
-        );
-        for line in link_out.lines() {
-            if line.contains(tap) {
-                assert!(
-                    !line.contains(",UP") && !line.contains("<UP,"),
-                    "TAP device {tap} must be DOWN during freeze barrier, got: {line}"
-                );
-            }
-        }
-    }
+    // HOLD OPERATION PENDING: during freeze stall, snapshot is active but VMs are not yet paused/captured/resumed
+    assert!(
+        lab.has_active_snapshot(),
+        "snapshot task must remain active"
+    );
+    assert!(
+        !vm0_root.join("is-paused").exists(),
+        "VM must not be paused while freeze is stalled"
+    );
+    assert!(
+        !vm0_root.join("capture-done").exists(),
+        "VM must not be captured while freeze is stalled"
+    );
+    assert!(
+        !sandbox.dir.path().join("lcf-A.resumed").exists(),
+        "VM must not be resumed while freeze is stalled"
+    );
 
-    // Release stall so background completes and thaws
-    let _ = fs::remove_file(vm0_root.join("stall-pause"));
+    // Release freeze stall so background completes freeze, pause, capture, resume, and thaw
+    let _ = fs::remove_file(vm0_root.join("stall-freeze"));
 
     wait_until(
-        "VM is resumed after freeze/pause cancellation",
+        "VM is resumed after freeze cancellation",
         Duration::from_secs(5),
         || !vm0_root.join("is-paused").exists(),
     )
@@ -910,5 +902,271 @@ async fn snapshot_via_control_socket() {
         .unwrap();
     supervisor.await.unwrap().unwrap();
 
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_caller_cancellation_releases_slot_for_subsequent_snapshot() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("lrel").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-pause"), b"").unwrap();
+
+    // Cancel caller while pause is stalled
+    tokio::select! {
+        _ = lab.snapshot("snap-1") => {}
+        () = async {
+            wait_until("pause reached", Duration::from_secs(5), || {
+                vm0_root.join("pause-started").exists()
+            })
+            .await;
+        } => {}
+    }
+
+    assert!(
+        lab.has_active_snapshot(),
+        "snapshot must remain active in background while running"
+    );
+
+    // A second snapshot attempt while the first is running must be rejected
+    let blocked_err = lab.snapshot("snap-blocked").await.unwrap_err();
+    assert!(
+        blocked_err.to_string().contains("already in progress"),
+        "expected snapshot already in progress error, got: {blocked_err}"
+    );
+
+    // Release stall so background task completes and settles
+    let _ = fs::remove_file(vm0_root.join("stall-pause"));
+    wait_until(
+        "background snapshot settles",
+        Duration::from_secs(5),
+        || !vm0_root.join("is-paused").exists() && !lab.has_active_snapshot(),
+    )
+    .await;
+
+    // Do NOT call wait_for_active_snapshot manually; the slot must be freed on completion
+    let manifest = lab.snapshot("snap-subsequent").await.unwrap();
+    assert_eq!(manifest.vms.len(), 3);
+
+    let snap_dir = store.snapshot_dir("lrel", "snap-subsequent");
+    let opener = SnapshotOpener::new(&snap_dir).unwrap();
+    manifest.verify(opener.verify_opener()).unwrap();
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn teardown_cancellation_during_pending_storage_retains_ownership_for_retry() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("ltret").await;
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-storage"), b"").unwrap();
+
+    // 1. Snapshot caller starts snapshot, but cancels while storage is stalled
+    tokio::select! {
+        _ = lab.snapshot("snap-stall") => {}
+        () = async {
+            wait_until("storage reached", Duration::from_secs(5), || {
+                vm0_root.join("storage-started").exists()
+            })
+            .await;
+        } => {}
+    }
+
+    assert!(
+        lab.has_active_snapshot(),
+        "snapshot must remain active in background"
+    );
+
+    // 2. Teardown caller starts teardown, but cancels while storage is still stalled
+    tokio::select! {
+        _ = lab.teardown() => {}
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+
+    // 3. Invariant: tracker retains ownership, teardown did not overtake pending storage
+    assert!(
+        lab.has_active_snapshot(),
+        "cancelled teardown must not detach snapshot ownership"
+    );
+    assert!(
+        vm0_root.exists(),
+        "teardown must not delete VM root while storage is pending"
+    );
+    assert_eq!(lab.vms().len(), 3, "VMs must not be cleared");
+
+    // 4. Retry teardown in a background task
+    let retry_task = tokio::spawn(async move { lab.teardown().await });
+
+    // Verify retry is blocked waiting for active snapshot
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !retry_task.is_finished(),
+        "retry must wait for active snapshot"
+    );
+
+    // 5. Release storage stall
+    let _ = fs::remove_file(vm0_root.join("stall-storage"));
+
+    // 6. Retry finishes successfully
+    let teardown_res = retry_task.await.unwrap();
+    assert!(teardown_res.is_ok(), "teardown retry must succeed");
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn teardown_cancellation_during_pending_storage_retains_ownership_for_drop() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("ltdrp").await;
+    lab.set_cleanup_on_drop(true);
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-storage"), b"").unwrap();
+
+    // 1. Snapshot caller cancels while storage is stalled
+    tokio::select! {
+        _ = lab.snapshot("snap-stall") => {}
+        () = async {
+            wait_until("storage reached", Duration::from_secs(5), || {
+                vm0_root.join("storage-started").exists()
+            })
+            .await;
+        } => {}
+    }
+
+    assert!(
+        lab.has_active_snapshot(),
+        "snapshot must remain active in background"
+    );
+
+    // 2. Teardown caller cancels
+    tokio::select! {
+        _ = lab.teardown() => {}
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+
+    // 3. Invariant: tracker retains ownership
+    assert!(
+        lab.has_active_snapshot(),
+        "cancelled teardown must not detach snapshot ownership"
+    );
+
+    // 4. Drop lab
+    drop(lab);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // While storage is stalled, drop cleanup must wait; resources still exist
+    assert!(
+        vm0_root.exists(),
+        "drop teardown must not overtake pending storage"
+    );
+
+    // 5. Release stall
+    let _ = fs::remove_file(vm0_root.join("stall-storage"));
+
+    // 6. Drop cleanup settles
+    wait_until("drop cleanup completes", Duration::from_secs(5), || {
+        let base = sandbox.dir.path().join("jails/firecracker");
+        std::fs::read_dir(base).map_or(true, |mut entries| entries.next().is_none())
+    })
+    .await;
+
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume() {
+    if !sandboxed("snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume") {
+        return;
+    }
+    let (sandbox, _store, spec, mut lab) = setup_lab("lsbnd").await;
+
+    let netns_dir = sandbox.dir.path().join("netns");
+    fs::create_dir_all(&netns_dir).unwrap();
+    let plan = dylos_net::FabricPlan::new("lsbnd", &spec).unwrap();
+    let network = dylos_net::LabNetwork::create(plan, &netns_dir, 0, 0)
+        .await
+        .unwrap();
+    let netns_path = network.netns_path().to_path_buf();
+    lab.set_network(network);
+
+    let vm0_root = lab.vms()[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-resume"), b"").unwrap();
+
+    let task = tokio::spawn(async move {
+        let manifest = lab.snapshot("snap-bnd").await;
+        (manifest, lab)
+    });
+
+    wait_until("resume started on VM0", Duration::from_secs(5), || {
+        vm0_root.join("resume-started").exists()
+    })
+    .await;
+
+    // AT RESUME BOUNDARY:
+    // 1. Every VM capture must be finished
+    for vm in ["lsbnd-A", "lsbnd-B", "lsbnd-C"] {
+        assert!(
+            sandbox
+                .dir
+                .path()
+                .join(format!("jails/firecracker/{vm}/root/capture-done"))
+                .exists(),
+            "all VM captures must be done before resume boundary"
+        );
+    }
+
+    // 2. TAPs must STILL BE DOWN because not all VMs have finished resuming
+    let output = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "show",
+        ])
+        .output()
+        .expect("failed to run nsenter");
+    let link_out = String::from_utf8_lossy(&output.stdout);
+    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        for line in link_out.lines() {
+            if line.contains(tap) {
+                assert!(
+                    !line.contains(",UP") && !line.contains("<UP,"),
+                    "TAP device {tap} must be DOWN during resume boundary, got: {line}"
+                );
+            }
+        }
+    }
+
+    // Release resume stall so all VMs finish resuming and fabric is thawed
+    let _ = fs::remove_file(vm0_root.join("stall-resume"));
+
+    let (res, mut lab) = task.await.unwrap();
+    let manifest = res.unwrap();
+    assert_eq!(manifest.vms.len(), 3);
+
+    // After completion, TAPs must be UP
+    let output_thawed = Command::new("nsenter")
+        .args([
+            format!("--net={}", netns_path.display()).as_str(),
+            "ip",
+            "link",
+            "show",
+        ])
+        .output()
+        .expect("failed to run nsenter");
+    let link_out_thawed = String::from_utf8_lossy(&output_thawed.stdout);
+    let mut found_taps = 0;
+    for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+        for line in link_out_thawed.lines() {
+            if line.contains(tap) {
+                assert!(
+                    line.contains("UP"),
+                    "TAP device {tap} must be UP after thaw, got: {line}"
+                );
+                found_taps += 1;
+            }
+        }
+    }
+    assert_eq!(found_taps, 3);
+
+    lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }

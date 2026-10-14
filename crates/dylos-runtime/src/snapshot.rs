@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -471,6 +473,15 @@ async fn run_snapshot_steps(
     let started_freeze = Instant::now();
     if let Some(fabric) = &job.fabric {
         state.frozen.store(true, Ordering::SeqCst);
+        #[cfg(feature = "test-hooks")]
+        if let Some(first_vm) = job.vms.first()
+            && first_vm.root_dir.join("stall-freeze").exists()
+        {
+            let _ = std::fs::write(first_vm.root_dir.join("freeze-started"), b"");
+            while first_vm.root_dir.join("stall-freeze").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
         fabric.freeze().await.map_err(LabError::Network)?;
     }
     let freeze_ms = u64::try_from(started_freeze.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -601,6 +612,7 @@ async fn run_snapshot_steps(
 
         let state_max_bytes = 16 * 1024 * 1024;
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
+        #[cfg(feature = "test-hooks")]
         let root_dir = vm.root_dir.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
@@ -907,11 +919,19 @@ pub async fn snapshot_lab_with_timings(
     dylos_core::validate_name(snapshot_id, 32)
         .map_err(|e| LabError::Store(dylos_store::Error::InvalidId(e.to_string())))?;
 
-    if lab.has_active_snapshot() {
-        return Err(LabError::Invalid {
-            lab: lab_id,
-            message: "snapshot already in progress".into(),
-        });
+    let tracker = lab.active_snapshot_tracker();
+    {
+        let mut lock = tracker.lock().await;
+        if let Some(handle) = lock.as_ref() {
+            if handle.is_finished() {
+                *lock = None;
+            } else {
+                return Err(LabError::Invalid {
+                    lab: lab_id,
+                    message: "snapshot already in progress".into(),
+                });
+            }
+        }
     }
 
     let store = lab.store().cloned().unwrap_or_default();
@@ -951,7 +971,6 @@ pub async fn snapshot_lab_with_timings(
 
     let span = tracing::info_span!("snapshot_lab", lab = %lab_id, snapshot = %snapshot_id);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    let tracker = lab.active_snapshot_tracker();
 
     let task = tokio::spawn(
         async move {
@@ -971,8 +990,8 @@ pub async fn snapshot_lab_with_timings(
     } else {
         // Task completed or panicked without sending via oneshot
         let mut lock = tracker.lock().await;
-        if let Some(mut handle) = lock.take() {
-            match (&mut handle).await {
+        if let Some(handle) = lock.as_mut() {
+            match handle.await {
                 Ok(()) => Err(LabError::Invalid {
                     lab: lab_id,
                     message: "snapshot task finished without publishing result".into(),

@@ -381,11 +381,27 @@ impl Lab {
         crate::snapshot::snapshot_lab_with_timings(self, snapshot_id).await
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub fn set_cleanup_on_drop(&mut self, cleanup: bool) {
+        self.cleanup_on_drop = cleanup;
+    }
+
     /// Checks if a snapshot task is currently running on this lab.
     #[must_use]
     pub fn has_active_snapshot(&self) -> bool {
         match self.active_snapshot.try_lock() {
-            Ok(guard) => guard.is_some(),
+            Ok(mut guard) => {
+                if let Some(handle) = guard.as_ref() {
+                    if handle.is_finished() {
+                        *guard = None;
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    false
+                }
+            }
             Err(_) => true,
         }
     }
@@ -400,12 +416,10 @@ impl Lab {
 
     /// Waits for any in-flight snapshot task to complete and cleans the tracker.
     pub async fn wait_for_active_snapshot(&mut self) {
-        let handle = {
-            let mut lock = self.active_snapshot.lock().await;
-            lock.take()
-        };
-        if let Some(handle) = handle {
+        let mut lock = self.active_snapshot.lock().await;
+        if let Some(handle) = lock.as_mut() {
             let _ = handle.await;
+            *lock = None;
         }
     }
 

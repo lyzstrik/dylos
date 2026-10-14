@@ -226,6 +226,10 @@ async fn parallel_pause_reply(
         .await;
         if action == "paused" {
             std::fs::write(root.join("is-paused"), b"").unwrap();
+            assert_taps_down(
+                sandbox,
+                "barrier violation: fabric must be frozen before VMs are paused, but TAP is UP",
+            );
             if root.join("stall-pause").exists() {
                 std::fs::write(root.join("pause-started"), b"").unwrap();
                 wait_until("pause stall released", Duration::from_secs(5), || {
@@ -268,9 +272,50 @@ async fn parallel_pause_reply(
                     }
                 }
             }
+            if root.join("stall-resume").exists() {
+                std::fs::write(root.join("resume-started"), b"").unwrap();
+                wait_until("resume stall released", Duration::from_secs(5), || {
+                    !root.join("stall-resume").exists()
+                })
+                .await;
+            }
+            assert_taps_down(
+                sandbox,
+                "barrier violation: fabric must remain frozen until all VMs resumed, but TAP is UP",
+            );
         }
     }
     false
+}
+
+fn assert_taps_down(sandbox: &Path, barrier_msg: &str) {
+    let netns_dir = sandbox.join("netns");
+    if netns_dir.exists()
+        && let Ok(entries) = std::fs::read_dir(&netns_dir)
+    {
+        for entry in entries.flatten() {
+            let netns_path = entry.path();
+            if let Ok(output) = std::process::Command::new("nsenter")
+                .args([
+                    format!("--net={}", netns_path.display()).as_str(),
+                    "ip",
+                    "link",
+                    "show",
+                ])
+                .output()
+            {
+                let link_out = String::from_utf8_lossy(&output.stdout);
+                for line in link_out.lines() {
+                    if line.contains("tap-") {
+                        assert!(
+                            !line.contains(",UP") && !line.contains("<UP,"),
+                            "{barrier_msg}: {line}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 async fn check_lab_request(
