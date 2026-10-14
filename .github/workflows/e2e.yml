@@ -87,7 +87,7 @@ jobs:
           URL="https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz"
           curl -fsSL "$URL" -o "$TMPDIR/firecracker.tgz"
 
-          EXPECTED_ARCHIVE_SHA="$(grep -E 'SHA-256 archive[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*([a-fA-F0-9]{64}).*/\1/')"
+          EXPECTED_ARCHIVE_SHA="$(sed -n 's/.*SHA-256 archive : \([a-fA-F0-9]\{64\}\).*/\1/p' docs/host.md)"
           echo "$EXPECTED_ARCHIVE_SHA  $TMPDIR/firecracker.tgz" | sha256sum -c -
 
           tar -xzf "$TMPDIR/firecracker.tgz" -C "$TMPDIR"
@@ -96,8 +96,8 @@ jobs:
           sudo chmod 0755 "$FC_DIR/firecracker" "$FC_DIR/jailer"
           rm -rf "$TMPDIR"
 
-          EXPECTED_FC_SHA="$(grep -E 'SHA-256 firecracker[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*([a-fA-F0-9]{64}).*/\1/')"
-          EXPECTED_JAILER_SHA="$(grep -E 'SHA-256 jailer[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*([a-fA-F0-9]{64}).*/\1/')"
+          EXPECTED_FC_SHA="$(sed -n 's/.*SHA-256 firecracker : \([a-fA-F0-9]\{64\}\).*/\1/p' docs/host.md)"
+          EXPECTED_JAILER_SHA="$(sed -n 's/.*SHA-256 jailer : \([a-fA-F0-9]\{64\}\).*/\1/p' docs/host.md)"
           echo "$EXPECTED_FC_SHA  $FC_DIR/firecracker" | sha256sum -c -
           echo "$EXPECTED_JAILER_SHA  $FC_DIR/jailer" | sha256sum -c -
 
@@ -106,9 +106,9 @@ jobs:
       - name: Download and verify guest kernel
         run: |
           mkdir -p kernels
-          KERNEL_URL="$(awk '/## Guest kernel/{flag=1} flag && /Source/{for(i=1;i<=NF;i++) if($i ~ /^https?:\/\//) print $i; exit}' docs/host.md)"
+          KERNEL_URL="$(sed -n '/## Guest kernel/,/##/ s/^- Source : //p' docs/host.md)"
           curl -fsSL "$KERNEL_URL" -o kernels/vmlinux.bin
-          EXPECTED_KERNEL_SHA="$(awk '/## Guest kernel/{flag=1} flag && /SHA-256/{for(i=1;i<=NF;i++) if($i ~ /^[a-fA-F0-9]{64}$/) print $i; exit}' docs/host.md)"
+          EXPECTED_KERNEL_SHA="$(sed -n '/## Guest kernel/,/##/ s/^- SHA-256 : //p' docs/host.md)"
           echo "$EXPECTED_KERNEL_SHA  kernels/vmlinux.bin" | sha256sum -c -
 
       - name: Cache rootfs image
@@ -124,8 +124,8 @@ jobs:
 
       - name: Verify rootfs image
         run: |
-          EXPECTED_SHA="$(grep -E 'Rootfs SHA-256[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*`?([a-fA-F0-9]{64})`?.*/\1/')"
-          ACTUAL_SHA="$(sha256sum target/images/rootfs.ext4 | awk '{print $1}')"
+          EXPECTED_SHA="$(sed -n 's/.*Rootfs SHA-256 : `\([a-fA-F0-9]\{64\}\)`.*/\1/p' docs/host.md)"
+          ACTUAL_SHA="$(sha256sum target/images/rootfs.ext4 | cut -d' ' -f1)"
           echo "Expected rootfs SHA-256: $EXPECTED_SHA"
           echo "Actual rootfs SHA-256:   $ACTUAL_SHA"
           if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
