@@ -310,6 +310,7 @@ dependencies = [
 name = "dylos-runtime"
 version = "0.1.0"
 dependencies = [
+ "dylos-agent",
  "dylos-core",
  "dylos-fc",
  "dylos-net",

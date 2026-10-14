@@ -13,6 +13,7 @@
 //! on the CLI application (`dylos-cli`).
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod error;
 pub mod jailer;
 pub mod lab;
