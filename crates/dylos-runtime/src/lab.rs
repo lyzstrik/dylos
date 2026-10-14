@@ -17,6 +17,10 @@ use tracing::Instrument;
 use crate::jailer::{ChrootFile, JailPaths, JailerConfig};
 use crate::{ProcessState, Timeouts, Vm, VmSpec};
 
+#[cfg(feature = "test-hooks")]
+static EXPECTED_UID_OVERRIDE: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
 #[derive(Debug, thiserror::Error)]
 pub enum LabError {
     #[error("lab {lab}: {message}")]
@@ -142,6 +146,11 @@ impl Lab {
             span: tracing::info_span!("lab", lab = id),
             cleanup_on_drop: false,
         }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn set_control_uid_override(uid: Option<u32>) {
+        EXPECTED_UID_OVERRIDE.store(uid.unwrap_or(u32::MAX), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// # Errors
@@ -353,6 +362,20 @@ impl Lab {
         crate::snapshot::snapshot_lab(self, snapshot_id).await
     }
 
+    /// Runs the consistent snapshot sequence and returns the manifest together with step durations.
+    ///
+    /// # Errors
+    /// Returns [`LabError`] on failure at any step or rollback.
+    pub async fn snapshot_with_timings(
+        &mut self,
+        snapshot_id: &str,
+    ) -> Result<(
+        dylos_core::manifest::SnapshotManifest,
+        crate::snapshot::SnapshotTimings,
+    )> {
+        crate::snapshot::snapshot_lab_with_timings(self, snapshot_id).await
+    }
+
     /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
     /// # Errors
     /// Reports socket, VM exit, and cleanup failures. A response is sent only after cleanup.
@@ -380,7 +403,22 @@ impl Lab {
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.map_err(|e| io(&self.id, e))?;
                         let credentials = stream.peer_cred().map_err(|e| io(&self.id, e))?;
-                        if credentials.uid() != nix::unistd::geteuid().as_raw() { continue; }
+                        let expected_uid = {
+                            #[cfg(feature = "test-hooks")]
+                            {
+                                let overridden = EXPECTED_UID_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
+                                if overridden == u32::MAX {
+                                    nix::unistd::geteuid().as_raw()
+                                } else {
+                                    overridden
+                                }
+                            }
+                            #[cfg(not(feature = "test-hooks"))]
+                            {
+                                nix::unistd::geteuid().as_raw()
+                            }
+                        };
+                        if credentials.uid() != expected_uid { continue; }
                         let mut buf = Vec::new();
                         let mut byte = [0u8; 1];
                         let read_res = tokio::time::timeout(Duration::from_secs(2), async {

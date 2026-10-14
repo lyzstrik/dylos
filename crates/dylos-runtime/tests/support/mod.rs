@@ -226,6 +226,13 @@ async fn parallel_pause_reply(
         .await;
         if action == "paused" {
             std::fs::write(root.join("is-paused"), b"").unwrap();
+            if root.join("stall-pause").exists() {
+                std::fs::write(root.join("pause-started"), b"").unwrap();
+                wait_until("pause stall released", Duration::from_secs(5), || {
+                    !root.join("stall-pause").exists()
+                })
+                .await;
+            }
             if root.join("drop-paused").exists() {
                 stream.shutdown().await.unwrap();
                 return true;
@@ -329,6 +336,13 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         }
         if request.starts_with("PUT /snapshot/create ") {
             let root = sock.parent().unwrap().parent().unwrap();
+            if root.join("stall-snapshot").exists() {
+                std::fs::write(root.join("snapshot-started"), b"").unwrap();
+                wait_until("snapshot stall released", Duration::from_secs(5), || {
+                    !root.join("stall-snapshot").exists()
+                })
+                .await;
+            }
             if root.join("fail-snapshot").exists() {
                 stream
                     .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
