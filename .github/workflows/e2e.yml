@@ -141,7 +141,7 @@ jobs:
       - name: Run end-to-end tests
         run: |
           set -o pipefail
-          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" just e2e 2>&1 | tee e2e.log
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" "NEXTEST_SUCCESS_OUTPUT=immediate" just e2e 2>&1 | tee e2e.log
           if grep -q "SKIPPED" e2e.log; then
             echo "::error::An e2e test was skipped for missing prerequisites" >&2
             exit 1
