@@ -286,7 +286,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         // 4. Positive host-originated reachability after entering clone 1 netns
         let c1_netns = config.netns_dir.join(format!("dylos-{}", clones[0].id()));
         let netns_arg = format!("--net={}", c1_netns.display());
-        let _ = tokio::process::Command::new("nsenter")
+        let add_v6 = tokio::process::Command::new("nsenter")
             .args([
                 &netns_arg,
                 "ip",
@@ -296,10 +296,16 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                 "fd64:796c:6f73:1::fe/64",
                 "dev",
                 "dylos-left",
+                "nodad",
             ])
             .output()
-            .await;
-        let _ = tokio::process::Command::new("nsenter")
+            .await
+            .unwrap();
+        assert!(
+            add_v6.status.success(),
+            "failed to add v6 addr inside c1 netns: {add_v6:?}"
+        );
+        let add_v4 = tokio::process::Command::new("nsenter")
             .args([
                 &netns_arg,
                 "ip",
@@ -311,33 +317,73 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                 "dylos-left",
             ])
             .output()
-            .await;
-        let ns_ping_v6 = tokio::process::Command::new("nsenter")
-            .args([
-                &netns_arg,
-                "ping",
-                "-6",
-                "-c",
-                "1",
-                "-W",
-                "2",
-                "fd64:796c:6f73:1::2",
-            ])
-            .output()
             .await
             .unwrap();
         assert!(
-            ns_ping_v6.status.success(),
-            "Host entered c1 netns must reach node A over IPv6: {ns_ping_v6:?}"
+            add_v4.status.success(),
+            "failed to add v4 addr inside c1 netns: {add_v4:?}"
         );
-        let ns_ping_v4 = tokio::process::Command::new("nsenter")
-            .args([&netns_arg, "ping", "-4", "-c", "1", "-W", "2", "10.0.1.2"])
-            .output()
-            .await
-            .unwrap();
+
+        let start_ns = std::time::Instant::now();
+        let mut ns_v6_ok = false;
+        let mut last_ns_v6 = String::new();
+        while start_ns.elapsed() < Duration::from_secs(10) {
+            let res = tokio::process::Command::new("nsenter")
+                .args([
+                    &netns_arg,
+                    "ping",
+                    "-6",
+                    "-c",
+                    "1",
+                    "-W",
+                    "1",
+                    "-I",
+                    "dylos-left",
+                    "fd64:796c:6f73:1::2",
+                ])
+                .output()
+                .await
+                .unwrap();
+            if res.status.success() {
+                ns_v6_ok = true;
+                break;
+            }
+            last_ns_v6 = format!("code={:?}: {}", res.status.code(), String::from_utf8_lossy(&res.stderr));
+        }
         assert!(
-            ns_ping_v4.status.success(),
-            "Host entered c1 netns must reach node A over IPv4: {ns_ping_v4:?}"
+            ns_v6_ok,
+            "Host entered c1 netns must reach node A over IPv6: {last_ns_v6}"
+        );
+
+        let start_ns = std::time::Instant::now();
+        let mut ns_v4_ok = false;
+        let mut last_ns_v4 = String::new();
+        while start_ns.elapsed() < Duration::from_secs(10) {
+            let res = tokio::process::Command::new("nsenter")
+                .args([
+                    &netns_arg,
+                    "ping",
+                    "-4",
+                    "-c",
+                    "1",
+                    "-W",
+                    "1",
+                    "-I",
+                    "dylos-left",
+                    "10.0.1.2",
+                ])
+                .output()
+                .await
+                .unwrap();
+            if res.status.success() {
+                ns_v4_ok = true;
+                break;
+            }
+            last_ns_v4 = format!("code={:?}: {}", res.status.code(), String::from_utf8_lossy(&res.stderr));
+        }
+        assert!(
+            ns_v4_ok,
+            "Host entered c1 netns must reach node A over IPv4: {last_ns_v4}"
         );
 
         // 5. Measure PSS under N=10 for clone 1
