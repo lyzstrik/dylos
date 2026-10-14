@@ -476,7 +476,7 @@ async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
 
 #[tokio::test]
 async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lf-clean").await;
+    let (sandbox, store, _spec, mut lab) = setup_lab("lcl").await;
     let vm0_root = lab.vms()[0].paths().root.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
     // VM 1 will fail snapshot create
@@ -493,7 +493,7 @@ async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
     .await;
 
     // While stall-snapshot is held, create an undeletable directory inside snap_dir
-    let snap_dir = store.snapshot_dir("lf-clean", "snap-clean-err");
+    let snap_dir = store.snapshot_dir("lcl", "snap-clean-err");
     let locked_dir = snap_dir.join("locked_subdir");
     fs::create_dir_all(&locked_dir).unwrap();
     fs::write(locked_dir.join("file.txt"), b"cannot delete").unwrap();
@@ -506,7 +506,7 @@ async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
     // Must be LabError::Rollback containing both the operation error and the cleanup error
     match &err {
         dylos_runtime::LabError::Rollback { operation, cleanup } => {
-            assert!(operation.to_string().contains("lf-clean"));
+            assert!(operation.to_string().contains("lcl"));
             assert!(
                 cleanup.to_string().contains("locked_subdir")
                     || cleanup.to_string().contains("Permission denied")
@@ -549,7 +549,7 @@ async fn snapshot_fails_at_resume_preserves_error_and_cleans_up() {
 
 #[tokio::test]
 async fn snapshot_in_flight_cancellation_during_pause() {
-    let (sandbox, _store, _spec, mut lab) = setup_lab("lcan-pause").await;
+    let (sandbox, _store, _spec, mut lab) = setup_lab("lcp").await;
     let vm0_root = lab.vms()[0].paths().root.clone();
     let vm_id = lab.vms()[0].paths().id.clone();
     fs::write(vm0_root.join("stall-pause"), b"").unwrap();
@@ -583,7 +583,7 @@ async fn snapshot_in_flight_cancellation_during_pause() {
 
 #[tokio::test]
 async fn snapshot_in_flight_cancellation_during_capture() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lcan-cap").await;
+    let (sandbox, store, _spec, mut lab) = setup_lab("lca").await;
     let vm0_root = lab.vms()[0].paths().root.clone();
     let vm_id = lab.vms()[0].paths().id.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
@@ -609,7 +609,7 @@ async fn snapshot_in_flight_cancellation_during_capture() {
                 && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
                 && !vm0_root.join("vm.state").exists()
                 && !vm0_root.join("vm.mem").exists()
-                && !store.snapshot_dir("lcan-cap", "snap-cancel-cap").exists()
+                && !store.snapshot_dir("lca", "snap-cancel-cap").exists()
         },
     )
     .await;
