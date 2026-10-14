@@ -453,3 +453,101 @@ async fn restore_load_and_resume_failures_roll_back_all_resources() {
         assert_removed(&sandbox, &config);
     }
 }
+
+#[test]
+fn generate_clone_ids_validates_count_and_naming() {
+    assert!(Lab::generate_clone_ids("test", 0).is_err());
+    assert!(Lab::generate_clone_ids("invalid/id", 1).is_err());
+    assert!(Lab::generate_clone_ids("a-very-long-prefix-that-exceeds-32-chars", 1).is_err());
+    let ids = Lab::generate_clone_ids("abc", 3).unwrap();
+    assert_eq!(ids, vec!["abc-c1", "abc-c2", "abc-c3"]);
+}
+
+#[tokio::test]
+async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_latency_and_pss() {
+    if !sandboxed(
+        "fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_latency_and_pss",
+    ) {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut source = Lab::up_with(&config, &spec, "s").await.unwrap();
+    source.snapshot("saved").await.unwrap();
+    let snapshot = config.store.snapshot_dir("s", "saved");
+
+    let clones = Lab::fork(&config, &snapshot, "s", 3).await.unwrap();
+    assert_eq!(clones.len(), 3);
+    for (i, clone) in clones.iter().enumerate() {
+        assert_eq!(clone.id(), format!("s-c{}", i + 1));
+        assert!(clone.restore_latency().is_some());
+        let pss = clone.measure_pss().await.unwrap();
+        assert_eq!(pss.len(), 3);
+        for (_node, pss_kib) in pss {
+            assert!(pss_kib > 0);
+        }
+        assert!(clone.total_pss_kib().await.unwrap() > 0);
+    }
+
+    // Each clone can be supervised and torn down independently
+    for clone in clones {
+        let socket = clone.control_socket();
+        let clone_id = clone.id().to_string();
+        let server = tokio::spawn(clone.supervise());
+        Lab::request_teardown(&socket, Duration::from_secs(5))
+            .await
+            .unwrap();
+        server.await.unwrap().unwrap();
+        assert!(!config.store.base.join(&clone_id).exists());
+        assert!(!config.netns_dir.join(format!("dylos-{clone_id}")).exists());
+    }
+
+    source.teardown().await.unwrap();
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn fork_partial_failure_rolls_back_all_clones() {
+    if !sandboxed("fork_partial_failure_rolls_back_all_clones") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
+    source.snapshot("saved").await.unwrap();
+    let snapshot = config.store.snapshot_dir("src", "saved");
+
+    // Block one clone from being restored by pre-creating an invalid directory with no write permissions
+    let blocked_dir = config.store.base.join("fail-c2");
+    fs::create_dir_all(&blocked_dir).unwrap();
+    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
+    perms.set_mode(0o400);
+    fs::set_permissions(&blocked_dir, perms).unwrap();
+
+    let clone_ids = vec![
+        "fail-c1".to_string(),
+        "fail-c2".to_string(),
+        "fail-c3".to_string(),
+    ];
+    let res = Lab::fork_with(&config, &snapshot, &clone_ids).await;
+    assert!(res.is_err());
+
+    // Restore permissions so cleanup works
+    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    let _ = fs::set_permissions(&blocked_dir, perms);
+    let _ = fs::remove_dir_all(&blocked_dir);
+
+    // Assert fail-c1 and fail-c3 were rolled back
+    assert!(!config.store.base.join("fail-c1").exists());
+    assert!(!config.store.base.join("fail-c3").exists());
+    assert!(!config.netns_dir.join("dylos-fail-c1").exists());
+    assert!(!config.netns_dir.join("dylos-fail-c3").exists());
+
+    source.teardown().await.unwrap();
+    assert_removed(&sandbox, &config);
+}
