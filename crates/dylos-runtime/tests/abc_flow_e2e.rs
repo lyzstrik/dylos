@@ -418,10 +418,10 @@ async fn guest_with_failed_network_marker_reports_not_ready() {
         .await
         .unwrap();
 
-    // Configure boot source with an invalid MAC address in dylos.if to force net-setup failure.
+    // Configure boot source with an unmatching MAC address in dylos.if to force net-setup failure.
     let mut boot_source = BootSource::new("/vmlinux.bin");
     boot_source.boot_args = Some(
-        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda dylos.if=eth0,00:00:00:00:00:00,fd64::1/64"
+        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda dylos.if=eth0,02:ff:ff:ff:ff:ff,fd64::1/64"
             .into(),
     );
     client.put_boot_source(&boot_source).await.unwrap();
