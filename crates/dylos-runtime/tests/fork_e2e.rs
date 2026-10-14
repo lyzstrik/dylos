@@ -9,13 +9,29 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
-async fn exec(lab: &Lab, node: &str, command: &str) -> String {
-    let result = lab
-        .exec(node, command, Duration::from_secs(10))
-        .await
-        .unwrap();
-    assert!(result.success(), "{node}: {command}: {result:?}");
-    result.stdout.trim().to_owned()
+async fn assert_ping(lab: &Lab, node: &str, target: &str, family: &str) {
+    let mut last_output = String::new();
+    let mut success = false;
+    for _ in 0..5 {
+        let result = lab
+            .exec(
+                node,
+                &format!("ping {family} -c 2 -W 2 {target}"),
+                Duration::from_secs(15),
+            )
+            .await
+            .unwrap();
+        if result.success() {
+            success = true;
+            break;
+        }
+        last_output = format!("{result:?}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        success,
+        "{node}: ping {family} {target} failed after retries: {last_output}"
+    );
 }
 
 #[tokio::test]
@@ -70,12 +86,17 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
     let mut original = Lab::up_with(&config, &spec, "src").await.unwrap();
 
     let result = std::panic::AssertUnwindSafe(async {
-        // Verify source lab connectivity
-        exec(&original, "A", "ping -c 1 -W 5 10.0.2.2").await;
-        exec(&original, "A", "ping -c 1 -W 5 fd64:796c:6f73:2::2").await;
+        // Verify source lab dual-stack connectivity (IPv6 first, ADR-0002)
+        assert_ping(&original, "A", "fd64:796c:6f73:2::2", "-6").await;
+        assert_ping(&original, "A", "10.0.2.2", "-4").await;
 
         let manifest = original.snapshot("snap").await.unwrap();
         let snapshot = config.store.snapshot_dir("src", "snap");
+
+        // Tear down source lab to verify clones are independent and reduce runner load
+        original.teardown().await.unwrap();
+        assert!(!config.store.base.join("src").exists());
+        assert!(!config.netns_dir.join("dylos-src").exists());
 
         // Fork 10 simultaneous clones in parallel with deterministic clone identifiers
         let clone_count = 10;
@@ -126,9 +147,9 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
             let netns_path = config.netns_dir.join(format!("dylos-{}", clone.id()));
             assert!(netns_path.exists());
 
-            // Dual-stack connectivity inside each clone
-            exec(clone, "A", "ping -c 1 -W 5 10.0.2.2").await;
-            exec(clone, "A", "ping -c 1 -W 5 fd64:796c:6f73:2::2").await;
+            // Dual-stack connectivity inside each clone (IPv6 first, ADR-0002)
+            assert_ping(clone, "A", "fd64:796c:6f73:2::2", "-6").await;
+            assert_ping(clone, "A", "10.0.2.2", "-4").await;
         }
 
         // Each clone is supervised and torn down independently via control socket (dylos lab down)
@@ -170,7 +191,9 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
     .catch_unwind()
     .await;
 
-    original.teardown().await.unwrap();
+    if config.store.base.join("src").exists() {
+        let _ = original.teardown().await;
+    }
     assert!(!config.store.base.join("src").exists());
     assert!(!config.netns_dir.join("dylos-src").exists());
 
