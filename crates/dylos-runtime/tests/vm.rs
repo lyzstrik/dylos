@@ -448,3 +448,108 @@ async fn exec_runs_commands_and_returns_output_and_exit_code() {
 
     vm.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn exec_handles_no_trailing_newline() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let out = vm
+        .exec("printf 'hello_without_newline'", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(out.stdout, "hello_without_newline");
+    assert!(out.success());
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_times_out_when_command_blocks() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let res = vm.exec("sleep 10", Duration::from_millis(100)).await;
+    assert!(
+        matches!(res, Err(Error::ExecTimeout { timeout, .. }) if timeout == Duration::from_millis(100))
+    );
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_fails_when_output_exceeds_budget() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // 1 MiB budget exceeded
+    let res = vm
+        .exec(
+            "head -c 1100000 /dev/zero | tr '\\0' 'a'",
+            Duration::from_secs(5),
+        )
+        .await;
+    assert!(
+        matches!(res, Err(Error::ExecFailed { ref message, .. }) if message.contains("exceeded budget")),
+        "Expected budget overflow error, got: {res:?}"
+    );
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_rejects_forged_markers() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // A command that prints a dummy end marker does not cause premature exit or fake status
+    let out = vm
+        .exec(
+            "echo '__DYLOS_END_0000000000000000__ 0'; echo real_output",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert!(out.stdout.contains("__DYLOS_END_0000000000000000__ 0"));
+    assert!(out.stdout.contains("real_output"));
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_concurrent_calls_serialize_correctly() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let (res1, res2) = tokio::join!(
+        vm.exec("echo call_one", Duration::from_secs(5)),
+        vm.exec("echo call_two", Duration::from_secs(5)),
+    );
+    let out1 = res1.unwrap();
+    let out2 = res2.unwrap();
+    assert_eq!(out1.exit_code, 0);
+    assert_eq!(out1.stdout.trim(), "call_one");
+    assert_eq!(out2.exit_code, 0);
+    assert_eq!(out2.stdout.trim(), "call_two");
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_deadline_covers_mutex_acquisition() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // Launch a command that holds the console lock for 1 second.
+    let slow = vm.exec("sleep 1", Duration::from_secs(2));
+    let blocked = async {
+        // Yield so slow starts and acquires the stdin lock.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Attempt a second exec with a short timeout (50ms); it must time out while waiting for the lock.
+        vm.exec("echo blocked", Duration::from_millis(50)).await
+    };
+    let (res_slow, res_blocked) = tokio::join!(slow, blocked);
+    assert!(res_slow.is_ok());
+    assert!(
+        matches!(res_blocked, Err(Error::ExecTimeout { timeout, .. }) if timeout == Duration::from_millis(50)),
+        "Expected timeout while waiting for lock, got: {res_blocked:?}"
+    );
+
+    vm.shutdown().await.unwrap();
+}
