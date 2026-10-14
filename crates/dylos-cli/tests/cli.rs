@@ -117,7 +117,7 @@ fn argument_parsing() {
             true,
             vec!["lab", "DYLOS_LAB_DIR", "DYLOS_FC_BIN_DIR"],
         ),
-        (vec!["lab", "--help"], true, vec!["up", "down"]),
+        (vec!["lab", "--help"], true, vec!["up", "down", "fork"]),
         (vec!["lab", "up", "--help"], true, vec!["<SPEC>", "--id"]),
         (vec!["lab", "down", "--help"], true, vec!["<ID>"]),
         (vec![], false, vec!["Usage:"]),
@@ -333,5 +333,50 @@ fn restore_command_requires_snapshot_and_rejects_invalid_id() {
         &run(dir.path(), &["lab", "restore", "--help"]),
         true,
         "--id",
+    );
+}
+
+#[test]
+fn fork_command_requires_snapshot_and_count_and_rejects_invalid_id() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_status(&run(dir.path(), &["lab", "fork"]), false, "<SNAPSHOT>");
+    assert_status(
+        &run(dir.path(), &["lab", "fork", "missing"]),
+        false,
+        "--count",
+    );
+    assert_status(
+        &run(dir.path(), &["lab", "fork", "missing", "-n", "0"]),
+        false,
+        "clone count must be at least 1",
+    );
+    assert_status(
+        &run(
+            dir.path(),
+            &["lab", "fork", "missing", "-n", "2", "--prefix", "../escape"],
+        ),
+        false,
+        "invalid clone id",
+    );
+    assert_status(
+        &run(
+            dir.path(),
+            &[
+                "lab",
+                "fork",
+                "missing",
+                "-n",
+                "10",
+                "--prefix",
+                "this-prefix-is-way-too-long-for-clone-ids",
+            ],
+        ),
+        false,
+        "too long",
+    );
+    assert_status(
+        &run(dir.path(), &["lab", "fork", "--help"]),
+        true,
+        "--count",
     );
 }
