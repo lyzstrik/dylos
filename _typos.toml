@@ -1,0 +1,8 @@
+[files]
+ignore-hidden = false
+
+[default.extend-words]
+# Hostile drive ID test case using unicode escape "caf\u{e9}" in crates/dylos-fc/tests/routes_acceptance.rs
+caf = "caf"
+# Quoted French section title from the Dylos design doc in docs/adr/0001-consistency-by-fabric-freeze.md
+restauration = "restauration"

@@ -58,6 +58,8 @@ rustup show
 - zizmor : 1.30.1
 - cargo-fuzz : 0.13.2
 - Fuzz toolchain : `nightly-2026-10-13`, isolated in `fuzz/rust-toolchain.toml`
+- typos : 1.51.1 (SHA-256 archive: 93c301fd4120ff076e2cc2a6d6a61cab4a4bdb81899287c0938b452e56d1f454)
+- cargo-machete : 0.9.2 (SHA-256 archive: 48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9)
 
 Install:
 
@@ -74,6 +76,18 @@ cargo install --locked cargo-fuzz --version 0.13.2
 
 # zizmor
 cargo install --locked zizmor --version 1.30.1
+
+# typos (or `cargo install --locked typos-cli --version 1.51.1`)
+curl -fsSLO https://github.com/crate-ci/typos/releases/download/v1.51.1/typos-v1.51.1-x86_64-unknown-linux-musl.tar.gz && \
+echo "93c301fd4120ff076e2cc2a6d6a61cab4a4bdb81899287c0938b452e56d1f454  typos-v1.51.1-x86_64-unknown-linux-musl.tar.gz" | sha256sum -c && \
+tar -xzf typos-v1.51.1-x86_64-unknown-linux-musl.tar.gz ./typos && \
+install -m 0755 typos ~/.local/bin/
+
+# cargo-machete (or `cargo install --locked cargo-machete --version 0.9.2`)
+curl -fsSLO https://github.com/bnjbvr/cargo-machete/releases/download/v0.9.2/cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz && \
+echo "48200087f54c55aabcd4db4af1e25742b49846c02a1b1bfa134711945b35b2e9  cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz" | sha256sum -c && \
+tar -xzf cargo-machete-v0.9.2-x86_64-unknown-linux-musl.tar.gz --strip-components=1 cargo-machete-v0.9.2-x86_64-unknown-linux-musl/cargo-machete && \
+install -m 0755 cargo-machete ~/.local/bin/
 ```
 
 ## Commit signing

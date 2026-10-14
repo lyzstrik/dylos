@@ -16,7 +16,7 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets --locked -- -D warnings
 
-# Run all checks (format, clippy, doc, tests, cargo-deny, static agent, workflow lint)
+# Run all checks (format, clippy, doc, tests, cargo-deny, static agent, workflow lint, typos, unused dependencies)
 check:
     just fmt-check
     just clippy
@@ -25,6 +25,16 @@ check:
     just deny
     just agent-check
     just ci-lint
+    just typos
+    just machete
+
+# Check for spelling errors
+typos:
+    typos
+
+# Detect unused dependencies
+machete:
+    cargo machete
 
 # Check dependency policy
 deny:
