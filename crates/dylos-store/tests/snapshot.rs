@@ -5,6 +5,7 @@ use dylos_core::manifest::{SnapshotManifest, StepDurations, VmManifest};
 use dylos_store::{SnapshotOpener, Store};
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 fn setup() -> (tempfile::TempDir, Store, LabSpec) {
@@ -462,7 +463,7 @@ fn restore_verifies_before_creation_and_reflinks_independent_files() {
         Err(e) => panic!("restore failed: {e}"),
     };
     for node in &manifest.lab_spec.nodes {
-        for name in ["rootfs.ext4", "vm.state", "vm.mem"] {
+        for name in ["rootfs.ext4", "vm.state"] {
             let source = path.join("vms").join(&node.name).join(name);
             let clone = lab.root().join("vms").join(&node.name).join(name);
             assert_eq!(fs::read(&source).unwrap(), fs::read(&clone).unwrap());
@@ -472,6 +473,17 @@ fn restore_verifies_before_creation_and_reflinks_independent_files() {
             );
             fs::write(clone, b"changed clone").unwrap();
         }
+        let mem_source = path.join("vms").join(&node.name).join("vm.mem");
+        let mem_clone = lab.root().join("vms").join(&node.name).join("vm.mem");
+        assert_eq!(
+            fs::read(&mem_source).unwrap(),
+            fs::read(&mem_clone).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&mem_source).unwrap().ino(),
+            fs::metadata(&mem_clone).unwrap().ino()
+        );
+        assert!(fs::metadata(&mem_clone).unwrap().permissions().readonly());
     }
     manifest
         .verify(SnapshotOpener::new(&path).unwrap().verify_opener())
@@ -479,8 +491,11 @@ fn restore_verifies_before_creation_and_reflinks_independent_files() {
     lab.remove().unwrap();
     lab.remove().unwrap();
     assert!(!store.base.join("clone").exists());
-    assert!(store.restore("source", &path).is_err());
-    fs::write(path.join("vms/a/vm.mem"), b"tampered").unwrap();
+    let tampered_path = path.join("vms/a/vm.mem");
+    let mut perms = fs::metadata(&tampered_path).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&tampered_path, perms).unwrap();
+    fs::write(&tampered_path, b"tampered").unwrap();
     assert!(store.restore("clone", &path).is_err());
     assert!(!store.base.join("clone").exists());
 }

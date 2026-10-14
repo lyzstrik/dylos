@@ -457,8 +457,11 @@ async fn restore_load_and_resume_failures_roll_back_all_resources() {
 #[test]
 fn generate_clone_ids_validates_count_and_naming() {
     assert!(Lab::generate_clone_ids("test", 0).is_err());
+    assert!(Lab::generate_clone_ids("test", 1025).is_err());
     assert!(Lab::generate_clone_ids("invalid/id", 1).is_err());
     assert!(Lab::generate_clone_ids("a-very-long-prefix-that-exceeds-32-chars", 1).is_err());
+    // Prefix that fits for c1 but c100 exceeds 32 chars
+    assert!(Lab::generate_clone_ids("twenty-seven-chars-long-prefix-", 100).is_err());
     let ids = Lab::generate_clone_ids("abc", 3).unwrap();
     assert_eq!(ids, vec!["abc-c1", "abc-c2", "abc-c3"]);
 }
@@ -480,9 +483,17 @@ async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_la
 
     let clones = Lab::fork(&config, &snapshot, "s", 3).await.unwrap();
     assert_eq!(clones.len(), 3);
+    let node0 = &spec.nodes[0].name;
+    let first_mem = clones[0].root().join("vms").join(node0).join("vm.mem");
+    let first_ino = fs::metadata(&first_mem).unwrap().ino();
+    assert!(fs::metadata(&first_mem).unwrap().permissions().readonly());
+
     for (i, clone) in clones.iter().enumerate() {
         assert_eq!(clone.id(), format!("s-c{}", i + 1));
         assert!(clone.restore_latency().is_some());
+        let clone_mem = clone.root().join("vms").join(node0).join("vm.mem");
+        assert_eq!(fs::metadata(&clone_mem).unwrap().ino(), first_ino);
+        assert!(fs::metadata(&clone_mem).unwrap().permissions().readonly());
         let pss = clone.measure_pss().await.unwrap();
         assert_eq!(pss.len(), 3);
         for (_node, pss_kib) in pss {

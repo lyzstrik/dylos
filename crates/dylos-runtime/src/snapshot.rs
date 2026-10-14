@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-#[cfg_attr(not(feature = "test-hooks"), allow(unused_imports))]
-use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};

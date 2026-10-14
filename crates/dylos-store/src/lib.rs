@@ -28,7 +28,10 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     time::{Instant, SystemTime},
 };
@@ -582,6 +585,12 @@ impl Snapshot {
             .map_err(|e| contextual(&dest_path, e))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
 
+        if file_name == "vm.mem" {
+            verified_dest_file
+                .set_permissions(std::fs::Permissions::from_mode(0o444))
+                .map_err(|e| contextual(&dest_path, e))?;
+        }
+
         Ok((
             FileMeta {
                 path: PathBuf::from(format!("vms/{node}/{file_name}")),
@@ -779,24 +788,27 @@ impl Store {
                 })?;
                 if let Some((opener, manifest)) = snapshot {
                     let saved = &manifest.vms[&node.name];
-                    for (meta, name) in [
-                        (&saved.state_file, "vm.state"),
-                        (&saved.memory_file, "vm.mem"),
-                    ] {
-                        let source = opener
-                            .open(&meta.path)
-                            .map_err(|e| contextual(&meta.path, e))?;
-                        let destination = open(
-                            &vm,
-                            name.as_ref(),
-                            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
-                        )
-                        .map_err(|e| contextual(&paths.directory.join(name), e))?;
-                        reflink(&source, &destination).map_err(|source| Error::Reflink {
-                            path: paths.directory.join(name),
+                    // 1. Reflink vm.state so each clone gets its own independent state file
+                    let state_source = opener
+                        .open(&saved.state_file.path)
+                        .map_err(|e| contextual(&saved.state_file.path, e))?;
+                    let state_destination = open(
+                        &vm,
+                        "vm.state".as_ref(),
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                    )
+                    .map_err(|e| contextual(&paths.directory.join("vm.state"), e))?;
+                    reflink(&state_source, &state_destination).map_err(|source| {
+                        Error::Reflink {
+                            path: paths.directory.join("vm.state"),
                             source,
-                        })?;
-                    }
+                        }
+                    })?;
+
+                    // 2. Hard-link vm.mem so all clones share the exact same inode and page cache
+                    opener
+                        .link(&saved.memory_file.path, &vm, "vm.mem")
+                        .map_err(|e| contextual(&paths.directory.join("vm.mem"), e))?;
                 }
                 tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
             }
@@ -1143,6 +1155,35 @@ impl SnapshotOpener {
     /// or non-regular leaves.
     pub fn open(&self, path: &Path) -> io::Result<File> {
         self.open_impl(path, None, &mut |_| {})
+    }
+
+    /// Hard-links a snapshot file into the target directory with the given name.
+    ///
+    /// The source path must be a regular file within the snapshot tree. The target
+    /// directory receives a hard link to the same inode, enabling shared memory mapping
+    /// in the page cache across multiple restored VMs.
+    ///
+    /// # Errors
+    /// Returns an error if the source file is missing, not regular, or if linking fails.
+    pub fn link(&self, path: &Path, target_dir: &File, target_name: &str) -> io::Result<()> {
+        let source = self.open(path)?;
+        let proc_path = format!("/proc/self/fd/{}", source.as_raw_fd());
+        let proc_c = std::ffi::CString::new(proc_path)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let name_c = std::ffi::CString::new(target_name)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        nix::unistd::linkat(
+            nix::fcntl::AT_FDCWD,
+            proc_c.as_c_str(),
+            target_dir,
+            name_c.as_c_str(),
+            nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
+        )
+        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        if let Ok(dest) = open(target_dir, target_name.as_ref(), OFlag::O_RDONLY) {
+            let _ = dest.set_permissions(std::fs::Permissions::from_mode(0o444));
+        }
+        Ok(())
     }
 
     /// Forces a resolver and pauses immediately before each resolution step.
