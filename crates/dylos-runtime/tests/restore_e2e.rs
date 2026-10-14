@@ -41,15 +41,27 @@ async fn measure_clocks(
     before_clocks: &str,
     before_timers: &str,
 ) {
-    let host_before = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let after_clocks = exec(clone, "A", clock_command).await;
-    let host_after = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+    // A slow serial command cannot establish a 100 ms accuracy bound. Retry
+    // only measurement uncertainty; clock errors still fail the assertion below.
+    let (host_before, host_after, after_clocks) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let host_before = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let clocks = exec(clone, "A", clock_command).await;
+                let host_after = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                if host_after.saturating_sub(host_before) <= 50_000_000 {
+                    break (host_before, host_after, clocks);
+                }
+            }
+        })
+        .await
+        .expect("could not obtain a guest clock sample within a 50 ms host interval");
     let parsed: Vec<u128> = after_clocks
         .split_whitespace()
         .map(|x| x.parse().unwrap())

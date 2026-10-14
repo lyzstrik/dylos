@@ -67,6 +67,7 @@ Resync steps `CLOCK_REALTIME`; it does not explicitly change
 Firecracker restore must be measured rather than inferred from the wall clock.
 The dual-stack TCP restore e2e test waits 30 seconds after snapshot completion,
 then checks guest wall time against a host time interval with 100 ms tolerance,
+retries host sampling intervals wider than 50 ms for at most 10 seconds,
 checks that monotonic time has not gone backwards, and prints
 `CLOCK_MEASUREMENT` with nanosecond clock samples and `ss -o` TCP timer
 state before snapshot and after restore. Both pre-existing IPv6 and IPv4 TCP
