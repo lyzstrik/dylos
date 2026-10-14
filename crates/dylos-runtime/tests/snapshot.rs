@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod support;
 
 use std::fs;
@@ -54,7 +54,7 @@ segments:
     .unwrap()
 }
 
-async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Lab) {
+async fn setup_lab(lab_id: &str) -> Option<(Sandbox, Store, LabSpec, Lab)> {
     let sandbox = Sandbox::in_target(Mode::ParallelPause);
     let store_dir = sandbox.dir.path().join("labs");
     let image = sandbox.dir.path().join("base_rootfs.ext4");
@@ -65,7 +65,24 @@ async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Lab) {
         image,
     };
     let spec = test_spec();
-    let storage = store.create(lab_id, &spec).unwrap();
+    let storage = match store.create(lab_id, &spec) {
+        Ok(s) => s,
+        Err(dylos_store::Error::Reflink { source, .. })
+            if source.raw_os_error().is_some_and(|code| {
+                matches!(
+                    nix::errno::Errno::from_raw(code),
+                    nix::errno::Errno::EOPNOTSUPP
+                        | nix::errno::Errno::ENOTTY
+                        | nix::errno::Errno::EXDEV
+                        | nix::errno::Errno::EINVAL
+                )
+            }) =>
+        {
+            eprintln!("SKIP: reflinks unsupported in this test environment: {source}");
+            return None;
+        }
+        Err(e) => panic!("store.create failed: {e}"),
+    };
 
     let mut vms = Vec::new();
     for node in ["A", "B", "C"] {
@@ -89,12 +106,14 @@ async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Lab) {
 
     let lab =
         Lab::from_test_vms_with_store(lab_id, vms, store.clone(), spec.clone(), Some(storage));
-    (sandbox, store, spec, lab)
+    Some((sandbox, store, spec, lab))
 }
 
 #[tokio::test]
 async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("ls").await;
+    let Some((sandbox, store, _spec, mut lab)) = setup_lab("ls").await else {
+        return;
+    };
     let manifest = lab.snapshot("snap-1").await.unwrap();
 
     assert_eq!(manifest.vms.len(), 3);
@@ -121,7 +140,9 @@ async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
 
 #[tokio::test]
 async fn snapshot_fails_at_pause_cleans_up_and_resumes_all_vms() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lfp").await;
+    let Some((sandbox, store, _spec, mut lab)) = setup_lab("lfp").await else {
+        return;
+    };
     fs::write(lab.vms()[0].paths().root.join("fail-paused"), b"").unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
@@ -145,7 +166,9 @@ async fn snapshot_fails_at_pause_cleans_up_and_resumes_all_vms() {
 
 #[tokio::test]
 async fn snapshot_fails_at_snapshot_create_cleans_up_and_resumes_all_vms() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lfc").await;
+    let Some((sandbox, store, _spec, mut lab)) = setup_lab("lfc").await else {
+        return;
+    };
     fs::write(lab.vms()[0].paths().root.join("fail-snapshot"), b"").unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
@@ -169,7 +192,9 @@ async fn snapshot_fails_at_snapshot_create_cleans_up_and_resumes_all_vms() {
 
 #[tokio::test]
 async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lfd").await;
+    let Some((sandbox, store, _spec, mut lab)) = setup_lab("lfd").await else {
+        return;
+    };
     let disk_path = lab.storage().unwrap().vm_paths("A").unwrap().rootfs;
     fs::remove_file(disk_path).unwrap();
 
@@ -194,7 +219,9 @@ async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
 
 #[tokio::test]
 async fn snapshot_fails_at_resume_preserves_error_and_cleans_up() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lfr").await;
+    let Some((sandbox, store, _spec, mut lab)) = setup_lab("lfr").await else {
+        return;
+    };
     fs::write(lab.vms()[0].paths().root.join("fail-resumed"), b"").unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
@@ -208,7 +235,9 @@ async fn snapshot_fails_at_resume_preserves_error_and_cleans_up() {
 
 #[tokio::test]
 async fn snapshot_via_control_socket() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lc").await;
+    let Some((sandbox, store, _spec, mut lab)) = setup_lab("lc").await else {
+        return;
+    };
     let socket = lab.bind_control_socket().await.unwrap();
 
     let supervisor = tokio::spawn(lab.supervise());

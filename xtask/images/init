@@ -5,7 +5,7 @@ mount -t devtmpfs devtmpfs /dev
 /sbin/net-setup-guard
 /sbin/report-readiness
 dylos-agent &
-if grep -q "dylos.writer=1" /proc/cmdline; then
+if grep -q "write_churn=1" /proc/cmdline; then
     (
         while :; do
             dd if=/dev/urandom of=/var/log/churn.dat bs=4k count=1 conv=notrunc oflag=append 2>/dev/null

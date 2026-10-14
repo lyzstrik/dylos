@@ -781,7 +781,7 @@ async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm
                 .await?;
             let mut boot = BootSource::new("/vmlinux.bin");
             let extra_boot_args = if node.name.contains("writer") {
-                " dylos.writer=1"
+                " write_churn=1"
             } else {
                 ""
             };
