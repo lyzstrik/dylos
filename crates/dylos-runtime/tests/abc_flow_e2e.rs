@@ -1,13 +1,20 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::similar_names)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::similar_names,
+    clippy::panic
+)]
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::FutureExt;
+
 use dylos_core::LabSpec;
 use dylos_fc::config::{BootSource, Drive, InstanceActionInfo, MachineConfiguration};
 use dylos_runtime::jailer::{ChrootFile, JailPaths, JailerConfig};
-use dylos_runtime::{Error, Lab, LabConfig, Timeouts, Vm, VmSpec};
+use dylos_runtime::{Error, Lab, LabConfig, LabError, Timeouts, Vm, VmSpec};
 
 fn binaries_dir() -> Option<PathBuf> {
     std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from)
@@ -53,77 +60,116 @@ fn parse_global_ips(output: &str) -> Vec<String> {
         .collect()
 }
 
-/// Moved from LYZ-16: Checks that each VM has exactly the declared addresses inside the guests.
+async fn assert_interface_addresses(
+    lab: &Lab,
+    node: &str,
+    dev: &str,
+    expected_v6: &[&str],
+    expected_v4: &[&str],
+) {
+    let out_v6 = lab
+        .exec(
+            node,
+            &format!("ip -o -6 addr show dev {dev} scope global"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out_v6.success(),
+        "IPv6 address query for {node}:{dev} failed: {out_v6:?}"
+    );
+    let mut actual_v6 = parse_global_ips(&out_v6.stdout);
+    actual_v6.sort();
+    let mut exp_v6: Vec<String> = expected_v6.iter().map(|&s| s.to_string()).collect();
+    exp_v6.sort();
+    assert_eq!(
+        actual_v6, exp_v6,
+        "Mismatch for IPv6 addresses on {node}:{dev}"
+    );
+
+    let out_v4 = lab
+        .exec(
+            node,
+            &format!("ip -o -4 addr show dev {dev} scope global"),
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+    assert!(
+        out_v4.success(),
+        "IPv4 address query for {node}:{dev} failed: {out_v4:?}"
+    );
+    let mut actual_v4 = parse_global_ips(&out_v4.stdout);
+    actual_v4.sort();
+    let mut exp_v4: Vec<String> = expected_v4.iter().map(|&s| s.to_string()).collect();
+    exp_v4.sort();
+    assert_eq!(
+        actual_v4, exp_v4,
+        "Mismatch for IPv4 addresses on {node}:{dev}"
+    );
+}
+
+/// Moved from LYZ-16: Checks that each VM has exactly the declared addresses per interface.
 async fn verify_guest_declared_addresses(lab: &Lab) {
-    let addrs_a_v6 = lab
-        .exec(
-            "A",
-            "ip -o -6 addr show scope global",
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    let addrs_a_v4 = lab
-        .exec(
-            "A",
-            "ip -o -4 addr show scope global",
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        parse_global_ips(&addrs_a_v6.stdout),
-        vec!["fd64:796c:6f73:1::2/64"]
-    );
-    assert_eq!(parse_global_ips(&addrs_a_v4.stdout), vec!["10.0.1.2/24"]);
+    assert_interface_addresses(
+        lab,
+        "A",
+        "eth0",
+        &["fd64:796c:6f73:1::2/64"],
+        &["10.0.1.2/24"],
+    )
+    .await;
 
-    let addrs_b_v6 = lab
-        .exec(
-            "B",
-            "ip -o -6 addr show scope global",
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    let addrs_b_v4 = lab
-        .exec(
-            "B",
-            "ip -o -4 addr show scope global",
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    let mut b_v6_ips = parse_global_ips(&addrs_b_v6.stdout);
-    b_v6_ips.sort();
-    assert_eq!(
-        b_v6_ips,
-        vec!["fd64:796c:6f73:1::1/64", "fd64:796c:6f73:2::1/64"]
-    );
-    let mut b_v4_ips = parse_global_ips(&addrs_b_v4.stdout);
-    b_v4_ips.sort();
-    assert_eq!(b_v4_ips, vec!["10.0.1.1/24", "10.0.2.1/24"]);
+    assert_interface_addresses(
+        lab,
+        "B",
+        "eth0",
+        &["fd64:796c:6f73:1::1/64"],
+        &["10.0.1.1/24"],
+    )
+    .await;
+    assert_interface_addresses(
+        lab,
+        "B",
+        "eth1",
+        &["fd64:796c:6f73:2::1/64"],
+        &["10.0.2.1/24"],
+    )
+    .await;
 
-    let addrs_c_v6 = lab
-        .exec(
-            "C",
-            "ip -o -6 addr show scope global",
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    let addrs_c_v4 = lab
-        .exec(
-            "C",
-            "ip -o -4 addr show scope global",
-            Duration::from_secs(10),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        parse_global_ips(&addrs_c_v6.stdout),
-        vec!["fd64:796c:6f73:2::2/64"]
+    assert_interface_addresses(
+        lab,
+        "C",
+        "eth0",
+        &["fd64:796c:6f73:2::2/64"],
+        &["10.0.2.2/24"],
+    )
+    .await;
+}
+
+/// Asserts that a ping command's summary line reports exactly 0% packet loss.
+fn assert_no_packet_loss(stdout: &str, context: &str) {
+    let mut found = false;
+    for line in stdout.lines() {
+        if let Some(idx) = line.find("% packet loss").or_else(|| line.find("% loss")) {
+            let prefix = line[..idx].trim_end();
+            let loss_str = prefix
+                .rsplit(|c: char| c.is_whitespace() || c == ',')
+                .next()
+                .unwrap_or("");
+            assert!(
+                loss_str == "0" || loss_str == "0.0",
+                "{context}: expected 0% packet loss, found {loss_str}% in summary line: {line}\nFull output:\n{stdout}"
+            );
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "{context}: packet loss summary line not found in output:\n{stdout}"
     );
-    assert_eq!(parse_global_ips(&addrs_c_v4.stdout), vec!["10.0.2.2/24"]);
 }
 
 /// Readiness: Usable connectivity across the lab in both families (ADR-0002: -6 first, then -4).
@@ -141,11 +187,7 @@ async fn verify_ping_connectivity(lab: &Lab) {
         "IPv6 ping from A to C failed: {}",
         ping_v6.stdout
     );
-    assert!(
-        ping_v6.stdout.contains("0% packet loss") || ping_v6.stdout.contains("0% loss"),
-        "IPv6 ping had packet loss: {}",
-        ping_v6.stdout
-    );
+    assert_no_packet_loss(&ping_v6.stdout, "IPv6 ping from A to C");
 
     let ping_v4 = lab
         .exec("A", "ping -4 -c 3 -W 2 10.0.2.2", Duration::from_secs(10))
@@ -156,11 +198,7 @@ async fn verify_ping_connectivity(lab: &Lab) {
         "IPv4 ping from A to C failed: {}",
         ping_v4.stdout
     );
-    assert!(
-        ping_v4.stdout.contains("0% packet loss") || ping_v4.stdout.contains("0% loss"),
-        "IPv4 ping had packet loss: {}",
-        ping_v4.stdout
-    );
+    assert_no_packet_loss(&ping_v4.stdout, "IPv4 ping from A to C");
 }
 
 /// iperf3 flow from A to C for 10 s, throughput logged (ADR-0002: -6 first, then -4).
@@ -169,7 +207,7 @@ async fn verify_iperf3_throughput(lab: &Lab) {
     let srv_v6 = lab
         .exec(
             "C",
-            "killall iperf3 2>/dev/null || true; iperf3 -s -D",
+            "killall iperf3 2>/dev/null || true; iperf3 -6 -s -D",
             Duration::from_secs(5),
         )
         .await
@@ -199,7 +237,7 @@ async fn verify_iperf3_throughput(lab: &Lab) {
     let srv_v4 = lab
         .exec(
             "C",
-            "killall iperf3 2>/dev/null || true; iperf3 -s -D",
+            "killall iperf3 2>/dev/null || true; iperf3 -4 -s -D",
             Duration::from_secs(5),
         )
         .await
@@ -288,6 +326,7 @@ async fn verify_routing_through_b(lab: &Lab) {
         "IPv6 ping failed after re-enabling routing on B: {}",
         rec_v6.stdout
     );
+    assert_no_packet_loss(&rec_v6.stdout, "IPv6 recovery ping");
 
     let rec_v4 = lab
         .exec("A", "ping -4 -c 1 -W 2 10.0.2.2", Duration::from_secs(5))
@@ -298,6 +337,7 @@ async fn verify_routing_through_b(lab: &Lab) {
         "IPv4 ping failed after re-enabling routing on B: {}",
         rec_v4.stdout
     );
+    assert_no_packet_loss(&rec_v4.stdout, "IPv4 recovery ping");
 }
 
 /// Teardown and assert nothing left on the host.
@@ -358,11 +398,6 @@ async fn abc_lab_ping_and_iperf3_flow_through_b_then_teardown_leaves_nothing() {
         .expect("lab bring-up failed");
     assert_eq!(lab.vms().len(), 3);
 
-    verify_guest_declared_addresses(&lab).await;
-    verify_ping_connectivity(&lab).await;
-    verify_iperf3_throughput(&lab).await;
-    verify_routing_through_b(&lab).await;
-
     let paths: Vec<_> = lab
         .vms()
         .iter()
@@ -371,7 +406,20 @@ async fn abc_lab_ping_and_iperf3_flow_through_b_then_teardown_leaves_nothing() {
     let root = lab.root().to_owned();
     let netns = config.netns_dir.join(format!("dylos-{lab_id}"));
 
+    let test_result = std::panic::AssertUnwindSafe(async {
+        verify_guest_declared_addresses(&lab).await;
+        verify_ping_connectivity(&lab).await;
+        verify_iperf3_throughput(&lab).await;
+        verify_routing_through_b(&lab).await;
+    })
+    .catch_unwind()
+    .await;
+
     verify_teardown_leaves_nothing(lab, paths, root, netns).await;
+
+    if let Err(payload) = test_result {
+        std::panic::resume_unwind(payload);
+    }
 }
 
 #[tokio::test]
@@ -412,42 +460,142 @@ async fn guest_with_failed_network_marker_reports_not_ready() {
     let paths = vm.paths().clone();
     let pid = vm.pid().unwrap();
 
-    let client = vm.client();
-    client
-        .put_machine_config(&MachineConfiguration::new(1, 128))
-        .await
-        .unwrap();
+    let test_result = std::panic::AssertUnwindSafe(async {
+        let client = vm.client();
+        client
+            .put_machine_config(&MachineConfiguration::new(1, 128))
+            .await
+            .unwrap();
 
-    // Configure boot source with an unmatching MAC address in dylos.if to force net-setup failure.
-    let mut boot_source = BootSource::new("/vmlinux.bin");
-    boot_source.boot_args = Some(
-        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda dylos.if=eth0,02:ff:ff:ff:ff:ff,fd64::1/64"
-            .into(),
-    );
-    client.put_boot_source(&boot_source).await.unwrap();
+        // Configure boot source with an unmatching MAC address in dylos.if to force net-setup failure.
+        let mut boot_source = BootSource::new("/vmlinux.bin");
+        boot_source.boot_args = Some(
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda dylos.if=eth0,02:ff:ff:ff:ff:ff,fd64::1/64"
+                .into(),
+        );
+        client.put_boot_source(&boot_source).await.unwrap();
 
-    let mut drive = Drive::new("rootfs", true);
-    drive.path_on_host = Some("/rootfs.ext4".into());
-    drive.is_read_only = Some(false);
-    client.put_drive(&drive).await.unwrap();
+        let mut drive = Drive::new("rootfs", true);
+        drive.path_on_host = Some("/rootfs.ext4".into());
+        drive.is_read_only = Some(false);
+        client.put_drive(&drive).await.unwrap();
 
-    client
-        .put::<_, serde_json::Value>("/actions", &InstanceActionInfo::instance_start())
-        .await
-        .unwrap();
+        client
+            .put::<_, serde_json::Value>("/actions", &InstanceActionInfo::instance_start())
+            .await
+            .unwrap();
 
-    // net-setup-guard catches net-setup failure, touches /run/dylos-net-failed,
-    // report-readiness prints 'dylos: network setup failed', and wait_for_ready fails.
-    let res = vm.wait_for_ready(Duration::from_secs(15)).await;
-    assert!(
-        matches!(res, Err(Error::ReadinessFailed { ref line, .. }) if line == "dylos: network setup failed"),
-        "Expected ReadinessFailed but got: {res:?}"
-    );
+        // net-setup-guard catches net-setup failure, touches /run/dylos-net-failed,
+        // report-readiness prints 'dylos: network setup failed', and wait_for_ready fails.
+        let res = vm.wait_for_ready(Duration::from_secs(15)).await;
+        assert!(
+            matches!(res, Err(Error::ReadinessFailed { ref line, .. }) if line == "dylos: network setup failed"),
+            "Expected ReadinessFailed but got: {res:?}"
+        );
+    })
+    .catch_unwind()
+    .await;
 
-    vm.shutdown().await.unwrap();
-
+    let shutdown_res = vm.shutdown().await;
     assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
     assert!(!paths.jail_dir.exists());
     assert!(!paths.cgroup_dir.exists());
     assert!(!paths.api_socket().exists());
+    shutdown_res.unwrap();
+
+    if let Err(payload) = test_result {
+        std::panic::resume_unwind(payload);
+    }
+}
+
+#[tokio::test]
+#[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
+async fn guest_with_unusable_connectivity_reports_not_ready() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let kernel = workspace.join("kernels/vmlinux.bin");
+    let image = workspace.join("target/images/rootfs.ext4");
+
+    if let Some(reason) = missing_prerequisite(&kernel, &image) {
+        eprintln!("SKIPPED guest_with_unusable_connectivity_reports_not_ready: {reason}");
+        return;
+    }
+
+    let bin = binaries_dir().unwrap();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    jailer.jailer = bin.join("jailer");
+    jailer.firecracker = bin.join("firecracker");
+
+    let config = LabConfig {
+        store: dylos_store::Store {
+            base: dir.path().join("labs"),
+            image,
+        },
+        jailer,
+        kernel,
+        netns_dir: dir.path().join("netns"),
+        boot_timeout: Duration::from_secs(30),
+        ..LabConfig::default()
+    };
+
+    let spec = LabSpec::from_yaml_str(include_str!("fixtures/unusable_connectivity.yaml")).unwrap();
+    let lab_id = "fail-connectivity-e2e";
+    let root = config.store.base.join(lab_id);
+    let netns = config.netns_dir.join(format!("dylos-{lab_id}"));
+    let jail_paths_a = JailPaths::new(&config.jailer, lab_id, "A").unwrap();
+    let jail_paths_b = JailPaths::new(&config.jailer, lab_id, "B").unwrap();
+    let jail_paths_c = JailPaths::new(&config.jailer, lab_id, "C").unwrap();
+
+    let test_result = std::panic::AssertUnwindSafe(async {
+        // Gateways are reachable from each node, but across-lab connectivity
+        // (A to C through B) is broken due to missing return route on C.
+        // Lab::up_with must fail readiness verification with ReadinessFailed
+        // and automatically roll back host resources.
+        let res = Lab::up_with(&config, &spec, lab_id).await;
+        match res {
+            Err(LabError::Vm(Error::ReadinessFailed { line, .. })) => {
+                assert!(
+                    line.contains("across-lab connectivity probe failed"),
+                    "Expected across-lab probe failure, got: {line}"
+                );
+            }
+            Ok(mut lab) => {
+                let _ = lab.teardown().await;
+                panic!(
+                    "Lab::up_with unexpectedly succeeded despite broken across-lab connectivity"
+                );
+            }
+            Err(err) => {
+                panic!("Expected ReadinessFailed from broken connectivity, got: {err:?}");
+            }
+        }
+    })
+    .catch_unwind()
+    .await;
+
+    // Verify automatic rollback left nothing on the host.
+    assert!(
+        !netns.exists(),
+        "Network namespace was not cleaned up: {netns:?}"
+    );
+    assert!(!root.exists(), "Storage root was not cleaned up: {root:?}");
+    for jp in [&jail_paths_a, &jail_paths_b, &jail_paths_c] {
+        assert!(
+            !jp.jail_dir.exists(),
+            "Jail directory was not cleaned up: {:?}",
+            jp.jail_dir
+        );
+        assert!(
+            !jp.cgroup_dir.exists(),
+            "Cgroup directory was not cleaned up: {:?}",
+            jp.cgroup_dir
+        );
+    }
+
+    if let Err(payload) = test_result {
+        std::panic::resume_unwind(payload);
+    }
 }

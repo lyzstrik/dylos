@@ -147,7 +147,7 @@ impl Vm {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn();
-            let mut child = match child {
+            let child = match child {
                 Ok(child) => child,
                 Err(source) => {
                     if let Err(e) = jail.release().await {
@@ -160,6 +160,7 @@ impl Vm {
                     });
                 }
             };
+            let mut child = child;
             let child_stdin = child
                 .stdin
                 .take()
@@ -341,101 +342,201 @@ impl Vm {
         &self.node
     }
 
-    /// Executes a command inside the guest via the serial console shell.
-    ///
-    /// # Errors
-    /// Returns [`Error::ExecFailed`] if stdin is unavailable or the channel closes,
-    /// [`Error::ExecTimeout`] if the command does not complete within `timeout`, or
-    /// [`Error::Io`] if writing to stdin fails.
-    #[cfg(feature = "test-support")]
-    pub async fn exec(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use tokio::io::AsyncWriteExt;
+    const MAX_EXEC_OUTPUT_BYTES: usize = 1024 * 1024;
+    const MAX_EXEC_OUTPUT_LINES: usize = 1000;
 
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    fn random_nonce() -> u64 {
+        static FALLBACK_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let mut buf = [0u8; 8];
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            use std::io::Read;
+            if f.read_exact(&mut buf).is_ok() {
+                let n = u64::from_ne_bytes(buf);
+                if n != 0 {
+                    return n;
+                }
+            }
+        }
+        let count = FALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+        time ^ count
+    }
 
-        let Some(stdin_mutex) = &self.stdin else {
-            return Err(Error::ExecFailed {
-                id: self.paths.id.clone(),
-                message: "guest stdin is not available".into(),
-            });
-        };
+    async fn collect_exec_output(
+        &self,
+        mut rx: tokio::sync::broadcast::Receiver<String>,
+        start_marker: &str,
+        end_prefix: &str,
+    ) -> Result<ExecOutput> {
+        let mut seen_start = false;
+        let mut output_lines = Vec::new();
+        let mut total_bytes = 0usize;
 
-        let mut stdin = stdin_mutex.lock().await;
-        let mut rx = self.lines_tx.subscribe();
-
-        let start_marker = format!("__DYLOS_START_{id}__");
-        let end_prefix = format!("__DYLOS_END_{id}__ ");
-
-        // We send a leading newline to clear any pending prompt on the console,
-        // and use printf with %s format substitutions so that terminal input echo
-        // does not produce the literal marker strings on their own line.
-        let payload = format!(
-            "\nprintf '__DYLOS_%s__\\n' START_{id}; {{ {cmd} ; }}; printf '__DYLOS_%s__ %d\\n' END_{id} $?\n"
-        );
-
-        stdin
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|e| Error::Io {
-                id: self.paths.id.clone(),
-                op: "write to stdin",
-                path: PathBuf::from("stdin"),
-                source: e,
-            })?;
-        stdin.flush().await.map_err(|e| Error::Io {
-            id: self.paths.id.clone(),
-            op: "flush stdin",
-            path: PathBuf::from("stdin"),
-            source: e,
-        })?;
-
-        let wait_fut = async {
-            let mut seen_start = false;
-            let mut output_lines = Vec::new();
-            loop {
-                match rx.recv().await {
-                    Ok(line) => {
-                        let clean = line.trim_end_matches('\r');
-                        if !seen_start {
-                            if clean.ends_with(&start_marker) {
-                                seen_start = true;
-                            }
-                            continue;
+        loop {
+            match rx.recv().await {
+                Ok(line) => {
+                    let clean = line.trim_end_matches('\r');
+                    if !seen_start {
+                        if clean == start_marker
+                            || clean.ends_with(&format!(" {start_marker}"))
+                            || clean.ends_with(&format!("# {start_marker}"))
+                            || clean.ends_with(&format!("$ {start_marker}"))
+                        {
+                            seen_start = true;
                         }
-                        if let Some(pos) = clean.find(&end_prefix) {
-                            let rest = &clean[pos + end_prefix.len()..];
-                            let exit_code = rest
-                                .split_whitespace()
-                                .next()
-                                .and_then(|c| c.parse::<i32>().ok())
-                                .unwrap_or(-1);
+                        continue;
+                    }
+
+                    if let Some(pos) = clean.find(end_prefix) {
+                        let prefix = &clean[..pos];
+                        let rest = clean[pos + end_prefix.len()..].trim();
+                        if let Ok(exit_code) = rest.parse::<i32>() {
+                            let trimmed_prefix = prefix.trim();
+                            if !trimmed_prefix.is_empty()
+                                && trimmed_prefix != "#"
+                                && trimmed_prefix != "$"
+                                && !trimmed_prefix.ends_with("/ #")
+                            {
+                                let line_cost = prefix.len() + 1;
+                                if output_lines.len() >= Self::MAX_EXEC_OUTPUT_LINES {
+                                    return Err(Error::ExecFailed {
+                                        id: self.paths.id.clone(),
+                                        message: format!(
+                                            "exec output exceeded limit of {} lines",
+                                            Self::MAX_EXEC_OUTPUT_LINES
+                                        ),
+                                    });
+                                }
+                                if total_bytes + line_cost > Self::MAX_EXEC_OUTPUT_BYTES {
+                                    return Err(Error::ExecFailed {
+                                        id: self.paths.id.clone(),
+                                        message: format!(
+                                            "exec output exceeded budget of {} bytes",
+                                            Self::MAX_EXEC_OUTPUT_BYTES
+                                        ),
+                                    });
+                                }
+                                output_lines.push(prefix.to_string());
+                            }
                             return Ok(ExecOutput {
                                 exit_code,
                                 stdout: output_lines.join("\n"),
                             });
                         }
-                        output_lines.push(clean.to_string());
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            vm = %self.paths.id,
-                            skipped,
-                            "exec subscriber lagged behind console output"
-                        );
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         return Err(Error::ExecFailed {
                             id: self.paths.id.clone(),
-                            message: "console output closed before command completed".into(),
+                            message: format!("malformed exit status in end marker: {clean}"),
                         });
                     }
+
+                    let line_cost = clean.len() + 1;
+                    if output_lines.len() >= Self::MAX_EXEC_OUTPUT_LINES {
+                        return Err(Error::ExecFailed {
+                            id: self.paths.id.clone(),
+                            message: format!(
+                                "exec output exceeded limit of {} lines",
+                                Self::MAX_EXEC_OUTPUT_LINES
+                            ),
+                        });
+                    }
+                    if total_bytes + line_cost > Self::MAX_EXEC_OUTPUT_BYTES {
+                        return Err(Error::ExecFailed {
+                            id: self.paths.id.clone(),
+                            message: format!(
+                                "exec output exceeded budget of {} bytes",
+                                Self::MAX_EXEC_OUTPUT_BYTES
+                            ),
+                        });
+                    }
+                    total_bytes += line_cost;
+                    output_lines.push(clean.to_string());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    return Err(Error::ExecFailed {
+                        id: self.paths.id.clone(),
+                        message: format!(
+                            "exec subscriber lagged behind console output ({skipped} lines dropped)"
+                        ),
+                    });
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(Error::ExecFailed {
+                        id: self.paths.id.clone(),
+                        message: "console output closed before command completed".into(),
+                    });
                 }
             }
+        }
+    }
+
+    /// Executes a command inside the guest via the serial console shell.
+    ///
+    /// The entire operation — acquiring the console lock, writing the payload, and awaiting
+    /// the exit sentinel marker — is bounded by `timeout`.
+    ///
+    /// # Security note
+    ///
+    /// Command execution uses sentinel markers written to and read from the Firecracker serial
+    /// console. This transport is intended for trusted test workloads; guest-reported command
+    /// results cannot authenticate an adversarial guest that possesses arbitrary code execution,
+    /// because the guest can inspect its environment/stdin and attempt to forge markers. A random
+    /// nonce is included in each invocation to prevent accidental marker collisions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ExecFailed`] if stdin is unavailable, the output channel closes or lags,
+    /// total output exceeds the output budget (1 MiB), or marker parsing encounters an invalid
+    /// record; [`Error::ExecTimeout`] if the deadline expires before completion; or [`Error::Io`]
+    /// if writing to stdin fails.
+    pub async fn exec(&self, cmd: &str, timeout: Duration) -> Result<ExecOutput> {
+        use tokio::io::AsyncWriteExt;
+
+        let nonce = format!("{:016x}", Self::random_nonce());
+        let start_marker = format!("__DYLOS_START_{nonce}__");
+        let end_prefix = format!("__DYLOS_END_{nonce}__ ");
+
+        // We send a leading newline to clear any pending prompt on the console,
+        // and use printf with %s format substitutions so that terminal input echo
+        // does not produce the literal marker strings on their own line.
+        let payload = format!(
+            "\nprintf '__DYLOS_%s__\\n' START_{nonce}; {{ {cmd} ; }}; printf '__DYLOS_%s__ %d\\n' END_{nonce} $?\n"
+        );
+
+        let exec_fut = async {
+            let Some(stdin_mutex) = &self.stdin else {
+                return Err(Error::ExecFailed {
+                    id: self.paths.id.clone(),
+                    message: "guest stdin is not available".into(),
+                });
+            };
+
+            let mut stdin = stdin_mutex.lock().await;
+            let rx = self.lines_tx.subscribe();
+
+            stdin
+                .write_all(payload.as_bytes())
+                .await
+                .map_err(|e| Error::Io {
+                    id: self.paths.id.clone(),
+                    op: "write to stdin",
+                    path: PathBuf::from("stdin"),
+                    source: e,
+                })?;
+            stdin.flush().await.map_err(|e| Error::Io {
+                id: self.paths.id.clone(),
+                op: "flush stdin",
+                path: PathBuf::from("stdin"),
+                source: e,
+            })?;
+
+            self.collect_exec_output(rx, &start_marker, &end_prefix)
+                .await
         };
 
-        tokio::time::timeout(timeout, wait_fut)
+        tokio::time::timeout(timeout, exec_fut)
             .await
             .map_err(|_| Error::ExecTimeout {
                 id: self.paths.id.clone(),
@@ -725,6 +826,44 @@ async fn supervise(
     res
 }
 
+const MAX_CONSOLE_LINE_BYTES: usize = 4096;
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_len: usize,
+) -> std::io::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            if line.len() + pos >= max_len {
+                let take = max_len - line.len();
+                line.extend_from_slice(&available[..take]);
+                reader.consume(take);
+                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+            }
+            line.extend_from_slice(&available[..pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        if line.len() + available.len() >= max_len {
+            let take = max_len - line.len();
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        }
+        line.extend_from_slice(available);
+        let len = available.len();
+        reader.consume(len);
+    }
+}
+
 async fn forward_lines(
     stream: impl AsyncRead + Unpin,
     source: &'static str,
@@ -733,9 +872,9 @@ async fn forward_lines(
     _done_tx: mpsc::Sender<()>,
     lines_tx: tokio::sync::broadcast::Sender<String>,
 ) {
-    let mut lines = BufReader::new(stream).lines();
+    let mut reader = BufReader::new(stream);
     loop {
-        match lines.next_line().await {
+        match read_bounded_line(&mut reader, MAX_CONSOLE_LINE_BYTES).await {
             Ok(Some(line)) => {
                 let trimmed = line.trim_end_matches('\r').to_string();
                 let marker = match trimmed.as_str() {

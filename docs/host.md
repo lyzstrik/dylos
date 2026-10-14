@@ -36,7 +36,7 @@ cp release-v1.17.0-x86_64/jailer-v1.17.0-x86_64 $D/bin/jailer
 - Filesystem : btrfs, reflink verified
 - Lab storage default : `target/labs` relative to the repository working directory; configure `dylos_store::Store::base` to use another directory on this volume.
 - Rootfs source default : `target/images/rootfs.ext4`, built with `just images`; configure `Store::image` if needed. Source and destination must support FICLONE (no full-copy fallback).
-- Rootfs SHA-256 : `cc40759edf40247e4ad78211247f559b86083a75bf1ced3093ecf92179beef18` (128 MiB, rebuilt with `just images` on 2026-10-14; includes iperf3 and socat for network tests; PID 1 disables ttyS0 echo and respawns the ttyS0 shell with BusyBox `setsid -c` and a one-second backoff).
+- Rootfs SHA-256 : `149e3c9ca9de0cc7a0a3a4b3ff9bd5e78c61549a0efcfd5e1471712113816a82` (128 MiB, rebuilt with `just images` on 2026-10-14; includes iperf3 and socat for network tests; PID 1 disables ttyS0 echo and respawns the ttyS0 shell with BusyBox `setsid -c` and a one-second backoff).
 - Guest shutdown/reboot : use `poweroff -f` or `reboot -f`; the minimal shell init does not handle the signals sent by the unforced BusyBox commands.
 - Storage base and image ancestors must be operator-controlled and not writable by untrusted processes. Directory components and source files are opened without following symlinks; lab directories use mode 0700 and files 0600.
 
