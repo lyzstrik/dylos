@@ -47,25 +47,35 @@ async fn pause_and_resume_dispatch_every_request_before_waiting_and_log_skew() {
 }
 
 #[tokio::test]
-async fn failed_pause_resumes_all_confirmed_vms_and_preserves_rollback_errors() {
-    for rollback_fails in [false, true] {
+async fn failed_pause_resumes_every_vm_and_preserves_rollback_errors() {
+    for (pause_failure, rollback_fails) in [
+        ("fail-paused", false),
+        ("fail-paused", true),
+        ("drop-paused", false),
+        ("drop-paused", true),
+    ] {
         let (sandbox, mut lab) = setup().await;
         let failed = lab.vms()[0].paths().root.clone();
-        std::fs::write(failed.join("fail-paused"), b"").unwrap();
+        std::fs::write(failed.join(pause_failure), b"").unwrap();
         if rollback_fails {
             std::fs::write(lab.vms()[1].paths().root.join("fail-resumed"), b"").unwrap();
         }
+        let (logs, _guard) = Captured::install();
         let error = pause_all(&mut lab).await.unwrap_err();
+        assert!(!logs.contains("skew_us"));
         assert_eq!(matches!(error, LabError::Rollback { .. }), rollback_fails);
         assert!(error.to_string().contains("lab lab, VM"));
         for (index, vm) in lab.vms().iter().enumerate() {
-            assert_eq!(
+            assert!(
                 sandbox
                     .dir
                     .path()
                     .join(format!("{}.resumed", vm.paths().id))
-                    .exists(),
-                index != 0
+                    .exists()
+            );
+            assert_eq!(
+                vm.paths().root.join("is-paused").exists(),
+                rollback_fails && index == 1
             );
         }
         lab.teardown().await.unwrap();

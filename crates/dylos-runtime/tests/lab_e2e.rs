@@ -120,6 +120,10 @@ async fn measure_pause_cycles(lab: &mut Lab) {
         maximum = maximum.max(skew);
         resume_all(lab).await.expect("resume cycle failed");
     }
+    assert!(
+        maximum < Duration::from_millis(100),
+        "pause skew: {maximum:?}"
+    );
     eprintln!(
         "abc pause/resume: cycles=50 mean_skew_us={} maximum_skew_us={}",
         (total / 50).as_micros(),

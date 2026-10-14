@@ -8,8 +8,9 @@ use crate::{Lab, LabError, Vm};
 /// Pauses all VMs concurrently, returning the first-to-last confirmation skew.
 /// The caller must freeze the fabric first when taking a consistent snapshot.
 /// # Errors
-/// Waits for all responses, then resumes every confirmed pause on failure.
+/// Waits for all responses, then attempts to resume every VM on failure.
 /// Transport failures leave the failed VM's state unknown; rollback errors are preserved.
+/// The caller must run this future to completion; dropping it does not perform rollback.
 pub async fn pause_all(lab: &mut Lab) -> Result<Duration, LabError> {
     async {
         let started = Instant::now();
@@ -19,32 +20,21 @@ pub async fn pause_all(lab: &mut Lab) -> Result<Duration, LabError> {
                 .map(|vm| async { change(lab.id(), vm, true).await.map(|()| Instant::now()) }),
         )
         .await;
-        let mut confirmed = Vec::new();
         let mut first = None;
         let mut last = None;
         let mut failure = None;
-        for (vm, result) in lab.vms().iter().zip(results) {
+        for result in results {
             match result {
                 Ok(at) => {
                     first = Some(first.map_or(at, |old: Instant| old.min(at)));
                     last = Some(last.map_or(at, |old: Instant| old.max(at)));
-                    confirmed.push(vm);
                 }
                 Err(error) => record(&mut failure, error),
             }
         }
-        let skew = first.zip(last).map_or(Duration::ZERO, |(a, b)| b - a);
-        tracing::info!(
-            skew_us = skew.as_micros(),
-            confirmed = confirmed.len(),
-            duration_us = started.elapsed().as_micros(),
-            "lab pause confirmations"
-        );
         if let Some(operation) = failure {
             let mut cleanup = None;
-            for result in
-                join_all(confirmed.into_iter().map(|vm| change(lab.id(), vm, false))).await
-            {
+            for result in join_all(lab.vms().iter().map(|vm| change(lab.id(), vm, false))).await {
                 if let Err(error) = result {
                     record(&mut cleanup, error);
                 }
@@ -57,6 +47,13 @@ pub async fn pause_all(lab: &mut Lab) -> Result<Duration, LabError> {
                 },
             });
         }
+        let skew = first.zip(last).map_or(Duration::ZERO, |(a, b)| b - a);
+        tracing::info!(
+            skew_us = skew.as_micros(),
+            confirmed = lab.vms().len(),
+            duration_us = started.elapsed().as_micros(),
+            "lab pause confirmations"
+        );
         Ok(skew)
     }
     .instrument(tracing::info_span!("pause_all", lab = lab.id()))

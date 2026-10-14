@@ -221,23 +221,16 @@ async fn parallel_pause_reply(
                         .is_some_and(|ext| ext == action)
                 })
                 .count()
-                == if action == "resumed" {
-                    std::fs::read_dir(sandbox.join("jails/firecracker"))
-                        .unwrap()
-                        .filter(|entry| {
-                            !entry
-                                .as_ref()
-                                .unwrap()
-                                .path()
-                                .join("root/fail-paused")
-                                .exists()
-                        })
-                        .count()
-                } else {
-                    3
-                }
+                == 3
         })
         .await;
+        if action == "paused" {
+            std::fs::write(root.join("is-paused"), b"").unwrap();
+            if root.join("drop-paused").exists() {
+                stream.shutdown().await.unwrap();
+                return true;
+            }
+        }
         if root.join(format!("fail-{action}")).exists() {
             stream
                 .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
@@ -245,6 +238,9 @@ async fn parallel_pause_reply(
                 .unwrap();
             stream.shutdown().await.unwrap();
             return true;
+        }
+        if action == "resumed" && root.join("is-paused").exists() {
+            std::fs::remove_file(root.join("is-paused")).unwrap();
         }
     }
     false
