@@ -174,7 +174,10 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn abc_fabric_freeze_under_real_traffic() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
         eprintln!("SKIPPED freeze_e2e: DYLOS_FC_BIN_DIR is not set");
         return;
