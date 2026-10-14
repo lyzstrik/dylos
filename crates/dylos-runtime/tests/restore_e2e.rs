@@ -81,8 +81,8 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
     let mut restored = None;
     let result = std::panic::AssertUnwindSafe(async {
         exec(&original, "C", "iperf3 -6 -s -D -p 5201; iperf3 -4 -s -D -p 5202").await;
-        exec(&original, "A", "iperf3 -6 -c fd64:796c:6f73:2::2 -p 5201 -t 0 -i 1 --forceflush > /tmp/flow6.log 2>&1 < /dev/null &").await;
-        exec(&original, "A", "iperf3 -4 -c 10.0.2.2 -p 5202 -t 0 -i 1 --forceflush > /tmp/flow4.log 2>&1 < /dev/null &").await;
+        exec(&original, "A", "iperf3 -6 -c fd64:796c:6f73:2::2 -p 5201 -t 0 -i 1 --forceflush > /tmp/flow6.log 2>&1 < /dev/null & true").await;
+        exec(&original, "A", "iperf3 -4 -c 10.0.2.2 -p 5202 -t 0 -i 1 --forceflush > /tmp/flow4.log 2>&1 < /dev/null & true").await;
         progress(&original, 512).await;
         let sockets = exec(&original, "A", "ss -Htn state established | sort").await;
         assert!(sockets.contains("5201") && sockets.contains("5202"), "{sockets}");
@@ -95,7 +95,7 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         assert_eq!(original.network().unwrap().plan().bridges(), clone.network().unwrap().plan().bridges());
         assert_ne!(original.network().unwrap().netns_path(), clone.network().unwrap().netns_path());
         // Queue lengths vary; compare endpoints while requiring both pre-existing data connections.
-        let endpoints = |text: &str| text.lines().map(|line| line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>();
+        let endpoints = |text: &str| { let mut rows = text.lines().map(|line| line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(); rows.sort(); rows };
         assert_eq!(endpoints(&sockets), endpoints(&exec(clone, "A", "ss -Htn state established | sort").await));
         original.teardown().await.unwrap();
         let size = progress(clone, 512).await;
