@@ -97,6 +97,18 @@ enum LabCommands {
     Up(UpArgs),
     /// Tear down a running or crashed lab
     Down(DownArgs),
+    /// Snapshot a running lab's microVMs and disks
+    Snapshot(SnapshotArgs),
+}
+
+#[derive(Args, Debug)]
+struct SnapshotArgs {
+    /// Lab identifier to snapshot
+    id: String,
+
+    /// Optional snapshot identifier (defaults to `snap-<timestamp>`)
+    #[arg(long)]
+    snapshot_id: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -147,6 +159,7 @@ async fn main() -> Result<()> {
         Commands::Lab(lab_args) => match lab_args.command {
             LabCommands::Up(up_args) => lab_up(up_args).await,
             LabCommands::Down(down_args) => lab_down(down_args).await,
+            LabCommands::Snapshot(snapshot_args) => lab_snapshot(snapshot_args).await,
         },
     }
 }
@@ -302,4 +315,36 @@ async fn lab_down(args: DownArgs) -> Result<()> {
             Err(err).with_context(|| format!("failed to request teardown for lab '{}'", args.id))
         }
     }
+}
+
+async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
+    validate_lab_id(&args.id)?;
+    if let Some(ref snap_id) = args.snapshot_id {
+        dylos_core::validate_name(snap_id, 64)
+            .map_err(|reason| anyhow!("invalid snapshot id '{snap_id}': {reason}"))?;
+    }
+
+    let config = build_config();
+    let timeout = Duration::from_secs(60);
+
+    let pinned = pin_control_socket(&config.store.base, &args.id);
+    let socket_file = match pinned {
+        Ok(f) => f,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to access control socket for lab '{}' (symlinks and unsafe paths are refused)",
+                    args.id
+                )
+            });
+        }
+    };
+
+    let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket_file.as_raw_fd()));
+    let res = Lab::request_snapshot(&socket_path, args.snapshot_id.as_deref(), timeout).await;
+    drop(socket_file);
+
+    res.with_context(|| format!("failed to snapshot lab '{}'", args.id))?;
+    println!("lab {} snapshotted successfully", args.id);
+    Ok(())
 }
