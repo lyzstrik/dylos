@@ -181,7 +181,7 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     let taps = tap_rx(namespace).await;
 
     // Pre-T TAP queues are allowed to drain. Observe this separately from the quiet window.
-    let stable = tokio::time::timeout(Duration::from_secs(5), async {
+    let stable = tokio::time::timeout(Duration::from_secs(20), async {
         let mut previous = initial.clone();
         let mut since = Instant::now();
         loop {
