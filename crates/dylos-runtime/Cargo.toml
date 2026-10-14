@@ -13,6 +13,7 @@ test-support = []
 workspace = true
 
 [dependencies]
+dylos-agent = { path = "../dylos-agent" }
 dylos-core = { path = "../dylos-core" }
 dylos-fc = { path = "../dylos-fc" }
 dylos-net = { path = "../dylos-net" }

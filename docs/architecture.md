@@ -51,3 +51,45 @@ Every segment is assigned an IPv6 prefix and optionally an IPv4 prefix. Addresse
 
 - **Privileges**: See [ADR-0004: Privilege Model](adr/0004-privilege-model.md) for details on privileged operations.
 - **Security**: The overall threat model and security considerations are maintained in the [Threat Model](security/threat-model.md) document. Dylos components are designed with strict boundaries, using `#![forbid(unsafe_code)]` wherever possible (with narrow, documented exceptions in `dylos-net` and `dylos-store`).
+
+## Guest time after restore
+
+Lab boot attaches a Firecracker vsock device (CID 3, jail-local
+`/vsock.sock`). Restore binds `vsock.sock_5000` in each new jail before
+loading and resuming the VMs. After all VMs resume, the runtime accepts each
+agent reconnection, sends the host's current Unix time via `resync`, and
+requires an acknowledgement and health reply before thawing the fabric.
+An absent or invalid agent fails restore and uses the normal rollback path.
+Snapshots made before vsock was configured cannot satisfy this readiness gate.
+
+Resync steps `CLOCK_REALTIME`; it does not explicitly change
+`CLOCK_MONOTONIC`, `CLOCK_BOOTTIME`, or TCP timers. Their behavior across
+Firecracker restore must be measured rather than inferred from the wall clock.
+The dual-stack TCP restore e2e test waits 30 seconds after snapshot completion,
+then checks guest wall time against a host time interval with 100 ms tolerance,
+retries host sampling intervals wider than 50 ms for at most 10 seconds,
+checks that monotonic time has not gone backwards, and prints
+`CLOCK_MEASUREMENT` with nanosecond clock samples and `ss -o` TCP timer
+state before snapshot and after restore. Both pre-existing IPv6 and IPv4 TCP
+connections must retain their endpoints and make further progress. This probes
+timer recovery for established streaming connections, not every TCP timeout
+policy or external peers.
+
+Observed on the Ubuntu 24.04 KVM CI runner with Firecracker 1.17.0
+([E2E run](https://github.com/lyzstrik/dylos/actions/runs/38621523007)):
+the pre-snapshot to post-resync wall-clock samples advanced 120.278 seconds
+(including snapshot work and the deliberate 30-second wait), while monotonic
+and boot-time samples advanced 2.292 seconds each. Both clocks remained
+nondecreasing, but did not account for the host's elapsed downtime. Restored
+applications must therefore not interpret monotonic elapsed time as elapsed
+host wall time. Wall time satisfied the 100 ms bound against both host sampling
+endpoints after resync.
+
+Before snapshot, the sampled IPv6 data socket had a retransmission timer with
+4 ms remaining and zero retransmissions. After restore, both IPv6 and IPv4
+data sockets showed retransmission timers with 892 ms remaining and three
+retransmissions. Their original endpoints survived and both streams subsequently
+progressed. This is evidence of retransmission recovery despite lost fabric
+traffic, consistent with guest timer progression following guest monotonic time
+rather than the stepped wall clock; it is not a measurement of every timer's
+exact remaining deadline at the snapshot cut.

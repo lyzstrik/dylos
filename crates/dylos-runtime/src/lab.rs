@@ -319,12 +319,7 @@ impl Lab {
             "all VM APIs ready"
         );
         if restoring {
-            self.load_restored().await?;
-            crate::resume_all(self).await?;
-            if let Some(network) = self.network.as_mut() {
-                network.thaw().await?;
-            }
-            self.bind_control_socket().await?;
+            self.resume_restored(config).await?;
             return Ok(());
         }
         let started = Instant::now();
@@ -360,6 +355,21 @@ impl Lab {
             }))
             .await,
         )?;
+        self.bind_control_socket().await?;
+        Ok(())
+    }
+
+    async fn resume_restored(&mut self, config: &LabConfig) -> Result<()> {
+        let listeners =
+            crate::agent::listeners(&self.vms, &config.jailer).map_err(|e| io(&self.id, e))?;
+        self.load_restored().await?;
+        crate::resume_all(self).await?;
+        crate::agent::resync_all(&self.vms, &listeners)
+            .await
+            .map_err(|e| invalid(&self.id, &e.to_string()))?;
+        if let Some(network) = self.network.as_mut() {
+            network.thaw().await?;
+        }
         self.bind_control_socket().await?;
         Ok(())
     }
@@ -1037,6 +1047,14 @@ async fn configure_vm(
             drive.path_on_host = Some("/rootfs.ext4".into());
             drive.is_read_only = Some(false);
             api.put_drive(&drive).await?;
+            let _: Option<serde_json::Value> = api
+                .put(
+                    "/vsock",
+                    &serde_json::json!({
+                        "guest_cid": 3, "uds_path": "/vsock.sock"
+                    }),
+                )
+                .await?;
             for interface in &node.interfaces {
                 let mut net = NetworkInterface::new(
                     &interface.name,
