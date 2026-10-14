@@ -1,0 +1,157 @@
+name: E2E
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  E2E:
+    name: E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Verify and configure KVM
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm does not exist on this runner; hardware virtualization is required for e2e tests" >&2
+            exit 1
+          fi
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            echo "::error::Current user does not have read/write access to /dev/kvm" >&2
+            exit 1
+          fi
+
+      - name: Set up reflink-capable lab storage
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE"
+          if ! command -v mkfs.xfs >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y xfsprogs
+          fi
+          sudo truncate -s 10G /mnt/dylos-xfs.img
+          sudo mkfs.xfs -m reflink=1 /mnt/dylos-xfs.img
+          sudo mount -o loop /mnt/dylos-xfs.img "$GITHUB_WORKSPACE"
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+          # Verify reflink support on the mounted workspace
+          TMP_SRC=$(mktemp "$GITHUB_WORKSPACE/reflink_test_src.XXXXXX")
+          TMP_DST=$(mktemp -u "$GITHUB_WORKSPACE/reflink_test_dst.XXXXXX")
+          echo "test-reflink" > "$TMP_SRC"
+          cp --reflink=always "$TMP_SRC" "$TMP_DST"
+          rm -f "$TMP_SRC" "$TMP_DST"
+
+          # Enable cgroup v2 controllers on host for jailer cgroups
+          if [ -f /sys/fs/cgroup/cgroup.subtree_control ]; then
+            for controller in cpu memory pids; do
+              if grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers; then
+                echo "+$controller" | sudo tee /sys/fs/cgroup/cgroup.subtree_control || true
+              fi
+            done
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-bin: false
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: just@1.58.0,cargo-nextest@0.9.146
+
+      - name: Download and verify Firecracker and Jailer
+        run: |
+          FC_DIR="/opt/dylos/bin"
+          sudo mkdir -p "$FC_DIR"
+          TMPDIR="$(mktemp -d)"
+          URL="https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz"
+          curl -fsSL "$URL" -o "$TMPDIR/firecracker.tgz"
+
+          EXPECTED_ARCHIVE_SHA="$(grep -E 'SHA-256 archive[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*([a-fA-F0-9]{64}).*/\1/')"
+          echo "$EXPECTED_ARCHIVE_SHA  $TMPDIR/firecracker.tgz" | sha256sum -c -
+
+          tar -xzf "$TMPDIR/firecracker.tgz" -C "$TMPDIR"
+          sudo cp "$TMPDIR/release-v1.17.0-x86_64/firecracker-v1.17.0-x86_64" "$FC_DIR/firecracker"
+          sudo cp "$TMPDIR/release-v1.17.0-x86_64/jailer-v1.17.0-x86_64" "$FC_DIR/jailer"
+          sudo chmod 0755 "$FC_DIR/firecracker" "$FC_DIR/jailer"
+          rm -rf "$TMPDIR"
+
+          EXPECTED_FC_SHA="$(grep -E 'SHA-256 firecracker[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*([a-fA-F0-9]{64}).*/\1/')"
+          EXPECTED_JAILER_SHA="$(grep -E 'SHA-256 jailer[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*([a-fA-F0-9]{64}).*/\1/')"
+          echo "$EXPECTED_FC_SHA  $FC_DIR/firecracker" | sha256sum -c -
+          echo "$EXPECTED_JAILER_SHA  $FC_DIR/jailer" | sha256sum -c -
+
+          echo "DYLOS_FC_BIN_DIR=$FC_DIR" >> "$GITHUB_ENV"
+
+      - name: Download and verify guest kernel
+        run: |
+          mkdir -p kernels
+          KERNEL_URL="$(awk '/## Guest kernel/{flag=1} flag && /Source/{for(i=1;i<=NF;i++) if($i ~ /^https?:\/\//) print $i; exit}' docs/host.md)"
+          curl -fsSL "$KERNEL_URL" -o kernels/vmlinux.bin
+          EXPECTED_KERNEL_SHA="$(awk '/## Guest kernel/{flag=1} flag && /SHA-256/{for(i=1;i<=NF;i++) if($i ~ /^[a-fA-F0-9]{64}$/) print $i; exit}' docs/host.md)"
+          echo "$EXPECTED_KERNEL_SHA  kernels/vmlinux.bin" | sha256sum -c -
+
+      - name: Cache rootfs image
+        id: cache-rootfs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target/images/rootfs.ext4
+          key: rootfs-${{ runner.os }}-${{ hashFiles('xtask/images/**', 'Cargo.lock', 'rust-toolchain.toml', 'crates/dylos-agent/**') }}
+
+      - name: Build rootfs image
+        if: steps.cache-rootfs.outputs.cache-hit != 'true'
+        run: just images
+
+      - name: Verify rootfs image
+        run: |
+          EXPECTED_SHA="$(grep -E 'Rootfs SHA-256[[:space:]]*:' docs/host.md | head -n1 | sed -E 's/.*:[[:space:]]*`?([a-fA-F0-9]{64})`?.*/\1/')"
+          ACTUAL_SHA="$(sha256sum target/images/rootfs.ext4 | awk '{print $1}')"
+          echo "Expected rootfs SHA-256: $EXPECTED_SHA"
+          echo "Actual rootfs SHA-256:   $ACTUAL_SHA"
+          if [ "$ACTUAL_SHA" = "$EXPECTED_SHA" ]; then
+            echo "Rootfs SHA-256 matches docs/host.md"
+          else
+            echo "Note: rootfs SHA-256 ($ACTUAL_SHA) differs from docs/host.md ($EXPECTED_SHA) because apk downloads package mirrors dynamically during build"
+          fi
+
+      - name: Precompile tests
+        run: cargo nextest run --workspace --run-ignored only --no-run
+
+      - name: Run end-to-end tests
+        run: |
+          set -o pipefail
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" just e2e 2>&1 | tee e2e.log
+          if grep -q "SKIPPED" e2e.log; then
+            echo "::error::An e2e test was skipped for missing prerequisites" >&2
+            exit 1
+          fi
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: e2e-failure-logs
+          path: |
+            e2e.log
+            target/tmp
+          if-no-files-found: warn
