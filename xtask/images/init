@@ -7,8 +7,10 @@ mount -t devtmpfs devtmpfs /dev
 dylos-agent &
 if grep -q "write_churn=1" /proc/cmdline; then
     (
+        seek=0
         while :; do
-            dd if=/dev/urandom of=/var/log/churn.dat bs=4k count=1 conv=notrunc oflag=append 2>/dev/null
+            dd if=/dev/urandom of=/var/log/churn.dat bs=4k count=1 seek="$seek" conv=notrunc 2>/dev/null
+            seek=$(( (seek + 1) % 1024 ))
             sync
         done
     ) &
