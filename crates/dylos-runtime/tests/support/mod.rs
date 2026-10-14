@@ -373,6 +373,19 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
                     let mut reader = tokio::io::BufReader::new(stream);
                     let mut line = String::new();
                     reader.read_line(&mut line).await.unwrap();
+                    assert!(matches!(
+                        dylos_agent::protocol::Request::from_line(&line)
+                            .unwrap()
+                            .body,
+                        dylos_agent::protocol::RequestBody::InjectEntropy { .. }
+                    ));
+                    reader
+                        .get_mut()
+                        .write_all(b"{\"v\":1,\"type\":\"ok\"}\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
                     let request = dylos_agent::protocol::Request::from_line(&line).unwrap();
                     assert!(matches!(
                         request.body,

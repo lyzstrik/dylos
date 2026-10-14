@@ -68,3 +68,15 @@ fn missing_version_and_garbage_are_rejected() {
         Err(ProtocolError::Malformed(_))
     ));
 }
+
+#[test]
+fn entropy_request_has_exactly_32_bytes() {
+    let body = RequestBody::InjectEntropy { entropy: [7; 32] };
+    let line = Request::new(body.clone()).to_line().unwrap();
+    assert_eq!(Request::from_line(&line).unwrap().body, body);
+    for bytes in [vec![0; 31], vec![0; 33], vec![256; 32], vec![-1; 32]] {
+        let invalid =
+            serde_json::json!({"v":1,"type":"inject_entropy","entropy":bytes}).to_string();
+        assert!(Request::from_line(&invalid).is_err());
+    }
+}

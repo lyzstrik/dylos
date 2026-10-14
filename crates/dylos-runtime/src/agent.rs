@@ -73,6 +73,30 @@ pub async fn resync<S: AsyncRead + AsyncWrite + Unpin>(
     .map_err(|_| AgentError::Timeout)?
 }
 
+/// Mixes exactly 256 fresh host entropy bits into the guest input pool.
+/// This does not force a synchronous CRNG reseed; `VMGenID` handles reseeding
+/// with the pinned Firecracker and guest kernel.
+/// # Errors
+/// Fails closed on entropy source, protocol, I/O or deadline failures.
+pub async fn inject_entropy<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    deadline: Duration,
+) -> Result<(), AgentError> {
+    tokio::time::timeout(deadline, async {
+        let mut entropy = [0; dylos_agent::protocol::ENTROPY_BYTES];
+        tokio::fs::File::open("/dev/urandom")
+            .await?
+            .read_exact(&mut entropy)
+            .await?;
+        if request(stream, RequestBody::InjectEntropy { entropy }).await? != ReplyBody::Ok {
+            return Err(AgentError::Unexpected);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| AgentError::Timeout)?
+}
+
 pub(crate) fn listeners(
     vms: &[crate::Vm],
     config: &crate::jailer::JailerConfig,
@@ -105,6 +129,7 @@ pub(crate) async fn resync_all(
             let started = std::time::Instant::now();
             let result = tokio::time::timeout(Duration::from_secs(15), async {
                 let (mut stream, _) = listener.accept().await?;
+                inject_entropy(&mut stream, Duration::from_secs(5)).await?;
                 resync(&mut stream, Duration::from_secs(5)).await?;
                 Ok::<_, AgentError>(())
             })
@@ -114,7 +139,7 @@ pub(crate) async fn resync_all(
                 vm = vm.node(),
                 duration_ms = started.elapsed().as_millis(),
                 success = result.is_ok(),
-                "guest clock resync completed"
+                "guest entropy and clock readiness completed"
             );
             result
         }))

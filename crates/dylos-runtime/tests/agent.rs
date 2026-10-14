@@ -71,3 +71,61 @@ impl dylos_agent::clock::GuestClock for FakeClock {
         Ok(Duration::ZERO)
     }
 }
+
+struct FakeEntropy(std::sync::Mutex<Vec<[u8; 32]>>);
+impl dylos_agent::entropy::GuestEntropy for FakeEntropy {
+    fn mix(&self, bytes: [u8; 32]) -> std::io::Result<()> {
+        self.0.lock().unwrap().push(bytes);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn restored_guests_receive_independent_host_entropy_before_health() {
+    let entropy = std::sync::Arc::new(FakeEntropy(std::sync::Mutex::new(Vec::new())));
+    for _ in 0..2 {
+        let (mut host, guest) = tokio::io::duplex(8192);
+        let source = entropy.clone();
+        let peer = tokio::spawn(async move {
+            dylos_agent::agent::serve_with_entropy(guest, &FakeClock, source)
+                .await
+                .unwrap();
+        });
+        dylos_runtime::agent::inject_entropy(&mut host, Duration::from_secs(1))
+            .await
+            .unwrap();
+        resync(&mut host, Duration::from_secs(1)).await.unwrap();
+        drop(host);
+        peer.await.unwrap();
+    }
+    let injected = entropy.0.lock().unwrap();
+    assert_eq!(injected.len(), 2);
+    assert_ne!(injected[0], injected[1]);
+}
+
+struct FailedEntropy;
+impl dylos_agent::entropy::GuestEntropy for FailedEntropy {
+    fn mix(&self, _: [u8; 32]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::PermissionDenied.into())
+    }
+}
+
+#[tokio::test]
+async fn failed_entropy_injection_is_not_acknowledged() {
+    let (mut host, guest) = tokio::io::duplex(8192);
+    let peer = tokio::spawn(async move {
+        dylos_agent::agent::serve_with_entropy(
+            guest,
+            &FakeClock,
+            std::sync::Arc::new(FailedEntropy),
+        )
+        .await
+        .unwrap();
+    });
+    assert!(matches!(
+        dylos_runtime::agent::inject_entropy(&mut host, Duration::from_secs(1)).await,
+        Err(AgentError::Unexpected)
+    ));
+    drop(host);
+    peer.await.unwrap();
+}
