@@ -32,9 +32,9 @@ check:
 typos:
     typos
 
-# Detect unused dependencies
+# Detect unused dependencies (fuzz/ is outside the workspace and cannot be loaded by cargo-machete)
 machete:
-    cargo machete
+    cargo machete crates xtask
 
 # Check dependency policy
 deny:
