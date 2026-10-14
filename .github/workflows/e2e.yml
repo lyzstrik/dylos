@@ -124,7 +124,7 @@ jobs:
 
       - name: Verify rootfs image
         run: |
-          EXPECTED_SHA="$(sed -n 's/.*Rootfs SHA-256 : `\([a-fA-F0-9]\{64\}\)`.*/\1/p' docs/host.md)"
+          EXPECTED_SHA="$(grep -E 'Rootfs SHA-256' docs/host.md | grep -oE '[a-fA-F0-9]{64}')"
           ACTUAL_SHA="$(sha256sum target/images/rootfs.ext4 | cut -d' ' -f1)"
           echo "Expected rootfs SHA-256: $EXPECTED_SHA"
           echo "Actual rootfs SHA-256:   $ACTUAL_SHA"
