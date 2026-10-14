@@ -250,6 +250,12 @@ impl Lab {
         &self.vms
     }
 
+    /// Gives integration tests access to the live fabric, until teardown removes it.
+    #[cfg(feature = "test-support")]
+    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
+        self.network.as_mut()
+    }
+
     /// Returns a reference to the VM with the given node name, if present.
     #[must_use]
     pub fn vm(&self, node: &str) -> Option<&Vm> {
