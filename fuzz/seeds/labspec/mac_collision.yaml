@@ -1,0 +1,20 @@
+nodes:
+  - name: NODE1
+    image: dummy
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: test
+        ipv6: fd00::1/64
+  - name: NODE2
+    image: dummy
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: test
+        ipv6: fd00::2/64
+segments:
+  - name: test
+    ipv6: fd00::/64
