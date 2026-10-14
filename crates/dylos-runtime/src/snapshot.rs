@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -601,6 +603,7 @@ async fn run_snapshot_steps(
 
         let state_max_bytes = 16 * 1024 * 1024;
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
+        #[cfg(feature = "test-hooks")]
         let root_dir = vm.root_dir.clone();
 
         let handle = tokio::task::spawn_blocking(move || {

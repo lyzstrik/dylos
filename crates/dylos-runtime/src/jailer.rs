@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Component;
 
 use nix::fcntl::{AtFlags, OFlag, openat};
@@ -86,6 +86,7 @@ impl JailerConfig {
 pub struct ChrootFile {
     pub source: PathBuf,
     pub name: String,
+    pub read_only: bool,
 }
 
 impl ChrootFile {
@@ -93,6 +94,16 @@ impl ChrootFile {
         Self {
             source: source.into(),
             name: name.into(),
+            read_only: false,
+        }
+    }
+
+    #[must_use]
+    pub fn read_only(source: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            name: name.into(),
+            read_only: true,
         }
     }
 
@@ -444,7 +455,13 @@ fn populate(
             #[cfg(feature = "test-hooks")]
             source_barrier,
         )?;
-        own(&placed, &paths.host_path(&file.jailed_path()))?;
+        if file.read_only {
+            placed
+                .set_permissions(std::fs::Permissions::from_mode(0o444))
+                .map_err(|e| io("chmod read-only", &paths.host_path(&file.jailed_path()))(e))?;
+        } else {
+            own(&placed, &paths.host_path(&file.jailed_path()))?;
+        }
     }
     let metrics_path = paths.host_path(METRICS_FILE);
     let metrics = openat(
