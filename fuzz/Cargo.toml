@@ -1,0 +1,43 @@
+[package]
+name = "dylos-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[workspace.dependencies]
+libfuzzer-sys = "0.4"
+dylos-core = { path = "../crates/dylos-core" }
+dylos-agent = { path = "../crates/dylos-agent" }
+
+[dependencies]
+libfuzzer-sys.workspace = true
+dylos-core.workspace = true
+dylos-agent.workspace = true
+
+[[bin]]
+name = "labspec"
+path = "fuzz_targets/labspec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "agent_protocol"
+path = "fuzz_targets/agent_protocol.rs"
+test = false
+doc = false
+bench = false

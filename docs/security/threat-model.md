@@ -54,6 +54,6 @@ These two risks are known and deliberately left open during the spike, to keep i
 - **Shared kernel inode owned by the jailer uid (LYZ-47).** Jail population hard-links source files into each jail and chowns them to the jailer uid, and all VMs share that uid. The read-only kernel shared by every VM is therefore owned by that uid on the host: a compromised Firecracker process could modify the kernel used by the other VMs and by future boots. Target: one uid per VM (ADR-0004) and per-VM copies or reflinks of shared files, with source files never chowned.
 - **Unfiltered traffic between peers on a segment (LYZ-48).** Bridges isolate labs from each other and from the host, but not VMs on the same segment from each other: a guest can spoof NDP, router advertisements, ARP and source addresses, and flood its peers. Target: per-TAP source filtering, RA and DHCP guard and rate limits, optional per lab since some labs need to model these behaviors.
 
-## Follow-ups
+## Parser fuzzing
 
-- Fuzzing of the `LabSpec`, manifest, and agent protocol parsers with `cargo-fuzz` (not done here).
+Parser fuzzing is implemented (LYZ-63): `cargo-fuzz` covers `LabSpec::from_yaml_str` and successful validation, snapshot manifest JSON serialization/parsing equality, and agent `Request`/`Reply` line serialization/parsing equality through public APIs. Committed real-file seeds and minimal valid messages feed bounded weekly and manual runs. This exercises parser robustness, not host listener size limits or transport behavior.

@@ -17,6 +17,11 @@ allow = [
     "Zlib",
 ]
 
+# NCSA is permissive and OSI-approved; libfuzzer-sys is fuzz-only, never shipped.
+[[licenses.exceptions]]
+allow = ["NCSA"]
+crate = "libfuzzer-sys"
+
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"

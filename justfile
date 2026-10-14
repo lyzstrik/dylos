@@ -61,3 +61,19 @@ e2e: host-check
 # Build guest images (rootfs) with rootless podman
 images:
     cargo xtask images
+
+# Build every fuzz harness with the isolated nightly toolchain
+fuzz-check:
+    cd fuzz && cargo deny --locked check
+    cd fuzz && cargo fuzz build
+
+# Fuzz one parser for a bounded number of seconds
+fuzz target seconds="120":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case '{{target}}' in labspec|manifest|agent_protocol) ;; *) echo "Unknown fuzz target" >&2; exit 2 ;; esac
+    [[ '{{seconds}}' =~ ^[1-9][0-9]*$ ]] || { echo "Seconds must be positive" >&2; exit 2; }
+    cd fuzz
+    mkdir -p 'corpus/{{target}}'
+    cp -n seeds/{{target}}/* 'corpus/{{target}}/'
+    cargo fuzz run '{{target}}' -- -max_total_time='{{seconds}}'

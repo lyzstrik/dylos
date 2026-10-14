@@ -1,0 +1,44 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: just@1.58.0,cargo-deny@0.20.2
+      - name: Install fuzz tools
+        working-directory: fuzz
+        run: |
+          rustup toolchain install nightly-2026-10-13 --profile minimal
+          cargo install --locked cargo-fuzz --version 0.13.2
+      - name: Build harnesses
+        run: just fuzz-check
+      - name: Fuzz LabSpec
+        if: ${{ !cancelled() }}
+        run: just fuzz labspec 300
+      - name: Fuzz manifest
+        if: ${{ !cancelled() }}
+        run: just fuzz manifest 300
+      - name: Fuzz agent protocol
+        if: ${{ !cancelled() }}
+        run: just fuzz agent_protocol 300
+      - name: Upload crash artifacts
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-crashes
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

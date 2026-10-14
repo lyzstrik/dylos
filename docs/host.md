@@ -56,6 +56,8 @@ rustup show
 - lefthook : 2.1.16
 - actionlint : 1.7.12 (SHA-256 archive: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8; on Arch Linux: `paru -S actionlint` or install binary below)
 - zizmor : 1.30.1
+- cargo-fuzz : 0.13.2
+- Fuzz toolchain : `nightly-2026-10-13`, isolated in `fuzz/rust-toolchain.toml`
 
 Install:
 
@@ -65,6 +67,10 @@ curl -fsSLO https://github.com/rhysd/actionlint/releases/download/v1.7.12/action
 echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c && \
 tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint && \
 install -m 0755 actionlint ~/.local/bin/
+
+# fuzzing (independent of the stable workspace)
+rustup toolchain install nightly-2026-10-13 --profile minimal
+cargo install --locked cargo-fuzz --version 0.13.2
 
 # zizmor
 cargo install --locked zizmor --version 1.30.1

@@ -22,3 +22,8 @@ target
 
 /kernels/*.bin
 /target/
+
+# Generated fuzz inputs and crash artifacts
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
