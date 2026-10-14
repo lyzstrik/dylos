@@ -651,6 +651,57 @@ impl Store {
     /// # Errors
     /// Rejects invalid specs, existing labs, symlinks, and unsupported reflinks. Rolls back on failure.
     pub fn create(&self, id: &str, spec: &LabSpec) -> Result<Lab, Error> {
+        self.create_from(id, spec, None)
+    }
+
+    /// Verifies a snapshot and reflinks private restore files without changing its inodes.
+    /// # Errors
+    /// Rejects malformed manifests, integrity failures, existing labs and unsupported reflinks.
+    pub fn restore(&self, id: &str, path: &Path) -> Result<(Lab, SnapshotManifest), Error> {
+        valid_id(id)?;
+        if path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == id)
+        {
+            return Err(Error::InvalidId(id.into()));
+        }
+        let opener = SnapshotOpener::new(path).map_err(|e| contextual(path, e))?;
+        let mut json = String::new();
+        opener
+            .open(Path::new("manifest.json"))
+            .map_err(|e| contextual(path, e))?
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut json)
+            .map_err(|e| contextual(path, e))?;
+        if json.len() > 1024 * 1024 {
+            return Err(contextual(path, io::ErrorKind::InvalidData.into()));
+        }
+        let manifest = SnapshotManifest::from_json_str(&json)?;
+        manifest.lab_spec.validate()?;
+        if manifest.firecracker_version != "1.17.0"
+            || manifest.vms.len() != manifest.lab_spec.nodes.len()
+            || manifest
+                .lab_spec
+                .nodes
+                .iter()
+                .any(|n| !manifest.vms.contains_key(&n.name))
+            || manifest.vms.values().any(|vm| vm.disks.len() != 1)
+        {
+            return Err(contextual(path, io::ErrorKind::InvalidData.into()));
+        }
+        manifest.verify(opener.verify_opener())?;
+        let lab = self.create_from(id, &manifest.lab_spec, Some((&opener, &manifest)))?;
+        Ok((lab, manifest))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_from(
+        &self,
+        id: &str,
+        spec: &LabSpec,
+        snapshot: Option<(&SnapshotOpener, &SnapshotManifest)>,
+    ) -> Result<Lab, Error> {
         valid_id(id)?;
         spec.validate()?;
         let _span = tracing::info_span!("store_create", lab = id).entered();
@@ -675,26 +726,31 @@ impl Store {
             owned: true,
         };
         let result = (|| {
-            let source_parent = self
-                .image
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let source_dir =
-                directory(source_parent, false).map_err(|e| contextual(&self.image, e))?;
-            let name = self
-                .image
-                .file_name()
-                .ok_or_else(|| contextual(&self.image, io::ErrorKind::InvalidInput.into()))?;
-            let source = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
-                .map_err(|e| contextual(&self.image, e))?;
-            if !source
-                .metadata()
-                .map_err(|e| contextual(&self.image, e))?
-                .is_file()
-            {
-                return Err(contextual(&self.image, io::ErrorKind::InvalidInput.into()));
-            }
+            let image = if snapshot.is_none() {
+                let source_parent = self
+                    .image
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                let source_dir =
+                    directory(source_parent, false).map_err(|e| contextual(&self.image, e))?;
+                let name = self
+                    .image
+                    .file_name()
+                    .ok_or_else(|| contextual(&self.image, io::ErrorKind::InvalidInput.into()))?;
+                let source = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
+                    .map_err(|e| contextual(&self.image, e))?;
+                if !source
+                    .metadata()
+                    .map_err(|e| contextual(&self.image, e))?
+                    .is_file()
+                {
+                    return Err(contextual(&self.image, io::ErrorKind::InvalidInput.into()));
+                }
+                Some(source)
+            } else {
+                None
+            };
             let vms =
                 make_directory(&lab.directory, "vms").map_err(|e| contextual(&lab.root, e))?;
             for node in &spec.nodes {
@@ -709,10 +765,39 @@ impl Store {
                     OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
                 )
                 .map_err(|e| contextual(&paths.rootfs, e))?;
-                reflink(&source, &destination).map_err(|source| Error::Reflink {
+                let restored_source = snapshot
+                    .map(|(opener, manifest)| opener.open(&manifest.vms[&node.name].disks[0].path))
+                    .transpose()
+                    .map_err(|e| contextual(&paths.rootfs, e))?;
+                let source = restored_source
+                    .as_ref()
+                    .or(image.as_ref())
+                    .ok_or_else(|| contextual(&paths.rootfs, io::ErrorKind::InvalidData.into()))?;
+                reflink(source, &destination).map_err(|source| Error::Reflink {
                     path: paths.rootfs,
                     source,
                 })?;
+                if let Some((opener, manifest)) = snapshot {
+                    let saved = &manifest.vms[&node.name];
+                    for (meta, name) in [
+                        (&saved.state_file, "vm.state"),
+                        (&saved.memory_file, "vm.mem"),
+                    ] {
+                        let source = opener
+                            .open(&meta.path)
+                            .map_err(|e| contextual(&meta.path, e))?;
+                        let destination = open(
+                            &vm,
+                            name.as_ref(),
+                            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                        )
+                        .map_err(|e| contextual(&paths.directory.join(name), e))?;
+                        reflink(&source, &destination).map_err(|source| Error::Reflink {
+                            path: paths.directory.join(name),
+                            source,
+                        })?;
+                    }
+                }
                 tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
             }
             let state = State {

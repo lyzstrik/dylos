@@ -17,6 +17,27 @@ pub(crate) struct State {
     frozen: bool,
 }
 
+pub(crate) async fn initially_frozen(plan: &FabricPlan, handle: &Handle) -> Result<State, Error> {
+    let mut saved = Vec::new();
+    for name in plan
+        .taps()
+        .iter()
+        .map(|t| &t.name)
+        .chain(plan.bridges().iter().map(|b| &b.name))
+    {
+        let index = super::fabric::require_index(plan.lab_id(), handle, name).await?;
+        saved.push(SavedTap {
+            name: name.clone(),
+            index,
+            up: true,
+        });
+    }
+    Ok(State {
+        saved: Some(saved),
+        frozen: true,
+    })
+}
+
 pub(crate) async fn transition(
     plan: &FabricPlan,
     handle: &Handle,
