@@ -15,6 +15,7 @@
 //! crates (like `dylos-runtime` or `dylos-cli`).
 
 use dylos_core::LabSpec;
+use dylos_core::manifest::{FileMeta, SnapshotManifest};
 use nix::{
     dir::Dir,
     errno::Errno,
@@ -23,9 +24,10 @@ use nix::{
     unistd::{UnlinkatFlags, unlinkat},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     fs::File,
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     path::{Component, Path, PathBuf},
     time::{Instant, SystemTime},
@@ -64,6 +66,20 @@ fn valid_id(id: &str) -> Result<(), Error> {
     if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
     {
         return Err(Error::InvalidId(id.into()));
+    }
+    Ok(())
+}
+
+fn valid_file_name(name: &str) -> Result<(), Error> {
+    if name.is_empty()
+        || name.len() > 64
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    {
+        return Err(Error::InvalidId(name.into()));
     }
     Ok(())
 }
@@ -139,6 +155,218 @@ impl Drop for Lab {
     fn drop(&mut self) {
         if let Err(error) = self.remove() {
             tracing::error!(lab = %self.id, %error, "lab cleanup failed");
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotVmPaths {
+    pub directory: PathBuf,
+    pub state_file: PathBuf,
+    pub memory_file: PathBuf,
+    pub rootfs: PathBuf,
+}
+
+/// Exclusive ownership of a snapshot directory during creation; dropping removes it unless committed.
+#[derive(Debug)]
+#[must_use]
+pub struct Snapshot {
+    root: PathBuf,
+    parent: File,
+    directory: File,
+    lab_id: String,
+    id: String,
+    owned: bool,
+}
+
+impl Snapshot {
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn lab_id(&self) -> &str {
+        &self.lab_id
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub fn manifest_path(&self) -> PathBuf {
+        self.root.join("manifest.json")
+    }
+
+    /// # Errors
+    /// Rejects names that could escape the snapshot directory.
+    pub fn vm_paths(&self, node: &str) -> Result<SnapshotVmPaths, Error> {
+        valid_id(node)?;
+        let directory = self.root.join("vms").join(node);
+        Ok(SnapshotVmPaths {
+            state_file: directory.join("vm.state"),
+            memory_file: directory.join("vm.mem"),
+            rootfs: directory.join("rootfs.ext4"),
+            directory,
+        })
+    }
+
+    /// Clones a VM disk into the snapshot by reflink after an fsync of the source disk.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] or [`Error::Reflink`].
+    pub fn clone_disk(
+        &self,
+        source_path: &Path,
+        node: &str,
+        disk_name: &str,
+    ) -> Result<FileMeta, Error> {
+        valid_id(node)?;
+        valid_file_name(disk_name)?;
+        let _span = tracing::info_span!("clone_disk", node = %node, disk = %disk_name).entered();
+        let started = Instant::now();
+
+        let source_parent = source_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let source_dir = directory(source_parent, false).map_err(|e| contextual(source_path, e))?;
+        let name = source_path
+            .file_name()
+            .ok_or_else(|| contextual(source_path, io::ErrorKind::InvalidInput.into()))?;
+        let source_file = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
+            .map_err(|e| contextual(source_path, e))?;
+        if !source_file
+            .metadata()
+            .map_err(|e| contextual(source_path, e))?
+            .is_file()
+        {
+            return Err(contextual(source_path, io::ErrorKind::InvalidInput.into()));
+        }
+        source_file
+            .sync_all()
+            .map_err(|e| contextual(source_path, e))?;
+
+        let vms = open(&self.directory, "vms".as_ref(), dirs())
+            .map_err(|e| contextual(&self.root.join("vms"), e))?;
+        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
+                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
+            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
+        };
+
+        let dest_path = self.root.join("vms").join(node).join(disk_name);
+        let dest_file = open(
+            &vm_dir,
+            disk_name.as_ref(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        )
+        .map_err(|e| contextual(&dest_path, e))?;
+
+        reflink(&source_file, &dest_file).map_err(|source| Error::Reflink {
+            path: dest_path.clone(),
+            source,
+        })?;
+
+        let (sha256, size) =
+            compute_file_sha256_and_size(&dest_file).map_err(|e| contextual(&dest_path, e))?;
+
+        tracing::debug!(elapsed = ?started.elapsed(), size, "disk cloned by reflink");
+        Ok(FileMeta {
+            path: PathBuf::from(format!("vms/{node}/{disk_name}")),
+            sha256,
+            size,
+        })
+    }
+
+    /// Moves or copies a VM state or memory file into the snapshot directory.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`].
+    pub fn save_vm_file(
+        &self,
+        source_path: &Path,
+        node: &str,
+        file_name: &str,
+    ) -> Result<FileMeta, Error> {
+        valid_id(node)?;
+        valid_file_name(file_name)?;
+        let vms = open(&self.directory, "vms".as_ref(), dirs())
+            .map_err(|e| contextual(&self.root.join("vms"), e))?;
+        let _vm_dir = match open(&vms, node.as_ref(), dirs()) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
+                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
+            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
+        };
+
+        let dest_path = self.root.join("vms").join(node).join(file_name);
+        if let Err(e) = std::fs::rename(source_path, &dest_path) {
+            if e.raw_os_error() == Some(libc::EXDEV) {
+                std::fs::copy(source_path, &dest_path).map_err(|e| contextual(&dest_path, e))?;
+                let _ = std::fs::remove_file(source_path);
+            } else {
+                return Err(contextual(&dest_path, e));
+            }
+        }
+
+        let file = File::open(&dest_path).map_err(|e| contextual(&dest_path, e))?;
+        let (sha256, size) =
+            compute_file_sha256_and_size(&file).map_err(|e| contextual(&dest_path, e))?;
+
+        Ok(FileMeta {
+            path: PathBuf::from(format!("vms/{node}/{file_name}")),
+            sha256,
+            size,
+        })
+    }
+
+    /// Writes the snapshot manifest to `manifest.json`.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] or [`Error::Spec`].
+    pub fn write_manifest(&self, manifest: &SnapshotManifest) -> Result<(), Error> {
+        let json = manifest.to_json_string_pretty()?;
+        let manifest_path = self.manifest_path();
+        let mut file = open(
+            &self.directory,
+            "manifest.json".as_ref(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_TRUNC,
+        )
+        .map_err(|e| contextual(&manifest_path, e))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| contextual(&manifest_path, e))?;
+        file.sync_all().map_err(|e| contextual(&manifest_path, e))?;
+        Ok(())
+    }
+
+    /// Commits the snapshot, transferring ownership to durable storage.
+    pub fn commit(&mut self) {
+        self.owned = false;
+    }
+
+    /// Removes the snapshot directory.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if removal fails.
+    pub fn remove(&mut self) -> Result<(), Error> {
+        if self.owned {
+            let name = Store::snapshot_name(&self.lab_id, &self.id);
+            remove_owned(&self.parent, &self.directory, &name)
+                .map_err(|e| contextual(&self.root, e))?;
+            self.owned = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        if let Err(error) = self.remove() {
+            tracing::error!(lab = %self.lab_id, snapshot = %self.id, %error, "partial snapshot cleanup failed");
         }
     }
 }
@@ -248,6 +476,99 @@ impl Store {
             other => other.map_err(|e| contextual(&self.base.join(id), e)),
         }
     }
+
+    #[must_use]
+    pub fn snapshot_name(lab_id: &str, snapshot_id: &str) -> String {
+        format!("{lab_id}-{snapshot_id}")
+    }
+
+    #[must_use]
+    pub fn snapshot_dir(&self, lab_id: &str, snapshot_id: &str) -> PathBuf {
+        self.base
+            .join("snapshots")
+            .join(Self::snapshot_name(lab_id, snapshot_id))
+    }
+
+    /// Creates a snapshot directory layout exclusively.
+    ///
+    /// # Errors
+    /// Rejects invalid ids, existing snapshots, symlinks.
+    pub fn create_snapshot(&self, lab_id: &str, snapshot_id: &str) -> Result<Snapshot, Error> {
+        valid_id(lab_id)?;
+        valid_id(snapshot_id)?;
+        let name = Self::snapshot_name(lab_id, snapshot_id);
+        let snapshots_base = self.base.join("snapshots");
+        let parent =
+            directory(&snapshots_base, true).map_err(|e| contextual(&snapshots_base, e))?;
+        let root = snapshots_base.join(&name);
+
+        mkdirat(&parent, name.as_str(), Mode::from_bits_truncate(0o700))
+            .map_err(|e| contextual(&root, e.into()))?;
+
+        let pinned = match open(&parent, name.as_ref(), dirs()) {
+            Ok(file) => file,
+            Err(error) => {
+                unlinkat(&parent, name.as_str(), UnlinkatFlags::RemoveDir)
+                    .map_err(|e| contextual(&root, e.into()))?;
+                return Err(contextual(&root, error));
+            }
+        };
+
+        let mut snapshot = Snapshot {
+            root,
+            parent,
+            directory: pinned,
+            lab_id: lab_id.into(),
+            id: snapshot_id.into(),
+            owned: true,
+        };
+
+        if let Err(err) = make_directory(&snapshot.directory, "vms") {
+            let _ = snapshot.remove();
+            return Err(contextual(&snapshot.root.join("vms"), err));
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Removes a snapshot directory by name.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] or [`Error::InvalidId`].
+    pub fn remove_snapshot(&self, lab_id: &str, snapshot_id: &str) -> Result<(), Error> {
+        valid_id(lab_id)?;
+        valid_id(snapshot_id)?;
+        let name = Self::snapshot_name(lab_id, snapshot_id);
+        let snapshots_base = self.base.join("snapshots");
+        let result = (|| {
+            let parent = directory(&snapshots_base, false)?;
+            remove_entry(&parent, name.as_ref())
+        })();
+        match result {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other.map_err(|e| contextual(&snapshots_base.join(name), e)),
+        }
+    }
+}
+
+fn compute_file_sha256_and_size(file: &File) -> io::Result<(String, u64)> {
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 16 * 1024];
+    let mut total_size = 0u64;
+    loop {
+        let n = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        total_size += n as u64;
+        hasher.update(&buffer[..n]);
+    }
+    let sha256 = format!("{:02x}", hasher.finalize());
+    Ok((sha256, total_size))
 }
 fn dirs() -> OFlag {
     OFlag::O_RDONLY | OFlag::O_DIRECTORY
