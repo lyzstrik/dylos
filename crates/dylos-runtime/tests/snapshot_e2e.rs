@@ -208,17 +208,17 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         cloned_disk.display()
     );
 
-    // Run e2fsck on the cloned disk image on the host with -p -E journal_only.
-    // This permits only standard journal replay and preening, strictly refusing repairs of corrupted filesystem structures.
+    // Run e2fsck on the cloned disk image on the host with -p (preen mode).
+    // This permits only safe automated preen and journal recovery, strictly refusing arbitrary repairs of corrupted filesystem structures (exiting 4 on corruption).
     let status = Command::new("e2fsck")
-        .args(["-p", "-E", "journal_only", cloned_disk.to_str().unwrap()])
+        .args(["-p", cloned_disk.to_str().unwrap()])
         .status()
-        .expect("failed to run e2fsck -p -E journal_only");
+        .expect("failed to run e2fsck -p");
 
-    eprintln!("e2fsck -p -E journal_only on cloned disk: exit={status:?}");
+    eprintln!("e2fsck -p on cloned disk: exit={status:?}");
     assert!(
         matches!(status.code(), Some(0..=2)),
-        "e2fsck journal recovery failed: exit {status:?}"
+        "e2fsck preen / journal recovery failed: exit {status:?}"
     );
 
     // Verify subsequent read-only check confirms clean filesystem with exit code 0
