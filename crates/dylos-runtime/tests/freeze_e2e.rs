@@ -181,7 +181,7 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     let taps = tap_rx(namespace).await;
 
     // Pre-T TAP queues are allowed to drain. Observe this separately from the quiet window.
-    let stable = tokio::time::timeout(Duration::from_secs(20), async {
+    let stable = tokio::time::timeout(Duration::from_secs(5), async {
         let mut previous = initial.clone();
         let mut since = Instant::now();
         loop {
@@ -294,6 +294,24 @@ async fn abc_fabric_freeze_under_real_traffic() {
     let run = tokio::spawn(async move {
         use futures_util::FutureExt;
         let result = std::panic::AssertUnwindSafe(async {
+            // TAP-down errors otherwise interleave with the serial command sentinels.
+            for vm in lab.vms() {
+                let log = vm.paths().root.join("run/freeze.log");
+                tokio::fs::write(&log, b"").await.unwrap();
+                tokio::task::spawn_blocking(move || {
+                    nix::unistd::chown(&log, Some(nix::unistd::Uid::from_raw(65534)), None)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                vm.client()
+                    .put::<_, Value>(
+                        "/logger",
+                        &serde_json::json!({"log_path": "/run/freeze.log"}),
+                    )
+                    .await
+                    .unwrap();
+            }
             exercise(&mut lab, &namespace, "-6", "fd64:796c:6f73:2::2").await;
             exercise(&mut lab, &namespace, "-4", "10.0.2.2").await;
         })
