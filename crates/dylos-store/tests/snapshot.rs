@@ -77,7 +77,7 @@ fn snapshot_clone_disk_save_vm_file_and_manifest_verify() {
     let state_bytes = b"microvm state json";
     fs::write(&source_state, state_bytes).unwrap();
     let state_meta = snapshot
-        .save_vm_file(&source_state, "node1", "vm.state")
+        .save_vm_file(&source_state, "node1", "vm.state", 1024 * 1024)
         .unwrap();
     assert_eq!(state_meta.path, PathBuf::from("vms/node1/vm.state"));
     assert_eq!(state_meta.size, state_bytes.len() as u64);
@@ -87,7 +87,7 @@ fn snapshot_clone_disk_save_vm_file_and_manifest_verify() {
     let mem_bytes = b"microvm memory binary dump";
     fs::write(&source_mem, mem_bytes).unwrap();
     let mem_meta = snapshot
-        .save_vm_file(&source_mem, "node1", "vm.mem")
+        .save_vm_file(&source_mem, "node1", "vm.mem", 1024 * 1024)
         .unwrap();
     assert_eq!(mem_meta.path, PathBuf::from("vms/node1/vm.mem"));
     assert_eq!(mem_meta.size, mem_bytes.len() as u64);
@@ -179,7 +179,7 @@ fn save_vm_file_rejects_symlink_source_without_outside_read() {
     let symlink_path = temp.path().join("evil_symlink");
     std::os::unix::fs::symlink(&target, &symlink_path).unwrap();
 
-    let err = snapshot.save_vm_file(&symlink_path, "node1", "vm.state");
+    let err = snapshot.save_vm_file(&symlink_path, "node1", "vm.state", 1024 * 1024);
     assert!(err.is_err(), "expected symlink to be rejected");
 
     // Ensure target was not deleted or modified
@@ -200,7 +200,12 @@ fn save_vm_file_rejects_ancestor_symlink() {
     let symlink_dir = temp.path().join("symlink_dir");
     std::os::unix::fs::symlink(&real_dir, &symlink_dir).unwrap();
 
-    let err = snapshot.save_vm_file(&symlink_dir.join("vm.state"), "node1", "vm.state");
+    let err = snapshot.save_vm_file(
+        &symlink_dir.join("vm.state"),
+        "node1",
+        "vm.state",
+        1024 * 1024,
+    );
     assert!(err.is_err(), "expected ancestor symlink to be rejected");
 }
 
@@ -212,7 +217,7 @@ fn save_vm_file_rejects_fifo_without_hanging() {
     let fifo_path = temp.path().join("test_fifo");
     nix::unistd::mkfifo(&fifo_path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
 
-    let err = snapshot.save_vm_file(&fifo_path, "node1", "vm.state");
+    let err = snapshot.save_vm_file(&fifo_path, "node1", "vm.state", 1024 * 1024);
     assert!(err.is_err(), "expected FIFO to be rejected");
     assert!(!snapshot.root().join("vms/node1/vm.state").exists());
 }
@@ -229,9 +234,99 @@ fn save_vm_file_fails_closed_on_exdev_without_copying() {
     let shm_file = shm_dir.join(format!("dylos-test-exdev-{}", std::process::id()));
     fs::write(&shm_file, b"memory content on another device").unwrap();
 
-    let res = snapshot.save_vm_file(&shm_file, "node1", "vm.mem");
+    let res = snapshot.save_vm_file(&shm_file, "node1", "vm.mem", 1024 * 1024);
     let _ = fs::remove_file(&shm_file);
 
     assert!(res.is_err(), "expected EXDEV to fail closed");
     assert!(!snapshot.root().join("vms/node1/vm.mem").exists());
+}
+
+#[test]
+fn save_vm_file_rejects_oversized_file() {
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let source = temp.path().join("oversized.mem");
+    fs::write(&source, vec![0u8; 1000]).unwrap();
+
+    let err = snapshot.save_vm_file(&source, "node1", "vm.mem", 500);
+    assert!(err.is_err(), "expected oversized file to be rejected");
+    assert!(!snapshot.root().join("vms/node1/vm.mem").exists());
+}
+
+#[test]
+fn save_vm_file_rejects_sparse_file_exceeding_bound() {
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let source = temp.path().join("sparse.mem");
+    let file = fs::File::create(&source).unwrap();
+    // 10 GiB logical size
+    file.set_len(10 * 1024 * 1024 * 1024).unwrap();
+    drop(file);
+
+    // Limit to 10 MiB: must fail immediately without reading 10 GiB
+    let started = std::time::Instant::now();
+    let err = snapshot.save_vm_file(&source, "node1", "vm.mem", 10 * 1024 * 1024);
+    assert!(err.is_err(), "expected sparse file to be rejected");
+    assert!(
+        started.elapsed().as_secs() < 2,
+        "sparse check took too long"
+    );
+    assert!(!snapshot.root().join("vms/node1/vm.mem").exists());
+}
+
+#[test]
+fn save_vm_file_deterministic_replacement_race() {
+    let (temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let source = temp.path().join("race.state");
+    fs::write(&source, b"original verified state content").unwrap();
+
+    let replacement_path = source.clone();
+    let meta = snapshot
+        .save_vm_file_with_hook(&source, "node1", "vm.state", 1024 * 1024, move || {
+            // Simulate malicious process replacing the file immediately after dylos opened it
+            fs::remove_file(&replacement_path).unwrap();
+            fs::write(&replacement_path, b"malicious replacement content").unwrap();
+        })
+        .unwrap();
+
+    // Verify destination was collected from the verified descriptor, NOT the replacement!
+    let dest_path = snapshot.root().join("vms/node1/vm.state");
+    let collected_content = fs::read(&dest_path).unwrap();
+    assert_eq!(collected_content, b"original verified state content");
+    assert_eq!(meta.size, b"original verified state content".len() as u64);
+
+    // Verify the replacement file was NOT unlinked because inode changed
+    assert!(source.exists());
+    assert_eq!(fs::read(&source).unwrap(), b"malicious replacement content");
+}
+
+#[test]
+fn save_vm_file_cleanup_error_propagation() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_temp, store, _spec) = setup();
+    let snapshot = store.create_snapshot("lab-1", "snap-1").unwrap();
+
+    let shm_dir = std::path::Path::new("/dev/shm");
+    if !shm_dir.exists() {
+        return;
+    }
+    let shm_file = shm_dir.join(format!("dylos-test-cleanup-{}", std::process::id()));
+    fs::write(&shm_file, b"content").unwrap();
+
+    // Create vms/node1 directory and make it read-only so unlinkat fails on error unwind
+    let vm_dir = snapshot.root().join("vms/node1");
+    fs::create_dir_all(&vm_dir).unwrap();
+    let dest = vm_dir.join("vm.mem");
+    fs::write(&dest, b"").unwrap();
+    fs::set_permissions(&vm_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let res = snapshot.save_vm_file(&shm_file, "node1", "vm.mem", 1024 * 1024);
+    let _ = fs::set_permissions(&vm_dir, fs::Permissions::from_mode(0o755));
+    let _ = fs::remove_file(&shm_file);
+
+    assert!(res.is_err(), "expected failure");
 }

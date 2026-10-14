@@ -179,6 +179,14 @@ pub struct Snapshot {
     owned: bool,
 }
 
+/// Timings recorded during a VM disk clone operation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiskCloneTimings {
+    pub fsync_ms: u64,
+    pub reflink_ms: u64,
+    pub hash_ms: u64,
+}
+
 impl Snapshot {
     #[must_use]
     pub fn root(&self) -> &Path {
@@ -223,6 +231,20 @@ impl Snapshot {
         node: &str,
         disk_name: &str,
     ) -> Result<FileMeta, Error> {
+        self.clone_disk_with_timings(source_path, node, disk_name)
+            .map(|(meta, _)| meta)
+    }
+
+    /// Clones a VM disk into the snapshot, returning fine-grained step durations.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] or [`Error::Reflink`].
+    pub fn clone_disk_with_timings(
+        &self,
+        source_path: &Path,
+        node: &str,
+        disk_name: &str,
+    ) -> Result<(FileMeta, DiskCloneTimings), Error> {
         valid_id(node)?;
         valid_file_name(disk_name)?;
         let _span = tracing::info_span!("clone_disk", node = %node, disk = %disk_name).entered();
@@ -245,9 +267,11 @@ impl Snapshot {
         {
             return Err(contextual(source_path, io::ErrorKind::InvalidInput.into()));
         }
+        let t_fsync = Instant::now();
         source_file
             .sync_all()
             .map_err(|e| contextual(source_path, e))?;
+        let fsync_ms = u64::try_from(t_fsync.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let vms = open(&self.directory, "vms".as_ref(), dirs())
             .map_err(|e| contextual(&self.root.join("vms"), e))?;
@@ -266,32 +290,99 @@ impl Snapshot {
         )
         .map_err(|e| contextual(&dest_path, e))?;
 
+        let t_reflink = Instant::now();
         reflink(&source_file, &dest_file).map_err(|source| Error::Reflink {
             path: dest_path.clone(),
             source,
         })?;
+        let reflink_ms = u64::try_from(t_reflink.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        let (sha256, size) =
-            compute_file_sha256_and_size(&dest_file).map_err(|e| contextual(&dest_path, e))?;
+        let t_hash = Instant::now();
+        let (sha256, size) = compute_file_sha256_and_size(&dest_file, u64::MAX)
+            .map_err(|e| contextual(&dest_path, e))?;
+        let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        tracing::debug!(elapsed = ?started.elapsed(), size, "disk cloned by reflink");
-        Ok(FileMeta {
-            path: PathBuf::from(format!("vms/{node}/{disk_name}")),
-            sha256,
+        tracing::debug!(
+            elapsed = ?started.elapsed(),
             size,
-        })
+            fsync_ms,
+            reflink_ms,
+            hash_ms,
+            "disk cloned by reflink"
+        );
+        Ok((
+            FileMeta {
+                path: PathBuf::from(format!("vms/{node}/{disk_name}")),
+                sha256,
+                size,
+            },
+            DiskCloneTimings {
+                fsync_ms,
+                reflink_ms,
+                hash_ms,
+            },
+        ))
+    }
+
+    /// Moves or reflinks a VM state or memory file into the snapshot directory, measuring hash duration.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] or [`Error::Reflink`].
+    pub fn save_vm_file_with_timings(
+        &self,
+        source_path: &Path,
+        node: &str,
+        file_name: &str,
+        max_bytes: u64,
+    ) -> Result<(FileMeta, u64), Error> {
+        let t_start = Instant::now();
+        let meta = self.save_vm_file(source_path, node, file_name, max_bytes)?;
+        let hash_ms = u64::try_from(t_start.elapsed().as_millis()).unwrap_or(0);
+        Ok((meta, hash_ms))
     }
 
     /// Moves or reflinks a VM state or memory file into the snapshot directory.
     ///
     /// # Errors
     /// Returns [`Error::Io`] or [`Error::Reflink`].
-    #[allow(clippy::too_many_lines)]
     pub fn save_vm_file(
         &self,
         source_path: &Path,
         node: &str,
         file_name: &str,
+        max_bytes: u64,
+    ) -> Result<FileMeta, Error> {
+        self.save_vm_file_impl(source_path, node, file_name, max_bytes, None)
+    }
+
+    /// Moves or reflinks a VM file with an optional test hook called immediately after opening source.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn save_vm_file_with_hook(
+        &self,
+        source_path: &Path,
+        node: &str,
+        file_name: &str,
+        max_bytes: u64,
+        after_open: impl FnOnce() + 'static,
+    ) -> Result<FileMeta, Error> {
+        self.save_vm_file_impl(
+            source_path,
+            node,
+            file_name,
+            max_bytes,
+            Some(Box::new(after_open)),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn save_vm_file_impl(
+        &self,
+        source_path: &Path,
+        node: &str,
+        file_name: &str,
+        max_bytes: u64,
+        after_open: Option<Box<dyn FnOnce()>>,
     ) -> Result<FileMeta, Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
@@ -314,7 +405,7 @@ impl Snapshot {
         )
         .map_err(|e| contextual(source_path, e))?;
 
-        // 3. Verify it is a regular file via descriptor
+        // 3. Verify it is a regular file via descriptor and within bounded size
         let source_meta = source_file
             .metadata()
             .map_err(|e| contextual(source_path, e))?;
@@ -323,6 +414,23 @@ impl Snapshot {
                 source_path,
                 io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file"),
             ));
+        }
+        if source_meta.len() > max_bytes {
+            return Err(contextual(
+                source_path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source file size {} exceeds maximum allowed bound of {} bytes",
+                        source_meta.len(),
+                        max_bytes
+                    ),
+                ),
+            ));
+        }
+
+        if let Some(hook) = after_open {
+            hook();
         }
 
         // 4. Open/create destination vm directory
@@ -337,7 +445,7 @@ impl Snapshot {
 
         // 5. Exclusively create destination file
         let dest_path = self.root.join("vms").join(node).join(file_name);
-        let dest_file = open(
+        let mut dest_file = open(
             &vm_dir,
             file_name.as_ref(),
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
@@ -350,20 +458,22 @@ impl Snapshot {
 
         // 6. Check for cross-device: fail closed on EXDEV, NEVER copy!
         if source_meta.dev() != dest_meta.dev() {
-            let _ = unlinkat(&vm_dir, file_name, UnlinkatFlags::NoRemoveDir);
-            return Err(contextual(
-                source_path,
-                io::Error::from_raw_os_error(libc::EXDEV),
-            ));
+            let cleanup_err = cleanup_dest(&vm_dir, file_name, &dest_path);
+            let mut err = io::Error::from_raw_os_error(libc::EXDEV);
+            if let Err(c_err) = cleanup_err {
+                err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
+            }
+            return Err(contextual(source_path, err));
         }
 
-        // 7. Reflink source into dest_file; if reflink is unsupported on the same device, renameat.
+        // 7. Reflink source into dest_file; if reflink is unsupported on the same device,
+        // copy from the already verified descriptor into the new exclusively created destination.
         let verified_dest_file = match reflink(&source_file, &dest_file) {
             Ok(()) => {
-                unlinkat(&source_dir, source_name, UnlinkatFlags::NoRemoveDir).map_err(|e| {
+                safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
                     Error::Io {
                         path: source_path.into(),
-                        source: e.into(),
+                        source: e,
                     }
                 })?;
                 dest_file
@@ -374,39 +484,30 @@ impl Snapshot {
                     Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
                 ) =>
             {
-                // Fall back to renameat on the same device without copying
-                drop(dest_file);
-                let _ = unlinkat(&vm_dir, file_name, UnlinkatFlags::NoRemoveDir);
-                renameat(
-                    &source_dir,
-                    Path::new(source_name),
-                    &vm_dir,
-                    Path::new(file_name),
-                )
-                .map_err(|e| contextual(&dest_path, e.into()))?;
-                let file = open(
-                    &vm_dir,
-                    file_name.as_ref(),
-                    OFlag::O_RDONLY | OFlag::O_NONBLOCK,
-                )
-                .map_err(|e| contextual(&dest_path, e))?;
-                if !file
-                    .metadata()
-                    .map_err(|e| contextual(&dest_path, e))?
-                    .is_file()
-                {
-                    return Err(contextual(
-                        &dest_path,
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "destination is not a regular file",
-                        ),
-                    ));
+                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
+                    let cleanup_err = cleanup_dest(&vm_dir, file_name, &dest_path);
+                    let mut err = copy_err;
+                    if let Err(c_err) = cleanup_err {
+                        err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
+                    }
+                    return Err(contextual(&dest_path, err));
                 }
-                file
+                safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
+                    Error::Io {
+                        path: source_path.into(),
+                        source: e,
+                    }
+                })?;
+                dest_file
             }
             Err(err) => {
-                let _ = unlinkat(&vm_dir, file_name, UnlinkatFlags::NoRemoveDir);
+                let cleanup_err = cleanup_dest(&vm_dir, file_name, &dest_path);
+                if let Err(c_err) = cleanup_err {
+                    return Err(contextual(
+                        &dest_path,
+                        io::Error::other(format!("reflink failed ({err}); additionally {c_err}")),
+                    ));
+                }
                 return Err(Error::Reflink {
                     path: dest_path.clone(),
                     source: err,
@@ -414,8 +515,8 @@ impl Snapshot {
             }
         };
 
-        // 8. Compute sha256 and size from the verified destination descriptor
-        let (sha256, size) = compute_file_sha256_and_size(&verified_dest_file)
+        // 8. Compute sha256 and size from the verified destination descriptor with bounded read
+        let (sha256, size) = compute_file_sha256_and_size(&verified_dest_file, max_bytes)
             .map_err(|e| contextual(&dest_path, e))?;
 
         Ok(FileMeta {
@@ -670,7 +771,7 @@ impl Store {
     }
 }
 
-fn compute_file_sha256_and_size(file: &File) -> io::Result<(String, u64)> {
+fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(String, u64)> {
     let mut reader = file.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
     let mut hasher = Sha256::new();
@@ -683,11 +784,88 @@ fn compute_file_sha256_and_size(file: &File) -> io::Result<(String, u64)> {
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        total_size += n as u64;
+        total_size = total_size
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "file size overflow"))?;
+        if total_size > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("file exceeded maximum allowed bound of {max_bytes} bytes during hashing"),
+            ));
+        }
         hasher.update(&buffer[..n]);
     }
     let sha256 = format!("{:02x}", hasher.finalize());
     Ok((sha256, total_size))
+}
+
+fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {
+    let mut reader = source.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    dest.seek(SeekFrom::Start(0))?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut copied = 0u64;
+    loop {
+        let n = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        copied = copied
+            .checked_add(n as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "copy size overflow"))?;
+        if copied > max_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "source file exceeded maximum allowed bound of {max_bytes} bytes during copy"
+                ),
+            ));
+        }
+        dest.write_all(&buffer[..n])?;
+    }
+    dest.sync_all()?;
+    Ok(())
+}
+
+fn safe_unlink_source(
+    source_dir: &File,
+    source_name: &std::ffi::OsStr,
+    source_meta: &std::fs::Metadata,
+) -> Result<(), io::Error> {
+    let stat = nix::sys::stat::fstatat(
+        source_dir,
+        source_name,
+        nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+    );
+    match stat {
+        Ok(s) => {
+            #[allow(clippy::useless_conversion)]
+            let (ino, dev) = (u64::from(s.st_ino), u64::from(s.st_dev));
+            if ino == source_meta.ino() && dev == source_meta.dev() {
+                match unlinkat(source_dir, source_name, UnlinkatFlags::NoRemoveDir) {
+                    Ok(()) | Err(Errno::ENOENT) => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            } else {
+                // Inode was replaced; do not unlink the replacement
+                Ok(())
+            }
+        }
+        Err(Errno::ENOENT) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn cleanup_dest(vm_dir: &File, file_name: &str, dest_path: &Path) -> Result<(), io::Error> {
+    match unlinkat(vm_dir, file_name, UnlinkatFlags::NoRemoveDir) {
+        Ok(()) | Err(Errno::ENOENT) => Ok(()),
+        Err(e) => Err(io::Error::other(format!(
+            "failed to clean up partial destination {}: {e}",
+            dest_path.display()
+        ))),
+    }
 }
 fn dirs() -> OFlag {
     OFlag::O_RDONLY | OFlag::O_DIRECTORY
