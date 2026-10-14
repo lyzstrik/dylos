@@ -102,3 +102,6 @@ git config --local tag.gpgsign true
 
 ## Verification
 `scripts/host-check.sh` must pass before any work session.
+
+## End-to-end tests
+End-to-end tests (`just e2e`) require root and `/dev/kvm`. They run automatically in CI on disposable GitHub-hosted runners (`.github/workflows/e2e.yml`). On a developer host, they are run by a human (never run `sudo` inside tests).

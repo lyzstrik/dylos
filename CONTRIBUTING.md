@@ -30,7 +30,7 @@ just host-check
 All commands run through `just` (see `justfile`):
 
 - Run `just check` before opening a pull request. It checks formatting (`cargo fmt`), clippy warnings, tests (`cargo nextest`), `cargo deny`, static agent compilation, and workflow linting.
-- If your change touches microVM lifecycle, networking, storage, or runtime behavior, also run `just e2e` locally. End-to-end tests require KVM and are run by a human.
+- If your change touches microVM lifecycle, networking, storage, or runtime behavior, also run `just e2e` locally. End-to-end tests require KVM and run in CI on disposable runners; on a developer host they are run by a human (never run `sudo` inside tests).
 
 ## Security
 
