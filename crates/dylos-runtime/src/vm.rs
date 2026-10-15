@@ -127,6 +127,9 @@ impl Vm {
                     spec.vcpu_count,
                     spec.mem_size_mib,
                 ))
+                // The foreground jailer execs Firecracker in this group; terminal signals
+                // must reach only the supervisor so it can order VM teardown.
+                .process_group(0)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())

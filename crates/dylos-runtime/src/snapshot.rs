@@ -16,7 +16,7 @@ use futures_util::FutureExt;
 use futures_util::future::join_all;
 use tracing::Instrument;
 
-use crate::{Lab, LabError, pause_all, resume_all};
+use crate::{Lab, LabError};
 
 /// Timings recorded across all snapshot stages.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl<'a> SnapshotLifecycleGuard<'a> {
 
     pub async fn pause(&mut self) -> Result<std::time::Duration, LabError> {
         self.paused = true;
-        let pause_res = pause_all(self.lab).await;
+        let pause_res = self.lab.pause_all().await;
         match pause_res {
             Ok(skew) => Ok(skew),
             Err(pause_err) => {
@@ -199,7 +199,7 @@ impl<'a> SnapshotLifecycleGuard<'a> {
         if !self.paused {
             return Ok(());
         }
-        let res = resume_all(self.lab).await;
+        let res = self.lab.resume_all().await;
         match res {
             Ok(()) => {
                 self.paused = false;

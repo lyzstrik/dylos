@@ -224,6 +224,7 @@ async fn parallel_pause_reply(
                 == 3
         })
         .await;
+        std::fs::write(sandbox.join(format!("{id}.{action}-barrier")), b"").unwrap();
         if action == "paused" {
             std::fs::write(root.join("is-paused"), b"").unwrap();
             assert_taps_down(
