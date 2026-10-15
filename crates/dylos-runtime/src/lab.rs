@@ -309,14 +309,21 @@ impl Lab {
     /// If any clone restore fails, all successfully started clones are rolled back and torn down.
     ///
     /// # Errors
-    /// Rejects empty clone lists, invalid or duplicate clone IDs, and propagates any restore error.
+    /// Rejects empty or oversized (over [`Self::MAX_CLONES`]) clone lists, invalid or duplicate
+    /// clone IDs, and propagates any restore error.
     pub async fn fork_with(
         config: &LabConfig,
         snapshot: &Path,
         clone_ids: &[String],
     ) -> Result<Vec<Self>> {
-        if clone_ids.is_empty() {
-            return Err(invalid("fork", "at least one clone identifier required"));
+        if clone_ids.is_empty() || clone_ids.len() > Self::MAX_CLONES {
+            return Err(invalid(
+                "fork",
+                &format!(
+                    "between 1 and {} clone identifiers required",
+                    Self::MAX_CLONES
+                ),
+            ));
         }
         let mut seen = std::collections::HashSet::new();
         for id in clone_ids {
@@ -1106,6 +1113,26 @@ impl Lab {
         })
         .await
         .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
+    }
+
+    /// [`Self::teardown_by_name`] once the previous owner has released the lab lock: a joined
+    /// supervisor can still own the lab through the teardown its drop spawned.
+    /// # Errors
+    /// As [`Self::teardown_by_name`]; the lock error if it is still held after `timeout`.
+    pub async fn recover_by_name(config: &LabConfig, id: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match Self::teardown_by_name(config, id).await {
+                Err(LabError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    // flock has no async wait; poll the lock rather than block a worker thread.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Cleans a crashed supervisor's lab by name, using its persisted spec, never a saved PID.
