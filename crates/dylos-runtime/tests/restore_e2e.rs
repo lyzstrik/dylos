@@ -2,7 +2,7 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use dylos_core::LabSpec;
 use dylos_runtime::jailer::JailerConfig;
@@ -33,6 +33,57 @@ async fn progress(lab: &Lab, previous: u64) -> u64 {
     })
     .await
     .expect("existing TCP flow stopped making progress")
+}
+
+async fn measure_clocks(
+    clone: &Lab,
+    clock_command: &str,
+    before_clocks: &str,
+    before_timers: &str,
+) {
+    // A slow serial command cannot establish a 100 ms accuracy bound. Retry
+    // only measurement uncertainty; clock errors still fail the assertion below.
+    let (host_before, host_after, after_clocks) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let host_before = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let clocks = exec(clone, "A", clock_command).await;
+                let host_after = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                if host_after.saturating_sub(host_before) <= 50_000_000 {
+                    break (host_before, host_after, clocks);
+                }
+            }
+        })
+        .await
+        .expect("could not obtain a guest clock sample within a 50 ms host interval");
+    let parsed: Vec<u128> = after_clocks
+        .split_whitespace()
+        .map(|x| x.parse().unwrap())
+        .collect();
+    assert!(
+        parsed[0]
+            .abs_diff(host_before)
+            .max(parsed[0].abs_diff(host_after))
+            <= 100_000_000,
+        "guest wall clock differs from a host interval endpoint by more than 100 ms: guest={parsed:?}, host={host_before}..{host_after}"
+    );
+    let baseline: Vec<u128> = before_clocks
+        .split_whitespace()
+        .map(|x| x.parse().unwrap())
+        .collect();
+    assert!(parsed[1] >= baseline[1], "monotonic clock went backwards");
+    let after_timers = exec(clone, "A", "ss -Hotn state established").await;
+    eprintln!(
+        "CLOCK_MEASUREMENT downtime_s=30 before_ns={baseline:?} after_ns={parsed:?} monotonic_delta_ns={} boottime_delta_ns={} tcp_before={before_timers:?} tcp_after={after_timers:?}",
+        parsed[1] - baseline[1],
+        parsed[2].saturating_sub(baseline[2])
+    );
 }
 
 #[tokio::test]
@@ -86,11 +137,17 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         progress(&original, 512).await;
         let sockets = exec(&original, "A", "ss -Htn state established | sort").await;
         assert!(sockets.contains("5201") && sockets.contains("5202"), "{sockets}");
+        let clock_command = "python3 -c 'import time; print(time.time_ns(), time.monotonic_ns(), time.clock_gettime_ns(time.CLOCK_BOOTTIME))'";
+        let before_clocks = exec(&original, "A", clock_command).await;
+        let before_timers = exec(&original, "A", "ss -Hotn state established").await;
         let manifest = original.snapshot("tcp").await.unwrap();
+        // Deliberate experimental downtime, rather than a readiness wait.
+        tokio::time::sleep_until(tokio::time::Instant::now() + Duration::from_secs(30)).await;
         let snapshot = config.store.snapshot_dir("src", "tcp");
         let clone = Lab::restore_with(&config, &snapshot, "dst").await.unwrap();
         restored = Some(clone);
         let clone = restored.as_ref().unwrap();
+        measure_clocks(clone, clock_command, &before_clocks, &before_timers).await;
         assert_eq!(original.network().unwrap().plan().taps(), clone.network().unwrap().plan().taps());
         assert_eq!(original.network().unwrap().plan().bridges(), clone.network().unwrap().plan().bridges());
         assert_ne!(original.network().unwrap().netns_path(), clone.network().unwrap().netns_path());

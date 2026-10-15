@@ -366,6 +366,57 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         if request.starts_with("PATCH /vm ") && request.contains("Resumed") {
             let root = sock.parent().unwrap().parent().unwrap();
             if root.join("load-done").exists() {
+                let agent_socket = root.join("vsock.sock_5000");
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let stream = tokio::net::UnixStream::connect(agent_socket).await.unwrap();
+                    let mut reader = tokio::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert!(matches!(
+                        dylos_agent::protocol::Request::from_line(&line)
+                            .unwrap()
+                            .body,
+                        dylos_agent::protocol::RequestBody::InjectEntropy { .. }
+                    ));
+                    reader
+                        .get_mut()
+                        .write_all(b"{\"v\":1,\"type\":\"ok\"}\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request = dylos_agent::protocol::Request::from_line(&line).unwrap();
+                    assert!(matches!(
+                        request.body,
+                        dylos_agent::protocol::RequestBody::Resync { .. }
+                    ));
+                    reader
+                        .get_mut()
+                        .write_all(b"{\"v\":1,\"type\":\"ok\"}\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert_eq!(
+                        dylos_agent::protocol::Request::from_line(&line)
+                            .unwrap()
+                            .body,
+                        dylos_agent::protocol::RequestBody::Health
+                    );
+                    let reply = dylos_agent::protocol::Reply::new(
+                        dylos_agent::protocol::ReplyBody::Health {
+                            uptime_ms: 0,
+                            wall_clock_unix_ns: 0,
+                            agent_version: "fake".into(),
+                        },
+                    );
+                    reader
+                        .get_mut()
+                        .write_all(reply.to_line().unwrap().as_bytes())
+                        .await
+                        .unwrap();
+                });
                 let jail = root.parent().unwrap();
                 let prefix = jail
                     .file_name()
