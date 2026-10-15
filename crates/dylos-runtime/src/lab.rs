@@ -102,6 +102,7 @@ pub struct Lab {
     span: tracing::Span,
     cleanup_on_drop: bool,
     active_snapshot: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    restore_latency: Option<Duration>,
 }
 
 impl Lab {
@@ -125,6 +126,7 @@ impl Lab {
             span: tracing::info_span!("lab", lab = id),
             cleanup_on_drop: false,
             active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+            restore_latency: None,
         }
     }
 
@@ -149,6 +151,7 @@ impl Lab {
             span: tracing::info_span!("lab", lab = id),
             cleanup_on_drop: false,
             active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+            restore_latency: None,
         }
     }
 
@@ -185,6 +188,7 @@ impl Lab {
                 span: span.clone(),
                 cleanup_on_drop: true,
                 active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+                restore_latency: None,
             };
             let result = lab.bring_up(config, spec, plan, false).await;
             if let Err(operation) = result {
@@ -235,6 +239,7 @@ impl Lab {
             span: span.clone(),
             cleanup_on_drop: true,
             active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+            restore_latency: None,
         };
         let started = Instant::now();
         if let Err(operation) = lab
@@ -258,6 +263,153 @@ impl Lab {
         Ok(lab)
     }
 
+    /// Maximum number of clones allowed in a single fork operation.
+    pub const MAX_CLONES: usize = 1024;
+
+    /// Generates `count` deterministic clone identifiers formatted as `<prefix>-c1..cN`.
+    ///
+    /// # Errors
+    /// Returns an error if `count` is 0 or exceeds [`Self::MAX_CLONES`], or if any generated identifier exceeds maximum length or is invalid.
+    pub fn generate_clone_ids(prefix: &str, count: usize) -> Result<Vec<String>> {
+        if count == 0 {
+            return Err(invalid(prefix, "clone count must be at least 1"));
+        }
+        if count > Self::MAX_CLONES {
+            return Err(invalid(
+                prefix,
+                &format!(
+                    "clone count {count} exceeds maximum allowed limit of {}",
+                    Self::MAX_CLONES
+                ),
+            ));
+        }
+        // Validate longest generated identifier first before allocating memory
+        let longest_id = format!("{prefix}-c{count}");
+        dylos_core::validate_name(&longest_id, 32)
+            .map_err(|reason| invalid(&longest_id, &format!("invalid clone id: {reason}")))?;
+
+        let mut ids = Vec::new();
+        ids.try_reserve(count).map_err(|e| {
+            invalid(
+                prefix,
+                &format!("failed to allocate memory for clone ids: {e}"),
+            )
+        })?;
+        for i in 1..=count {
+            let id = format!("{prefix}-c{i}");
+            dylos_core::validate_name(&id, 32)
+                .map_err(|reason| invalid(&id, &format!("invalid clone id: {reason}")))?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// Restores a verified snapshot into N parallel independent clone labs.
+    ///
+    /// If any clone restore fails, all successfully started clones are rolled back and torn down.
+    ///
+    /// # Errors
+    /// Rejects empty or oversized (over [`Self::MAX_CLONES`]) clone lists, invalid or duplicate
+    /// clone IDs, and propagates any restore error.
+    pub async fn fork_with(
+        config: &LabConfig,
+        snapshot: &Path,
+        clone_ids: &[String],
+    ) -> Result<Vec<Self>> {
+        if clone_ids.is_empty() || clone_ids.len() > Self::MAX_CLONES {
+            return Err(invalid(
+                "fork",
+                &format!(
+                    "between 1 and {} clone identifiers required",
+                    Self::MAX_CLONES
+                ),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for id in clone_ids {
+            dylos_core::validate_name(id, 32)
+                .map_err(|reason| invalid(id, &format!("invalid clone id: {reason}")))?;
+            if !seen.insert(id) {
+                return Err(invalid(id, "duplicate clone identifier"));
+            }
+        }
+
+        let mut handles = Vec::with_capacity(clone_ids.len());
+        for id in clone_ids {
+            let config = config.clone();
+            let snapshot = snapshot.to_path_buf();
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                Self::restore_owned(&config, &snapshot, &id).await
+            }));
+        }
+
+        let results = join_all(handles).await;
+        let mut labs = Vec::with_capacity(clone_ids.len());
+        let mut first_error = None;
+        for (i, res) in results.into_iter().enumerate() {
+            match res {
+                Ok(Ok(lab)) => labs.push(lab),
+                Ok(Err(err)) => {
+                    tracing::error!(lab = %clone_ids[i], error = %err, "clone restore failed");
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+                Err(source) => {
+                    tracing::error!(lab = %clone_ids[i], error = %source, "clone restore task panicked");
+                    if first_error.is_none() {
+                        first_error = Some(LabError::Task {
+                            lab: clone_ids[i].clone(),
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            let mut cleanup_error = None;
+            let cleanup_results = join_all(labs.into_iter().map(|mut lab| async move {
+                let id = lab.id().to_string();
+                (id, lab.teardown().await)
+            }))
+            .await;
+            for (id, res) in cleanup_results {
+                if let Err(cleanup_err) = res {
+                    tracing::error!(lab = %id, error = %cleanup_err, "rollback teardown failed");
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(cleanup_err);
+                    }
+                }
+            }
+            if let Some(cleanup) = cleanup_error {
+                return Err(LabError::Rollback {
+                    operation: Box::new(err),
+                    cleanup: Box::new(cleanup),
+                });
+            }
+            return Err(err);
+        }
+
+        Ok(labs)
+    }
+
+    /// Restores a verified snapshot into N parallel independent clone labs with deterministic `<prefix>-c1..cN` IDs.
+    ///
+    /// # Errors
+    /// Returns an error if identifier validation fails or if any clone restore fails.
+    pub async fn fork(
+        config: &LabConfig,
+        snapshot: &Path,
+        prefix: &str,
+        count: usize,
+    ) -> Result<Vec<Self>> {
+        let ids = Self::generate_clone_ids(prefix, count)?;
+        Self::fork_with(config, snapshot, &ids).await
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn bring_up(
         &mut self,
         config: &LabConfig,
@@ -267,6 +419,7 @@ impl Lab {
     ) -> Result<()> {
         let root = self.root().to_owned();
         self.lock = Some(blocking(&self.id, move || lock_directory(&root)).await?);
+        let netns_started = Instant::now();
         self.network = Some(create_network(config, plan, restoring).await?);
         let netns = config.netns_dir.join(format!("dylos-{}", self.id));
         let specs: Vec<_> = spec
@@ -279,10 +432,13 @@ impl Lab {
                 )];
                 if restoring {
                     for name in ["vm.state", "vm.mem"] {
-                        files.push(ChrootFile::new(
-                            self.root().join("vms").join(&node.name).join(name),
-                            name,
-                        ));
+                        let path = self.root().join("vms").join(&node.name).join(name);
+                        let read_only = name == "vm.mem";
+                        files.push(if read_only {
+                            ChrootFile::read_only(path, name)
+                        } else {
+                            ChrootFile::new(path, name)
+                        });
                     }
                 } else {
                     files.push(ChrootFile::new(&config.kernel, "vmlinux.bin"));
@@ -324,6 +480,14 @@ impl Lab {
             if let Some(network) = self.network.as_mut() {
                 network.thaw().await?;
             }
+            let latency = netns_started.elapsed();
+            self.restore_latency = Some(latency);
+            tracing::info!(
+                lab = %self.id,
+                latency_ms = latency.as_millis(),
+                target_ms = 500,
+                "clone restored and thawed (netns to thaw)"
+            );
             self.bind_control_socket().await?;
             return Ok(());
         }
@@ -528,6 +692,52 @@ impl Lab {
         }
     }
 
+    /// Returns the latency from network namespace creation to fabric thaw if this lab was restored or forked.
+    #[must_use]
+    pub fn restore_latency(&self) -> Option<Duration> {
+        self.restore_latency
+    }
+
+    /// Reads the PSS (Proportional Set Size) in KiB from `/proc/<pid>/smaps_rollup`
+    /// for each Firecracker VM process of this lab.
+    ///
+    /// # Errors
+    /// Returns an error if any VM lacks a PID or if `/proc/<pid>/smaps_rollup` cannot be read.
+    pub async fn measure_pss(&self) -> Result<Vec<(String, u64)>> {
+        let targets: Vec<(String, u32)> = self
+            .vms
+            .iter()
+            .map(|vm| {
+                let pid = vm
+                    .pid()
+                    .ok_or_else(|| invalid(&self.id, &format!("VM {} has no PID", vm.node())))?;
+                Ok((vm.node().to_owned(), pid))
+            })
+            .collect::<Result<_>>()?;
+        let lab_id = self.id.clone();
+        blocking(&self.id, move || {
+            let mut metrics = Vec::with_capacity(targets.len());
+            for (node, pid) in targets {
+                let pss = read_pid_pss(pid).map_err(|e| io(&lab_id, e))?;
+                tracing::info!(lab = %lab_id, vm = %node, pid = %pid, pss_kib = %pss, "measured VM PSS");
+                metrics.push((node, pss));
+            }
+            Ok(metrics)
+        })
+        .await
+    }
+
+    /// Returns the total PSS in KiB across all Firecracker VM processes of this lab.
+    ///
+    /// # Errors
+    /// Returns an error if measuring PSS fails for any VM.
+    pub async fn total_pss_kib(&self) -> Result<u64> {
+        let metrics = self.measure_pss().await?;
+        let total: u64 = metrics.iter().map(|(_, pss)| *pss).sum();
+        tracing::info!(lab = %self.id, total_pss_kib = total, "measured clone total PSS");
+        Ok(total)
+    }
+
     /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
     /// # Errors
     /// Reports socket, VM exit, and cleanup failures. A response is sent only after cleanup.
@@ -719,6 +929,28 @@ fn invalid(lab: &str, message: &str) -> LabError {
         message: message.into(),
     }
 }
+
+fn read_pid_pss(pid: u32) -> std::io::Result<u64> {
+    let path = format!("/proc/{pid}/smaps_rollup");
+    let content = std::fs::read_to_string(&path)?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Pss:") {
+            let part = rest.split_whitespace().next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid Pss line in smaps_rollup",
+                )
+            })?;
+            return part
+                .parse::<u64>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "Pss field not found in smaps_rollup",
+    ))
+}
 fn io(lab: &str, source: std::io::Error) -> LabError {
     LabError::Io {
         lab: lab.into(),
@@ -881,6 +1113,26 @@ impl Lab {
         })
         .await
         .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
+    }
+
+    /// [`Self::teardown_by_name`] once the previous owner has released the lab lock: a joined
+    /// supervisor can still own the lab through the teardown its drop spawned.
+    /// # Errors
+    /// As [`Self::teardown_by_name`]; the lock error if it is still held after `timeout`.
+    pub async fn recover_by_name(config: &LabConfig, id: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match Self::teardown_by_name(config, id).await {
+                Err(LabError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    // flock has no async wait; poll the lock rather than block a worker thread.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Cleans a crashed supervisor's lab by name, using its persisted spec, never a saved PID.
@@ -1076,6 +1328,7 @@ impl Drop for Lab {
                 span: self.span.clone(),
                 cleanup_on_drop: false,
                 active_snapshot: Arc::clone(&self.active_snapshot),
+                restore_latency: self.restore_latency,
             };
             runtime.spawn(async move {
                 if let Err(error) = owned.teardown().await {

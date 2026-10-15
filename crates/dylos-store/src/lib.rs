@@ -26,9 +26,13 @@ use nix::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
-    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, PermissionsExt},
+    },
     path::{Component, Path, PathBuf},
     time::{Instant, SystemTime},
 };
@@ -582,6 +586,12 @@ impl Snapshot {
             .map_err(|e| contextual(&dest_path, e))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
 
+        if file_name == "vm.mem" {
+            verified_dest_file
+                .set_permissions(std::fs::Permissions::from_mode(0o444))
+                .map_err(|e| contextual(&dest_path, e))?;
+        }
+
         Ok((
             FileMeta {
                 path: PathBuf::from(format!("vms/{node}/{file_name}")),
@@ -690,8 +700,29 @@ impl Store {
         {
             return Err(contextual(path, io::ErrorKind::InvalidData.into()));
         }
-        manifest.verify(opener.verify_opener())?;
-        let lab = self.create_from(id, &manifest.lab_spec, Some((&opener, &manifest)))?;
+        // Pin each shared memory file before hashing it: the inode that is verified is the one
+        // that gets linked into the clone, so a swap after verification cannot go unnoticed.
+        let mut backings = BTreeMap::new();
+        for (node, vm) in &manifest.vms {
+            let pinned = SharedBacking::pin(&opener, &vm.memory_file)
+                .map_err(|e| contextual(&path.join(&vm.memory_file.path), e))?;
+            backings.insert(node.clone(), pinned);
+        }
+        manifest.verify(
+            |file: &Path| match backings.values().find(|b| b.path == file) {
+                Some(backing) => backing.reader(),
+                None => opener.open(file),
+            },
+        )?;
+        let lab = self.create_from(
+            id,
+            &manifest.lab_spec,
+            Some(Restored {
+                opener: &opener,
+                manifest: &manifest,
+                backings: &backings,
+            }),
+        )?;
         Ok((lab, manifest))
     }
 
@@ -700,7 +731,7 @@ impl Store {
         &self,
         id: &str,
         spec: &LabSpec,
-        snapshot: Option<(&SnapshotOpener, &SnapshotManifest)>,
+        snapshot: Option<Restored<'_>>,
     ) -> Result<Lab, Error> {
         valid_id(id)?;
         spec.validate()?;
@@ -725,97 +756,107 @@ impl Store {
             id: id.into(),
             owned: true,
         };
-        let result = (|| {
-            let image = if snapshot.is_none() {
-                let source_parent = self
-                    .image
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let source_dir =
-                    directory(source_parent, false).map_err(|e| contextual(&self.image, e))?;
-                let name = self
-                    .image
-                    .file_name()
-                    .ok_or_else(|| contextual(&self.image, io::ErrorKind::InvalidInput.into()))?;
-                let source = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
-                    .map_err(|e| contextual(&self.image, e))?;
-                if !source
-                    .metadata()
-                    .map_err(|e| contextual(&self.image, e))?
-                    .is_file()
-                {
-                    return Err(contextual(&self.image, io::ErrorKind::InvalidInput.into()));
-                }
-                Some(source)
-            } else {
-                None
-            };
-            let vms =
-                make_directory(&lab.directory, "vms").map_err(|e| contextual(&lab.root, e))?;
-            for node in &spec.nodes {
-                let _vm = tracing::info_span!("store_vm", vm = %node.name).entered();
-                let vm_started = Instant::now();
-                let paths = lab.vm_paths(&node.name)?;
-                let vm = make_directory(&vms, &node.name)
-                    .map_err(|e| contextual(&paths.directory, e))?;
-                let destination = open(
-                    &vm,
-                    "rootfs.ext4".as_ref(),
-                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
-                )
-                .map_err(|e| contextual(&paths.rootfs, e))?;
-                let restored_source = snapshot
-                    .map(|(opener, manifest)| opener.open(&manifest.vms[&node.name].disks[0].path))
-                    .transpose()
+        let result =
+            (|| {
+                let image = if snapshot.is_none() {
+                    let source_parent = self
+                        .image
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    let source_dir =
+                        directory(source_parent, false).map_err(|e| contextual(&self.image, e))?;
+                    let name = self.image.file_name().ok_or_else(|| {
+                        contextual(&self.image, io::ErrorKind::InvalidInput.into())
+                    })?;
+                    let source = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
+                        .map_err(|e| contextual(&self.image, e))?;
+                    if !source
+                        .metadata()
+                        .map_err(|e| contextual(&self.image, e))?
+                        .is_file()
+                    {
+                        return Err(contextual(&self.image, io::ErrorKind::InvalidInput.into()));
+                    }
+                    Some(source)
+                } else {
+                    None
+                };
+                let vms =
+                    make_directory(&lab.directory, "vms").map_err(|e| contextual(&lab.root, e))?;
+                for node in &spec.nodes {
+                    let _vm = tracing::info_span!("store_vm", vm = %node.name).entered();
+                    let vm_started = Instant::now();
+                    let paths = lab.vm_paths(&node.name)?;
+                    let vm = make_directory(&vms, &node.name)
+                        .map_err(|e| contextual(&paths.directory, e))?;
+                    let destination = open(
+                        &vm,
+                        "rootfs.ext4".as_ref(),
+                        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                    )
                     .map_err(|e| contextual(&paths.rootfs, e))?;
-                let source = restored_source
-                    .as_ref()
-                    .or(image.as_ref())
-                    .ok_or_else(|| contextual(&paths.rootfs, io::ErrorKind::InvalidData.into()))?;
-                reflink(source, &destination).map_err(|source| Error::Reflink {
-                    path: paths.rootfs,
-                    source,
-                })?;
-                if let Some((opener, manifest)) = snapshot {
-                    let saved = &manifest.vms[&node.name];
-                    for (meta, name) in [
-                        (&saved.state_file, "vm.state"),
-                        (&saved.memory_file, "vm.mem"),
-                    ] {
-                        let source = opener
-                            .open(&meta.path)
-                            .map_err(|e| contextual(&meta.path, e))?;
-                        let destination = open(
+                    let restored_source = snapshot
+                        .map(|r| r.opener.open(&r.manifest.vms[&node.name].disks[0].path))
+                        .transpose()
+                        .map_err(|e| contextual(&paths.rootfs, e))?;
+                    let source = restored_source.as_ref().or(image.as_ref()).ok_or_else(|| {
+                        contextual(&paths.rootfs, io::ErrorKind::InvalidData.into())
+                    })?;
+                    reflink(source, &destination).map_err(|source| Error::Reflink {
+                        path: paths.rootfs,
+                        source,
+                    })?;
+                    if let Some(Restored {
+                        opener,
+                        manifest,
+                        backings,
+                    }) = snapshot
+                    {
+                        let saved = &manifest.vms[&node.name];
+                        // 1. Reflink vm.state so each clone gets its own independent state file
+                        let state_source = opener
+                            .open(&saved.state_file.path)
+                            .map_err(|e| contextual(&saved.state_file.path, e))?;
+                        let state_destination = open(
                             &vm,
-                            name.as_ref(),
+                            "vm.state".as_ref(),
                             OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
                         )
-                        .map_err(|e| contextual(&paths.directory.join(name), e))?;
-                        reflink(&source, &destination).map_err(|source| Error::Reflink {
-                            path: paths.directory.join(name),
-                            source,
+                        .map_err(|e| contextual(&paths.directory.join("vm.state"), e))?;
+                        reflink(&state_source, &state_destination).map_err(|source| {
+                            Error::Reflink {
+                                path: paths.directory.join("vm.state"),
+                                source,
+                            }
                         })?;
+
+                        // 2. Hard-link vm.mem so all clones share the exact same inode and page cache
+                        let backing = backings.get(&node.name).ok_or_else(|| {
+                            contextual(&paths.directory, io::ErrorKind::InvalidData.into())
+                        })?;
+                        backing
+                            .link_into(&vm, "vm.mem")
+                            .map_err(|e| contextual(&paths.directory.join("vm.mem"), e))?;
                     }
+                    tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
                 }
-                tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
-            }
-            let state = State {
-                lab_id: id.into(),
-                spec: spec.clone(),
-                created_at: SystemTime::now(),
-            };
-            let bytes = serde_json::to_vec(&state)?;
-            let mut file = open(
-                &lab.directory,
-                "state.json".as_ref(),
-                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
-            )
-            .map_err(|e| contextual(&lab.state_path(), e))?;
-            file.write_all(&bytes)
+                let state = State {
+                    lab_id: id.into(),
+                    spec: spec.clone(),
+                    created_at: SystemTime::now(),
+                };
+                let bytes = serde_json::to_vec(&state)?;
+                let mut file = open(
+                    &lab.directory,
+                    "state.json".as_ref(),
+                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                )
                 .map_err(|e| contextual(&lab.state_path(), e))?;
-            Ok(())
-        })();
+                file.write_all(&bytes)
+                    .map_err(|e| contextual(&lab.state_path(), e))?;
+                Ok(())
+            })();
         if let Err(error) = result {
             let mut lab = lab;
             lab.remove()?;
@@ -1116,6 +1157,116 @@ struct open_how {
 }
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
+/// Rejects a shared read-only backing file unless the orchestrator owns it and nobody can write
+/// it. Mode bits alone are not enough: the owner, for example an unprivileged jailer uid, could
+/// chmod the inode back to writable and alter the memory of every clone that maps it.
+///
+/// # Errors
+/// [`io::ErrorKind::PermissionDenied`] naming the offending owner or mode.
+pub fn ensure_trusted_read_only(owner: u32, mode: u32, orchestrator: u32) -> io::Result<()> {
+    if owner != orchestrator {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "shared backing is owned by uid {owner}, not the orchestrator uid {orchestrator}"
+            ),
+        ));
+    }
+    if mode & 0o222 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("shared backing is writable (mode {:o})", mode & 0o7777),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct Restored<'a> {
+    opener: &'a SnapshotOpener,
+    manifest: &'a SnapshotManifest,
+    backings: &'a BTreeMap<String, SharedBacking>,
+}
+
+/// A snapshot memory file pinned by descriptor, validated before it is hashed or linked.
+struct SharedBacking {
+    path: PathBuf,
+    file: File,
+    stamp: (u64, u64, u64, i64, i64),
+}
+
+impl SharedBacking {
+    fn pin(opener: &SnapshotOpener, meta: &FileMeta) -> io::Result<Self> {
+        let file = opener.open(&meta.path)?;
+        let stamp = Self::validate(&file, meta.size)?;
+        Ok(Self {
+            path: meta.path.clone(),
+            file,
+            stamp,
+        })
+    }
+
+    fn validate(file: &File, size: u64) -> io::Result<(u64, u64, u64, i64, i64)> {
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        ensure_trusted_read_only(meta.uid(), meta.mode(), nix::unistd::geteuid().as_raw())?;
+        if meta.len() != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "shared backing is {} bytes, manifest says {size}",
+                    meta.len()
+                ),
+            ));
+        }
+        Ok((
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ))
+    }
+
+    // A second open file description: hashing must not move a shared offset.
+    fn reader(&self) -> io::Result<File> {
+        File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    /// Links the pinned inode, then fails closed, removing the link, if the inode was replaced,
+    /// modified or made writable since it was pinned.
+    fn link_into(&self, dir: &File, name: &str) -> io::Result<()> {
+        let source = std::ffi::CString::new(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        nix::unistd::linkat(
+            nix::fcntl::AT_FDCWD,
+            source.as_c_str(),
+            dir,
+            name,
+            nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
+        )?;
+        let checked =
+            open(dir, name.as_ref(), OFlag::O_RDONLY | OFlag::O_NONBLOCK).and_then(|linked| {
+                let linked = Self::validate(&linked, self.stamp.2)?;
+                let pinned = Self::validate(&self.file, self.stamp.2)?;
+                if linked != self.stamp || pinned != self.stamp {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "shared backing changed after verification",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = checked {
+            unlinkat(dir, name, UnlinkatFlags::NoRemoveDir)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
 
 /// Descriptor-relative snapshot access under operator-controlled directories.
 /// Ancestors and snapshot trees must not be writable by hostile processes: the

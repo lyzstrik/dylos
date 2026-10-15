@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+#[cfg(feature = "test-hooks")]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -304,7 +306,7 @@ async fn clean_jail_files_for_vms(vms: &[SnapshotVm]) -> Result<(), LabError> {
         for root in vm_roots {
             match dylos_store::directory(&root, false) {
                 Ok(dir) => {
-                    for file in ["vm.state", "vm.mem"] {
+                    for file in ["snap.state", "snap.mem"] {
                         match nix::unistd::unlinkat(
                             &dir,
                             file,
@@ -537,7 +539,7 @@ async fn run_snapshot_steps(
         let api = vm.client.clone();
         let lab_id_for_api = job.lab_id.clone();
         let handle = tokio::spawn(async move {
-            let params = SnapshotCreateParams::full("/vm.state", "/vm.mem");
+            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem");
             api.create_snapshot(&params)
                 .await
                 .map_err(|source| LabError::Api {
@@ -595,12 +597,13 @@ async fn run_snapshot_steps(
     for vm in &job.vms {
         let snap = Arc::clone(&snapshot_arc);
         let node = vm.node.clone();
-        let state_src = vm.root_dir.join("vm.state");
-        let mem_src = vm.root_dir.join("vm.mem");
+        let state_src = vm.root_dir.join("snap.state");
+        let mem_src = vm.root_dir.join("snap.mem");
         let disk_src = vm.disk_path.clone();
 
         let state_max_bytes = 16 * 1024 * 1024;
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
+        #[cfg(feature = "test-hooks")]
         let root_dir = vm.root_dir.clone();
 
         let handle = tokio::task::spawn_blocking(move || {

@@ -502,3 +502,36 @@ async fn injected_jail_directory_symlink_is_rejected_without_touching_target() {
     assert_eq!(std::fs::read(&target).unwrap(), b"outside contents");
     assert!(!outside.join("run").exists());
 }
+
+#[tokio::test]
+async fn read_only_file_is_shared_unchanged_and_writable_source_is_refused() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let config = local_config(dir.path());
+    let source = dir.path().join("vm.mem");
+    std::fs::write(&source, b"memory").unwrap();
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+
+    let err = prepare_chroot(&config, &paths, &[ChrootFile::read_only(&source, "vm.mem")])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Io { op: "validate read-only source", source, .. }
+            if source.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    assert!(!paths.jail_dir.exists());
+
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let before = std::fs::metadata(&source).unwrap();
+    let mut jail = prepare_chroot(&config, &paths, &[ChrootFile::read_only(&source, "vm.mem")])
+        .await
+        .unwrap();
+    let placed = std::fs::metadata(paths.root.join("vm.mem")).unwrap();
+    assert_eq!((placed.dev(), placed.ino()), (before.dev(), before.ino()));
+    let after = std::fs::metadata(&source).unwrap();
+    assert_eq!(after.mode(), before.mode());
+    assert_eq!(after.uid(), before.uid());
+    jail.release().await.unwrap();
+    remove_jail(&paths).await.unwrap();
+}
