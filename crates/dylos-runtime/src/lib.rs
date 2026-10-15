@@ -23,5 +23,5 @@ pub mod vm;
 pub use error::{Error, Result};
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
-pub use snapshot::{SnapshotTimings, snapshot_lab, snapshot_lab_with_timings};
+pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms};
 pub use vm::{ProcessState, Timeouts, Vm, VmSpec};

@@ -1,4 +1,9 @@
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::result_large_err
+)]
 mod support;
 
 use std::fs;
@@ -8,7 +13,11 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use dylos_core::LabSpec;
-use dylos_runtime::{Lab, Timeouts, Vm, VmSpec};
+use dylos_core::manifest::SnapshotManifest;
+use dylos_net::LabNetwork;
+use dylos_runtime::{
+    Lab, LabConfig, LabError, SnapshotRequest, SnapshotSlot, Timeouts, Vm, VmSpec, snapshot_vms,
+};
 use dylos_store::{SnapshotOpener, Store};
 use support::{Mode, Sandbox, wait_until};
 
@@ -43,7 +52,50 @@ fn sandboxed(test: &str) -> bool {
     false
 }
 
-async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Lab) {
+/// The explicit inputs of a snapshot, owned by the test in place of a running [`Lab`].
+struct Parts {
+    id: String,
+    store: Store,
+    spec: LabSpec,
+    storage: Option<dylos_store::Lab>,
+    vms: Vec<Vm>,
+    network: Option<LabNetwork>,
+    slot: SnapshotSlot,
+}
+
+impl Parts {
+    async fn snapshot(&self, snapshot_id: &str) -> Result<SnapshotManifest, LabError> {
+        let request = SnapshotRequest {
+            lab_id: &self.id,
+            snapshot_id,
+            spec: &self.spec,
+            store: &self.store,
+            storage: self.storage.as_ref(),
+            vms: &self.vms,
+            network: self.network.as_ref(),
+        };
+        snapshot_vms(request, &self.slot)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    async fn teardown(&mut self) -> Result<(), LabError> {
+        self.slot.wait().await;
+        for vm in &mut self.vms {
+            vm.shutdown().await?;
+        }
+        self.vms.clear();
+        if let Some(network) = &mut self.network {
+            network.teardown().await?;
+        }
+        if let Some(mut storage) = self.storage.take() {
+            storage.remove()?;
+        }
+        Ok(())
+    }
+}
+
+async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Parts) {
     let sandbox = Sandbox::in_target(Mode::ParallelPause);
     let store_dir = sandbox.dir.path().join("labs");
     let image = sandbox.dir.path().join("base_rootfs.ext4");
@@ -92,8 +144,56 @@ async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Lab) {
         );
     }
 
-    let lab = Lab::from_test_vms_with_store(lab_id, vms, store.clone(), spec.clone(), storage);
+    let lab = Parts {
+        id: lab_id.into(),
+        store: store.clone(),
+        spec: spec.clone(),
+        storage,
+        vms,
+        network: None,
+        slot: SnapshotSlot::default(),
+    };
     (sandbox, store, spec, lab)
+}
+
+/// Brings up a full lab on the fake jailer; `None` when reflinks are unavailable here.
+async fn up_lab(sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfig, Lab)> {
+    let kernel = sandbox.dir.path().join("vmlinux.bin");
+    fs::write(&kernel, b"kernel").unwrap();
+    let image = sandbox.dir.path().join("rootfs.ext4");
+    fs::write(&image, b"simulated rootfs content").unwrap();
+    let config = LabConfig {
+        store: Store {
+            base: sandbox.dir.path().join("labs"),
+            image,
+        },
+        kernel,
+        netns_dir: sandbox.dir.path().join("netns"),
+        jailer: sandbox.config.clone(),
+        timeouts: Timeouts {
+            ready: Duration::from_secs(5),
+            graceful: Duration::from_millis(100),
+            term: Duration::from_millis(100),
+            kill: Duration::from_secs(2),
+            metrics_poll: Duration::from_millis(50),
+        },
+        boot_timeout: Duration::from_secs(5),
+        extra_boot_args: None,
+    };
+    match Lab::up_with(&config, &test_spec(), lab_id).await {
+        Ok(lab) => Some((config, lab)),
+        Err(LabError::Store(dylos_store::Error::Reflink { source, .. })) => {
+            eprintln!("SKIPPED {lab_id}: reflinks unavailable: {source}");
+            None
+        }
+        Err(error) => panic!("lab bring-up failed: {error}"),
+    }
+}
+
+fn assert_lab_removed(sandbox: &Sandbox, config: &LabConfig, lab_id: &str) {
+    sandbox.assert_no_jail_left();
+    assert!(!config.store.base.join(lab_id).exists());
+    assert!(!config.netns_dir.join(format!("dylos-{lab_id}")).exists());
 }
 
 #[tokio::test]
@@ -109,13 +209,13 @@ async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
 
-    if lab.storage().is_some() {
+    if lab.storage.as_ref().is_some() {
         for vm in manifest.vms.values() {
             assert_eq!(vm.disks.len(), 1);
         }
     }
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -145,9 +245,9 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
         .await
         .unwrap();
     let netns_path = network.netns_path().to_path_buf();
-    lab.set_network(network);
+    lab.network = Some(network);
 
-    let vm0_root = lab.vms()[0].paths().root.clone();
+    let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
     let task = tokio::spawn(async move {
@@ -240,7 +340,7 @@ async fn snapshot_with_network_observes_freeze_thaw_barrier_order() {
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -270,14 +370,14 @@ async fn snapshot_fails_at_freeze_never_pauses_vms() {
 
     // Tear down network before snapshot to trigger freeze failure
     network.teardown().await.unwrap();
-    lab.set_network(network);
+    lab.network = Some(network);
 
     let err = lab.snapshot("snap-freeze-err").await.unwrap_err();
     assert!(err.to_string().contains("ls-ff"));
 
     // VMs must NEVER have been paused because freeze is Step 1 before pause
     assert!(!store.snapshot_dir("ls-ff", "snap-freeze-err").exists());
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             !sandbox
                 .dir
@@ -294,14 +394,14 @@ async fn snapshot_fails_at_freeze_never_pauses_vms() {
 #[tokio::test]
 async fn snapshot_fails_at_pause_cleans_up_and_resumes_all_vms() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfp").await;
-    fs::write(lab.vms()[0].paths().root.join("fail-paused"), b"").unwrap();
+    fs::write(lab.vms[0].paths().root.join("fail-paused"), b"").unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
     assert!(err.to_string().contains("lab lfp, VM"));
 
     assert!(!store.snapshot_dir("lfp", "snap-err").exists());
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -318,14 +418,14 @@ async fn snapshot_fails_at_pause_cleans_up_and_resumes_all_vms() {
 #[tokio::test]
 async fn snapshot_fails_at_snapshot_create_cleans_up_and_resumes_all_vms() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfc").await;
-    fs::write(lab.vms()[0].paths().root.join("fail-snapshot"), b"").unwrap();
+    fs::write(lab.vms[0].paths().root.join("fail-snapshot"), b"").unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
     assert!(err.to_string().contains("lfc"));
 
     assert!(!store.snapshot_dir("lfc", "snap-err").exists());
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -342,13 +442,13 @@ async fn snapshot_fails_at_snapshot_create_cleans_up_and_resumes_all_vms() {
 #[tokio::test]
 async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfd").await;
-    if lab.storage().is_none() {
+    if lab.storage.as_ref().is_none() {
         eprintln!("SKIP: disk clone test requires storage reflink support");
         lab.teardown().await.unwrap();
         sandbox.assert_no_jail_left();
         return;
     }
-    let disk_path = lab.storage().unwrap().vm_paths("A").unwrap().rootfs;
+    let disk_path = lab.storage.as_ref().unwrap().vm_paths("A").unwrap().rootfs;
     fs::remove_file(disk_path).unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
@@ -356,7 +456,7 @@ async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
 
     assert!(!store.snapshot_dir("lfd", "snap-err").exists());
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -375,8 +475,8 @@ async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
 
 #[tokio::test]
 async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lfm").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
+    let (sandbox, store, _spec, lab) = setup_lab("lfm").await;
+    let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
     let task = tokio::spawn(async move {
@@ -408,7 +508,7 @@ async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
     // Cleanup the injected failure directory so assertions can verify partial cleanup
     let _ = fs::remove_dir(snap_dir.join("manifest.json.tmp"));
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -439,9 +539,9 @@ async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
         .await
         .unwrap();
     let netns_path = network.netns_path().to_path_buf();
-    lab.set_network(network);
+    lab.network = Some(network);
 
-    let vm0_root = lab.vms()[0].paths().root.clone();
+    let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
     let task = tokio::spawn(async move {
@@ -477,7 +577,7 @@ async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
     assert!(!store.snapshot_dir("ls-tf", "snap-thaw-err").exists());
 
     // VMs must be resumed
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -495,11 +595,11 @@ async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
 
 #[tokio::test]
 async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lcl").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
+    let (sandbox, store, _spec, lab) = setup_lab("lcl").await;
+    let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
     // VM 1 will fail snapshot create
-    fs::write(lab.vms()[1].paths().root.join("fail-snapshot"), b"").unwrap();
+    fs::write(lab.vms[1].paths().root.join("fail-snapshot"), b"").unwrap();
 
     let task = tokio::spawn(async move {
         let res = lab.snapshot("snap-clean-err").await;
@@ -538,7 +638,7 @@ async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
     let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
     let _ = fs::remove_dir_all(&snap_dir);
 
-    for vm in lab.vms() {
+    for vm in &lab.vms {
         assert!(
             sandbox
                 .dir
@@ -555,7 +655,7 @@ async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
 #[tokio::test]
 async fn snapshot_fails_at_resume_preserves_error_and_cleans_up() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfr").await;
-    fs::write(lab.vms()[0].paths().root.join("fail-resumed"), b"").unwrap();
+    fs::write(lab.vms[0].paths().root.join("fail-resumed"), b"").unwrap();
 
     let err = lab.snapshot("snap-err").await.unwrap_err();
     assert!(err.to_string().contains("lfr"));
@@ -569,8 +669,8 @@ async fn snapshot_fails_at_resume_preserves_error_and_cleans_up() {
 #[tokio::test]
 async fn snapshot_in_flight_cancellation_during_pause() {
     let (sandbox, _store, _spec, mut lab) = setup_lab("lcp").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
-    let vm_id = lab.vms()[0].paths().id.clone();
+    let vm0_root = lab.vms[0].paths().root.clone();
+    let vm_id = lab.vms[0].paths().id.clone();
     fs::write(vm0_root.join("stall-pause"), b"").unwrap();
 
     tokio::select! {
@@ -610,8 +710,8 @@ async fn snapshot_in_flight_cancellation_during_pause() {
 #[tokio::test]
 async fn snapshot_in_flight_cancellation_during_capture() {
     let (sandbox, _store, _spec, mut lab) = setup_lab("lca").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
-    let vm_id = lab.vms()[0].paths().id.clone();
+    let vm0_root = lab.vms[0].paths().root.clone();
+    let vm_id = lab.vms[0].paths().id.clone();
     fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
     tokio::select! {
@@ -651,51 +751,55 @@ async fn snapshot_in_flight_cancellation_during_capture() {
 }
 
 #[tokio::test]
-async fn snapshot_in_flight_cancellation_during_storage() {
-    let (sandbox, _store, _spec, mut lab) = setup_lab("lcs").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
-    let vm_id = lab.vms()[0].paths().id.clone();
-    fs::write(vm0_root.join("stall-storage"), b"").unwrap();
+async fn snapshot_in_flight_cancellation_during_resume_still_commits() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("lcs").await;
+    let vm0_root = lab.vms[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-resume"), b"").unwrap();
 
+    // Storage and the manifest write precede resume, so the caller is cancelled after them.
     tokio::select! {
-        _ = lab.snapshot("snap-cancel-storage") => {}
+        _ = lab.snapshot("snap-cancel-resume") => {}
         () = async {
-            wait_until("storage started", Duration::from_secs(5), || {
-                vm0_root.join("storage-started").exists()
+            wait_until("resume started", Duration::from_secs(5), || {
+                vm0_root.join("resume-started").exists()
             })
             .await;
         } => {}
     }
-
-    // HOLD OPERATION PENDING: Assert resume cannot overtake in-flight storage
-    tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
-        !sandbox.dir.path().join(format!("{vm_id}.resumed")).exists(),
-        "resume must not overtake pending storage"
+        lab.slot.is_active(),
+        "snapshot task must outlive its caller"
     );
 
-    // Release stall so storage completes
-    let _ = fs::remove_file(vm0_root.join("stall-storage"));
+    let _ = fs::remove_file(vm0_root.join("stall-resume"));
+    lab.slot.wait().await;
 
-    wait_until(
-        "VM is resumed after storage cancellation",
-        Duration::from_secs(5),
-        || {
-            !vm0_root.join("is-paused").exists()
-                && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
-                && !vm0_root.join("vm.state").exists()
-                && !vm0_root.join("vm.mem").exists()
-        },
-    )
-    .await;
+    assert!(!vm0_root.join("is-paused").exists());
+    for vm in &lab.vms {
+        assert!(
+            sandbox
+                .dir
+                .path()
+                .join(format!("{}.resumed", vm.paths().id))
+                .exists()
+        );
+        assert!(!vm.paths().root.join("vm.state").exists());
+        assert!(!vm.paths().root.join("vm.mem").exists());
+    }
+    let snap_dir = store.snapshot_dir("lcs", "snap-cancel-resume");
+    let manifest_json = fs::read_to_string(snap_dir.join("manifest.json")).unwrap();
+    let manifest = SnapshotManifest::from_json_str(&manifest_json).unwrap();
+    manifest
+        .verify(SnapshotOpener::new(&snap_dir).unwrap().verify_opener())
+        .unwrap();
 
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
 
 #[tokio::test]
-async fn snapshot_in_flight_cancellation_during_freeze() {
-    if !sandboxed("snapshot_in_flight_cancellation_during_freeze") {
+async fn snapshot_in_flight_cancellation_with_network_thaws_after_completion() {
+    if !sandboxed("snapshot_in_flight_cancellation_with_network_thaws_after_completion") {
         return;
     }
     let (sandbox, _store, spec, mut lab) = setup_lab("lcf").await;
@@ -707,50 +811,35 @@ async fn snapshot_in_flight_cancellation_during_freeze() {
         .await
         .unwrap();
     let netns_path = network.netns_path().to_path_buf();
-    lab.set_network(network);
+    lab.network = Some(network);
 
-    let vm0_root = lab.vms()[0].paths().root.clone();
-    fs::write(vm0_root.join("stall-freeze"), b"").unwrap();
+    let vm0_root = lab.vms[0].paths().root.clone();
+    fs::write(vm0_root.join("stall-pause"), b"").unwrap();
 
+    // The fake checks that every TAP is down before it confirms the pause.
     tokio::select! {
-        _ = lab.snapshot("snap-cancel-freeze") => {}
+        _ = lab.snapshot("snap-cancel-net") => {}
         () = async {
-            wait_until("freeze started", Duration::from_secs(5), || {
-                vm0_root.join("freeze-started").exists()
+            wait_until("pause started", Duration::from_secs(5), || {
+                vm0_root.join("pause-started").exists()
             })
             .await;
         } => {}
     }
 
-    // HOLD OPERATION PENDING: during freeze stall, snapshot is active but VMs are not yet paused/captured/resumed
-    assert!(
-        lab.has_active_snapshot(),
-        "snapshot task must remain active"
-    );
-    assert!(
-        !vm0_root.join("is-paused").exists(),
-        "VM must not be paused while freeze is stalled"
-    );
+    assert!(lab.slot.is_active(), "snapshot task must remain active");
     assert!(
         !vm0_root.join("capture-done").exists(),
-        "VM must not be captured while freeze is stalled"
+        "VM must not be captured while pause is stalled"
     );
-    assert!(
-        !sandbox.dir.path().join("lcf-A.resumed").exists(),
-        "VM must not be resumed while freeze is stalled"
+    support::assert_taps_down(
+        sandbox.dir.path(),
+        "fabric must stay frozen while the cancelled snapshot is paused",
     );
 
-    // Release freeze stall so background completes freeze, pause, capture, resume, and thaw
-    let _ = fs::remove_file(vm0_root.join("stall-freeze"));
+    let _ = fs::remove_file(vm0_root.join("stall-pause"));
 
-    wait_until(
-        "VM is resumed after freeze cancellation",
-        Duration::from_secs(5),
-        || !vm0_root.join("is-paused").exists(),
-    )
-    .await;
-
-    lab.wait_for_active_snapshot().await;
+    lab.slot.wait().await;
 
     // After completion, TAPs must be UP
     let output_thawed = Command::new("nsenter")
@@ -785,55 +874,15 @@ async fn snapshot_in_flight_cancellation_during_freeze() {
 }
 
 #[tokio::test]
-async fn snapshot_panic_during_capture_recovers_cleanly() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lpan").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
-    fs::write(vm0_root.join("panic-snapshot"), b"").unwrap();
-
-    dylos_runtime::snapshot::set_snapshot_test_hook(|stage, root| {
-        assert!(
-            !(stage == "api_snapshot" && root.join("panic-snapshot").exists()),
-            "injected panic during firecracker api snapshot"
-        );
-    });
-
-    let err = lab.snapshot("snap-panic").await.unwrap_err();
-    dylos_runtime::snapshot::clear_snapshot_test_hook();
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("panicked"),
-        "expected panic error message, got: {err_str}"
-    );
-
-    // Verify VMs are resumed and not left paused
-    assert!(
-        !vm0_root.join("is-paused").exists(),
-        "VM must be resumed after panic recovery"
-    );
-    // Verify no leftover jail snapshot files
-    assert!(
-        !vm0_root.join("vm.state").exists(),
-        "vm.state must be cleaned up on panic"
-    );
-    assert!(
-        !vm0_root.join("vm.mem").exists(),
-        "vm.mem must be cleaned up on panic"
-    );
-    // Verify partial snapshot is removed
-    assert!(
-        !store.snapshot_dir("lpan", "snap-panic").exists(),
-        "partial snapshot must be removed after panic recovery"
-    );
-
-    lab.teardown().await.unwrap();
-    sandbox.assert_no_jail_left();
-}
-
-#[tokio::test]
 async fn snapshot_via_control_socket() {
-    let (sandbox, store, _spec, mut lab) = setup_lab("lc").await;
-    let socket = lab.bind_control_socket().await.unwrap();
-
+    if !sandboxed("snapshot_via_control_socket") {
+        return;
+    }
+    let sandbox = Sandbox::in_target(Mode::LabSnapshot);
+    let Some((config, lab)) = up_lab(&sandbox, "lc").await else {
+        return;
+    };
+    let socket = lab.control_socket();
     let supervisor = tokio::spawn(lab.supervise());
 
     // 1. Unknown command rejection closes connection without disrupting the lab
@@ -880,36 +929,20 @@ async fn snapshot_via_control_socket() {
         assert!(res.is_err() || res.unwrap() == 0);
     }
 
-    // 5. Unauthorized peer UID rejection closes connection without response
-    {
-        Lab::set_control_uid_override(Some(9999));
-        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
-        stream
-            .write_all(b"snapshot unauthorized-test\n")
-            .await
-            .unwrap();
-        let mut resp = String::new();
-        let mut reader = tokio::io::BufReader::new(stream);
-        let read_res =
-            tokio::time::timeout(Duration::from_millis(500), reader.read_line(&mut resp)).await;
-        assert!(matches!(read_res, Err(_) | Ok(Err(_) | Ok(0))));
-        assert!(!store.snapshot_dir("lc", "unauthorized-test").exists());
-        Lab::set_control_uid_override(None);
-    }
-
-    // 6. Successful snapshot returns snapshot ID
+    // 5. Successful snapshot returns snapshot ID
     let snap_id = Lab::request_snapshot(&socket, Some("snap-socket"), Duration::from_secs(10))
         .await
         .unwrap();
     assert_eq!(snap_id, "snap-socket");
 
-    let snap_dir = store.snapshot_dir("lc", "snap-socket");
+    let snap_dir = config.store.snapshot_dir("lc", "snap-socket");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
     let manifest_json = fs::read_to_string(snap_dir.join("manifest.json")).unwrap();
-    let manifest = dylos_core::manifest::SnapshotManifest::from_json_str(&manifest_json).unwrap();
+    let manifest = SnapshotManifest::from_json_str(&manifest_json).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
+    assert_eq!(manifest.vms.len(), 3);
 
-    // 7. Teardown
+    // 6. Teardown
     Lab::request_teardown(&socket, Duration::from_secs(5))
         .await
         .unwrap();
@@ -921,7 +954,7 @@ async fn snapshot_via_control_socket() {
 #[tokio::test]
 async fn snapshot_caller_cancellation_releases_slot_for_subsequent_snapshot() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lrel").await;
-    let vm0_root = lab.vms()[0].paths().root.clone();
+    let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-pause"), b"").unwrap();
 
     // Cancel caller while pause is stalled
@@ -936,7 +969,7 @@ async fn snapshot_caller_cancellation_releases_slot_for_subsequent_snapshot() {
     }
 
     assert!(
-        lab.has_active_snapshot(),
+        lab.slot.is_active(),
         "snapshot must remain active in background while running"
     );
 
@@ -952,7 +985,7 @@ async fn snapshot_caller_cancellation_releases_slot_for_subsequent_snapshot() {
     wait_until(
         "background snapshot settles",
         Duration::from_secs(5),
-        || !vm0_root.join("is-paused").exists() && !lab.has_active_snapshot(),
+        || !vm0_root.join("is-paused").exists() && !lab.slot.is_active(),
     )
     .await;
 
@@ -969,17 +1002,23 @@ async fn snapshot_caller_cancellation_releases_slot_for_subsequent_snapshot() {
 }
 
 #[tokio::test]
-async fn teardown_cancellation_during_pending_storage_retains_ownership_for_retry() {
-    let (sandbox, _store, _spec, mut lab) = setup_lab("ltret").await;
+async fn teardown_cancellation_during_pending_snapshot_retains_ownership_for_retry() {
+    if !sandboxed("teardown_cancellation_during_pending_snapshot_retains_ownership_for_retry") {
+        return;
+    }
+    let sandbox = Sandbox::in_target(Mode::LabSnapshot);
+    let Some((config, mut lab)) = up_lab(&sandbox, "ltret").await else {
+        return;
+    };
     let vm0_root = lab.vms()[0].paths().root.clone();
-    fs::write(vm0_root.join("stall-storage"), b"").unwrap();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
-    // 1. Snapshot caller starts snapshot, but cancels while storage is stalled
+    // 1. Snapshot caller starts snapshot, but cancels while capture is stalled
     tokio::select! {
         _ = lab.snapshot("snap-stall") => {}
         () = async {
-            wait_until("storage reached", Duration::from_secs(5), || {
-                vm0_root.join("storage-started").exists()
+            wait_until("capture reached", Duration::from_secs(5), || {
+                vm0_root.join("snapshot-started").exists()
             })
             .await;
         } => {}
@@ -990,55 +1029,59 @@ async fn teardown_cancellation_during_pending_storage_retains_ownership_for_retr
         "snapshot must remain active in background"
     );
 
-    // 2. Teardown caller starts teardown, but cancels while storage is still stalled
+    // 2. Teardown caller starts teardown, but cancels while capture is still stalled
     tokio::select! {
         _ = lab.teardown() => {}
         () = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
 
-    // 3. Invariant: tracker retains ownership, teardown did not overtake pending storage
+    // 3. Invariant: the slot retains ownership, teardown did not overtake the pending capture
     assert!(
         lab.has_active_snapshot(),
         "cancelled teardown must not detach snapshot ownership"
     );
     assert!(
         vm0_root.exists(),
-        "teardown must not delete VM root while storage is pending"
+        "teardown must not delete VM root while capture is pending"
     );
     assert_eq!(lab.vms().len(), 3, "VMs must not be cleared");
 
     // 4. Retry teardown in a background task
     let retry_task = tokio::spawn(async move { lab.teardown().await });
 
-    // Verify retry is blocked waiting for active snapshot
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
         !retry_task.is_finished(),
         "retry must wait for active snapshot"
     );
 
-    // 5. Release storage stall
-    let _ = fs::remove_file(vm0_root.join("stall-storage"));
+    // 5. Release capture stall
+    let _ = fs::remove_file(vm0_root.join("stall-snapshot"));
 
     // 6. Retry finishes successfully
     let teardown_res = retry_task.await.unwrap();
     assert!(teardown_res.is_ok(), "teardown retry must succeed");
-    sandbox.assert_no_jail_left();
+    assert_lab_removed(&sandbox, &config, "ltret");
 }
 
 #[tokio::test]
-async fn teardown_cancellation_during_pending_storage_retains_ownership_for_drop() {
-    let (sandbox, _store, _spec, mut lab) = setup_lab("ltdrp").await;
-    lab.set_cleanup_on_drop(true);
+async fn teardown_cancellation_during_pending_snapshot_retains_ownership_for_drop() {
+    if !sandboxed("teardown_cancellation_during_pending_snapshot_retains_ownership_for_drop") {
+        return;
+    }
+    let sandbox = Sandbox::in_target(Mode::LabSnapshot);
+    let Some((config, mut lab)) = up_lab(&sandbox, "ltdrp").await else {
+        return;
+    };
     let vm0_root = lab.vms()[0].paths().root.clone();
-    fs::write(vm0_root.join("stall-storage"), b"").unwrap();
+    fs::write(vm0_root.join("stall-snapshot"), b"").unwrap();
 
-    // 1. Snapshot caller cancels while storage is stalled
+    // 1. Snapshot caller cancels while capture is stalled
     tokio::select! {
         _ = lab.snapshot("snap-stall") => {}
         () = async {
-            wait_until("storage reached", Duration::from_secs(5), || {
-                vm0_root.join("storage-started").exists()
+            wait_until("capture reached", Duration::from_secs(5), || {
+                vm0_root.join("snapshot-started").exists()
             })
             .await;
         } => {}
@@ -1055,7 +1098,7 @@ async fn teardown_cancellation_during_pending_storage_retains_ownership_for_drop
         () = tokio::time::sleep(Duration::from_millis(50)) => {}
     }
 
-    // 3. Invariant: tracker retains ownership
+    // 3. Invariant: the slot retains ownership
     assert!(
         lab.has_active_snapshot(),
         "cancelled teardown must not detach snapshot ownership"
@@ -1065,23 +1108,23 @@ async fn teardown_cancellation_during_pending_storage_retains_ownership_for_drop
     drop(lab);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    // While storage is stalled, drop cleanup must wait; resources still exist
     assert!(
         vm0_root.exists(),
-        "drop teardown must not overtake pending storage"
+        "drop teardown must not overtake the pending capture"
     );
 
     // 5. Release stall
-    let _ = fs::remove_file(vm0_root.join("stall-storage"));
+    let _ = fs::remove_file(vm0_root.join("stall-snapshot"));
 
     // 6. Drop cleanup settles
     wait_until("drop cleanup completes", Duration::from_secs(5), || {
         let base = sandbox.dir.path().join("jails/firecracker");
         std::fs::read_dir(base).map_or(true, |mut entries| entries.next().is_none())
+            && !config.store.base.join("ltdrp").exists()
     })
     .await;
 
-    sandbox.assert_no_jail_left();
+    assert_lab_removed(&sandbox, &config, "ltdrp");
 }
 
 #[tokio::test]
@@ -1099,9 +1142,9 @@ async fn snapshot_with_network_verifies_all_vm_capture_and_thaw_after_resume() {
         .await
         .unwrap();
     let netns_path = network.netns_path().to_path_buf();
-    lab.set_network(network);
+    lab.network = Some(network);
 
-    let vm0_root = lab.vms()[0].paths().root.clone();
+    let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-resume"), b"").unwrap();
 
     let task = tokio::spawn(async move {

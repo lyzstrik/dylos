@@ -2,9 +2,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dylos_core::manifest::SnapshotManifest;
 use dylos_core::{LabSpec, guest_net};
 use dylos_fc::config::{BootSource, Drive, MachineConfiguration, NetworkInterface};
 use dylos_net::{FabricPlan, LabNetwork};
@@ -16,11 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::Instrument;
 
 use crate::jailer::{ChrootFile, JailPaths, JailerConfig};
+use crate::snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings};
 use crate::{ProcessState, Timeouts, Vm, VmSpec};
-
-#[cfg(feature = "test-hooks")]
-static EXPECTED_UID_OVERRIDE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LabError {
@@ -92,8 +89,8 @@ impl Default for LabConfig {
 #[must_use]
 pub struct Lab {
     id: String,
-    store: Option<dylos_store::Store>,
-    spec: Option<LabSpec>,
+    store: dylos_store::Store,
+    spec: LabSpec,
     storage: Option<dylos_store::Lab>,
     network: Option<LabNetwork>,
     vms: Vec<Vm>,
@@ -101,7 +98,7 @@ pub struct Lab {
     lock: Option<Flock<File>>,
     span: tracing::Span,
     cleanup_on_drop: bool,
-    active_snapshot: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    snapshots: SnapshotSlot,
 }
 
 impl Lab {
@@ -118,40 +115,6 @@ impl Lab {
     /// Returns the first failure and logs every failed response.
     pub async fn resume_all(&mut self) -> Result<()> {
         crate::resume_all(&self.id, &self.vms).await
-    }
-
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Constructs a VM lab with store, spec and storage for unprivileged snapshot tests.
-    #[cfg(feature = "test-hooks")]
-    pub fn from_test_vms_with_store(
-        id: &str,
-        vms: Vec<Vm>,
-        store: dylos_store::Store,
-        spec: LabSpec,
-        storage: Option<dylos_store::Lab>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            store: Some(store),
-            spec: Some(spec),
-            storage,
-            network: None,
-            vms,
-            listener: None,
-            lock: None,
-            span: tracing::info_span!("lab", lab = id),
-            cleanup_on_drop: false,
-            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
-        }
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub fn set_control_uid_override(uid: Option<u32>) {
-        EXPECTED_UID_OVERRIDE.store(uid.unwrap_or(u32::MAX), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// # Errors
@@ -172,8 +135,8 @@ impl Lab {
             let storage = blocking(lab_id, move || Ok(store.create(&id, &spec_copy)?)).await?;
             let mut lab = Self {
                 id: lab_id.into(),
-                store: Some(config.store.clone()),
-                spec: Some(spec.clone()),
+                store: config.store.clone(),
+                spec: spec.clone(),
                 storage: Some(storage),
                 network: None,
                 vms: Vec::new(),
@@ -181,7 +144,7 @@ impl Lab {
                 lock: None,
                 span: span.clone(),
                 cleanup_on_drop: true,
-                active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+                snapshots: SnapshotSlot::default(),
             };
             let result = lab.bring_up(config, spec, plan).await;
             if let Err(operation) = result {
@@ -284,26 +247,12 @@ impl Lab {
             }))
             .await,
         )?;
-        self.bind_control_socket().await?;
-        Ok(())
-    }
-
-    /// Binds the control socket listener.
-    ///
-    /// # Errors
-    /// Returns [`LabError::Io`] if socket binding fails.
-    pub async fn bind_control_socket(&mut self) -> Result<PathBuf> {
         let socket = self.control_socket();
-        if let Some(parent) = socket.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io(&self.id, e))?;
-        }
         self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(|e| io(&self.id, e))?;
-        Ok(socket)
+        Ok(())
     }
 
     #[must_use]
@@ -323,101 +272,44 @@ impl Lab {
         &self.vms
     }
 
-    #[must_use]
-    pub fn store(&self) -> Option<&dylos_store::Store> {
-        self.store.as_ref()
-    }
-
-    #[must_use]
-    pub fn spec(&self) -> Option<&LabSpec> {
-        self.spec.as_ref()
-    }
-
-    #[must_use]
-    pub fn storage(&self) -> Option<&dylos_store::Lab> {
-        self.storage.as_ref()
-    }
-
-    #[must_use]
-    pub fn network(&self) -> Option<&LabNetwork> {
-        self.network.as_ref()
-    }
-
-    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
-        self.network.as_mut()
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub fn set_network(&mut self, net: LabNetwork) {
-        self.network = Some(net);
-    }
-
-    /// Runs the consistent snapshot sequence per ADR-0001:
-    /// fabric freeze -> pause all VMs -> snapshot & clone disks -> write manifest -> resume all VMs -> thaw fabric.
+    /// Runs the consistent snapshot sequence of ADR-0001 on every VM of the lab.
     ///
     /// # Errors
     /// Returns [`LabError`] on failure at any step or rollback.
-    pub async fn snapshot(
-        &mut self,
-        snapshot_id: &str,
-    ) -> Result<dylos_core::manifest::SnapshotManifest> {
-        crate::snapshot::snapshot_lab(self, snapshot_id).await
+    pub async fn snapshot(&mut self, snapshot_id: &str) -> Result<SnapshotManifest> {
+        self.snapshot_with_timings(snapshot_id)
+            .await
+            .map(|(manifest, _)| manifest)
     }
 
-    /// Runs the consistent snapshot sequence and returns the manifest together with step durations.
+    /// As [`Lab::snapshot`], also returning step durations.
     ///
     /// # Errors
     /// Returns [`LabError`] on failure at any step or rollback.
     pub async fn snapshot_with_timings(
         &mut self,
         snapshot_id: &str,
-    ) -> Result<(
-        dylos_core::manifest::SnapshotManifest,
-        crate::snapshot::SnapshotTimings,
-    )> {
-        crate::snapshot::snapshot_lab_with_timings(self, snapshot_id).await
+    ) -> Result<(SnapshotManifest, SnapshotTimings)> {
+        let request = SnapshotRequest {
+            lab_id: &self.id,
+            snapshot_id,
+            spec: &self.spec,
+            store: &self.store,
+            storage: self.storage.as_ref(),
+            vms: &self.vms,
+            network: self.network.as_ref(),
+        };
+        crate::snapshot_vms(request, &self.snapshots).await
     }
 
-    #[cfg(feature = "test-hooks")]
-    pub fn set_cleanup_on_drop(&mut self, cleanup: bool) {
-        self.cleanup_on_drop = cleanup;
-    }
-
-    /// Checks if a snapshot task is currently running on this lab.
     #[must_use]
     pub fn has_active_snapshot(&self) -> bool {
-        match self.active_snapshot.try_lock() {
-            Ok(mut guard) => {
-                if let Some(handle) = guard.as_ref() {
-                    if handle.is_finished() {
-                        *guard = None;
-                        false
-                    } else {
-                        true
-                    }
-                } else {
-                    false
-                }
-            }
-            Err(_) => true,
-        }
+        self.snapshots.is_active()
     }
 
-    /// Returns a reference to the active snapshot tracker.
-    #[must_use]
-    pub fn active_snapshot_tracker(
-        &self,
-    ) -> Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> {
-        Arc::clone(&self.active_snapshot)
-    }
-
-    /// Waits for any in-flight snapshot task to complete and cleans the tracker.
-    pub async fn wait_for_active_snapshot(&mut self) {
-        let mut lock = self.active_snapshot.lock().await;
-        if let Some(handle) = lock.as_mut() {
-            let _ = handle.await;
-            *lock = None;
-        }
+    /// Waits until the in-flight snapshot task, if any, has finished its recovery.
+    pub async fn wait_for_active_snapshot(&self) {
+        self.snapshots.wait().await;
     }
 
     /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
@@ -447,22 +339,7 @@ impl Lab {
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.map_err(|e| io(&self.id, e))?;
                         let credentials = stream.peer_cred().map_err(|e| io(&self.id, e))?;
-                        let expected_uid = {
-                            #[cfg(feature = "test-hooks")]
-                            {
-                                let overridden = EXPECTED_UID_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
-                                if overridden == u32::MAX {
-                                    nix::unistd::geteuid().as_raw()
-                                } else {
-                                    overridden
-                                }
-                            }
-                            #[cfg(not(feature = "test-hooks"))]
-                            {
-                                nix::unistd::geteuid().as_raw()
-                            }
-                        };
-                        if credentials.uid() != expected_uid { continue; }
+                        if credentials.uid() != nix::unistd::geteuid().as_raw() { continue; }
                         let mut buf = Vec::new();
                         let mut byte = [0u8; 1];
                         let read_res = tokio::time::timeout(Duration::from_secs(2), async {
@@ -960,8 +837,8 @@ impl Drop for Lab {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let mut owned = Self {
                 id: self.id.clone(),
-                store: self.store.take(),
-                spec: self.spec.take(),
+                store: self.store.clone(),
+                spec: self.spec.clone(),
                 storage: self.storage.take(),
                 network: self.network.take(),
                 vms: std::mem::take(&mut self.vms),
@@ -969,7 +846,7 @@ impl Drop for Lab {
                 lock: self.lock.take(),
                 span: self.span.clone(),
                 cleanup_on_drop: false,
-                active_snapshot: Arc::clone(&self.active_snapshot),
+                snapshots: self.snapshots.clone(),
             };
             runtime.spawn(async move {
                 if let Err(error) = owned.teardown().await {

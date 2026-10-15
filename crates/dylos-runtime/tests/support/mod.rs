@@ -48,6 +48,8 @@ pub enum Mode {
     LabConfigureFailure,
     LabNetworkFailure,
     LabCrashOnFlush,
+    /// `LabReady` without its configuration barriers, with the `ParallelPause` and snapshot fakes.
+    LabSnapshot,
 }
 
 pub struct Sandbox {
@@ -193,7 +195,7 @@ async fn parallel_pause_reply(
     request: &str,
     stream: &mut UnixStream,
 ) -> bool {
-    if mode == "ParallelPause" && request.starts_with("PATCH /vm ") {
+    if matches!(mode, "ParallelPause" | "LabSnapshot") && request.starts_with("PATCH /vm ") {
         let root = sock.parent().unwrap().parent().unwrap();
         let action = if request.contains("Paused") {
             "paused"
@@ -397,7 +399,10 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             continue;
         }
         if request.contains("InstanceStart") {
-            if mode == "LabReady" || mode == "LabPartialLaunch" || mode == "LabCrashOnFlush" {
+            if matches!(
+                mode,
+                "LabReady" | "LabPartialLaunch" | "LabCrashOnFlush" | "LabSnapshot"
+            ) {
                 println!("dylos: ready");
             }
             if mode == "LabNetworkFailure" {
