@@ -19,7 +19,7 @@ use dylos_runtime::{
     Lab, LabConfig, LabError, SnapshotRequest, SnapshotSlot, Timeouts, Vm, VmSpec, snapshot_vms,
 };
 use dylos_store::{SnapshotOpener, Store};
-use support::{Mode, Sandbox, wait_until};
+use support::{Mode, Sandbox, StaleSummaryCounters, verify_e2fsck_readonly_output, wait_until};
 
 const SANDBOX_ENV: &str = "DYLOS_SNAPSHOT_SANDBOX";
 
@@ -1305,193 +1305,149 @@ async fn tap_boundary_assertion_fails_closed_when_tap_is_missing() {
     sandbox.assert_no_jail_left();
 }
 
+fn e2fsck_rejects(output: &str, expected: &str) {
+    let error = verify_e2fsck_readonly_output(output, Some(0)).unwrap_err();
+    assert!(
+        error.contains(expected),
+        "expected {expected:?} in: {error}"
+    );
+}
+
 #[test]
 fn e2fsck_parser_accepts_clean_filesystem() {
-    let clean_output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 1: Checking inodes, blocks, and sizes
-Pass 2: Checking directory structure
-Pass 3: Checking directory connectivity
-Pass 4: Checking reference counts
-Pass 5: Checking group summary information
-/dev/sda1: 885/32768 files (1.7% non-contiguous), 28698/131072 blocks
-";
-    assert!(support::verify_e2fsck_readonly_output(clean_output, Some(0)).is_ok());
+    let stale = verify_e2fsck_readonly_output(include_str!("fixtures/e2fsck/clean.txt"), Some(0));
+    assert_eq!(stale.unwrap(), StaleSummaryCounters::default());
 }
 
 #[test]
 fn e2fsck_parser_accepts_superblock_free_blocks_summary_counter() {
-    // Exact output observed from crash-consistent snapshot in CI run 38641307440:
-    let output = "\
-Pass 1: Checking inodes, blocks, and sizes
-Pass 2: Checking directory structure
-Pass 3: Checking directory connectivity
-Pass 4: Checking reference counts
-Pass 5: Checking group summary information
-Free blocks count wrong (102374, counted=101746).
-Fix? no
-
-/home/runner/work/dylos/dylos/target/tmp/.tmpX3Gu6X/labs/snapshots/writer-e2e/snap-writer/vms/writer/rootfs.ext4: 885/32768 files (1.7% non-contiguous), 28698/131072 blocks
-
-e2fsck 1.47.0 (5-Feb-2023)
-";
-    assert!(support::verify_e2fsck_readonly_output(output, Some(0)).is_ok());
+    let output = include_str!("fixtures/e2fsck/free_blocks_stale_ci.txt");
+    let stale = verify_e2fsck_readonly_output(output, Some(0)).unwrap();
+    assert!(stale.free_blocks && !stale.free_inodes);
 }
 
 #[test]
 fn e2fsck_parser_accepts_superblock_free_inodes_summary_counter() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 1: Checking inodes, blocks, and sizes
-Pass 2: Checking directory structure
-Pass 3: Checking directory connectivity
-Pass 4: Checking reference counts
-Pass 5: Checking group summary information
-Free inodes count wrong (26154, counted=26150).
-Fix? no
-/path/to/disk: clean, 100/32768 files, 2000/131072 blocks
-";
-    assert!(support::verify_e2fsck_readonly_output(output, Some(0)).is_ok());
+    let output = include_str!("fixtures/e2fsck/free_inodes_stale.txt");
+    let stale = verify_e2fsck_readonly_output(output, Some(0)).unwrap();
+    assert!(!stale.free_blocks && stale.free_inodes);
 }
 
 #[test]
 fn e2fsck_parser_accepts_both_superblock_summary_counters() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 1: Checking inodes, blocks, and sizes
-Pass 2: Checking directory structure
-Pass 3: Checking directory connectivity
-Pass 4: Checking reference counts
-Pass 5: Checking group summary information
-Free blocks count wrong (102374, counted=101746).
-Fix? no
-Free inodes count wrong (26154, counted=26150).
-Fix? no
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    assert!(support::verify_e2fsck_readonly_output(output, Some(0)).is_ok());
+    let output = include_str!("fixtures/e2fsck/both_stale.txt");
+    let stale = verify_e2fsck_readonly_output(output, Some(0)).unwrap();
+    assert!(stale.free_blocks && stale.free_inodes);
 }
 
 #[test]
 fn e2fsck_parser_rejects_group_descriptor_free_blocks_difference() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 1: Checking inodes, blocks, and sizes
-Pass 2: Checking directory structure
-Pass 3: Checking directory connectivity
-Pass 4: Checking reference counts
-Pass 5: Checking group summary information
-Free blocks count wrong for group #0 (102374, counted=101746).
-Fix? no
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert!(
-        err.contains("Free blocks count wrong for group #0"),
-        "error must quote rejected group-level mismatch: {err}"
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/group_free_blocks.txt"),
+        "Free blocks count wrong for group #0",
     );
 }
 
 #[test]
 fn e2fsck_parser_rejects_group_descriptor_free_inodes_difference() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 5: Checking group summary information
-Free inodes count wrong for group #0 (26154, counted=26150).
-Fix? no
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    assert!(
-        res.unwrap_err()
-            .contains("Free inodes count wrong for group #0")
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/group_free_inodes.txt"),
+        "Free inodes count wrong for group #0",
     );
 }
 
 #[test]
 fn e2fsck_parser_rejects_group_descriptor_directories_count_difference() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 5: Checking group summary information
-Directories count wrong for group #0 (12, counted=34).
-Fix? no
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    assert!(
-        res.unwrap_err()
-            .contains("Directories count wrong for group #0")
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/group_directories.txt"),
+        "Directories count wrong for group #0",
     );
 }
 
 #[test]
 fn e2fsck_parser_rejects_bitmap_differences() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 5: Checking group summary information
-Block bitmap differences: -(100--200)
-Fix? no
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    assert!(res.unwrap_err().contains("Block bitmap differences"));
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/bitmap_differences.txt"),
+        "Block bitmap differences",
+    );
 }
 
 #[test]
 fn e2fsck_parser_rejects_structural_corruption() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 1: Checking inodes, blocks, and sizes
-Inode 12 has illegal block(s).
-Fix? no
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    assert!(res.unwrap_err().contains("Inode 12 has illegal block(s)."));
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/structural.txt"),
+        "Inode 12 has illegal block(s).",
+    );
 }
 
 #[test]
 fn e2fsck_parser_rejects_nonzero_exit() {
-    let output = "e2fsck 1.47.0 (5-Feb-2023)\n";
-    let res = support::verify_e2fsck_readonly_output(output, Some(4));
-    assert!(res.is_err());
-    assert!(res.unwrap_err().contains("non-zero status: Some(4)"));
+    let output = include_str!("fixtures/e2fsck/clean.txt");
+    let error = verify_e2fsck_readonly_output(output, Some(4)).unwrap_err();
+    assert!(error.contains("non-zero status: Some(4)"), "{error}");
 }
 
 #[test]
 fn e2fsck_parser_rejects_signal_termination() {
-    let output = "e2fsck 1.47.0 (5-Feb-2023)\n";
-    let res = support::verify_e2fsck_readonly_output(output, None);
-    assert!(res.is_err());
-    assert!(res.unwrap_err().contains("non-zero status: None"));
+    let output = include_str!("fixtures/e2fsck/clean.txt");
+    let error = verify_e2fsck_readonly_output(output, None).unwrap_err();
+    assert!(error.contains("non-zero status: None"), "{error}");
 }
 
 #[test]
 fn e2fsck_parser_rejects_spurious_fix_prompts() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Fix? no
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    assert!(res.unwrap_err().contains("Fix? no"));
+    e2fsck_rejects(include_str!("fixtures/e2fsck/spurious_fix.txt"), "Fix? no");
 }
 
 #[test]
 fn e2fsck_parser_rejects_unfixed_allowlisted_mismatch() {
-    let output = "\
-e2fsck 1.47.0 (5-Feb-2023)
-Pass 5: Checking group summary information
-Free blocks count wrong (102374, counted=101746).
-/dev/rootfs: 885/32768 files, 28698/131072 blocks
-";
-    let res = support::verify_e2fsck_readonly_output(output, Some(0));
-    assert!(res.is_err());
-    assert!(res.unwrap_err().contains("expected 'Fix? no'"));
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/unfixed_mismatch.txt"),
+        "expected 'Fix? no'",
+    );
+}
+
+#[test]
+fn e2fsck_parser_rejects_empty_output() {
+    e2fsck_rejects("", "missing \"Pass 1");
+}
+
+#[test]
+fn e2fsck_parser_rejects_missing_pass() {
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/missing_pass.txt"),
+        "Pass 5: Checking group summary information",
+    );
+}
+
+#[test]
+fn e2fsck_parser_rejects_missing_summary() {
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/missing_summary.txt"),
+        "missing final summary",
+    );
+}
+
+#[test]
+fn e2fsck_parser_rejects_text_after_a_pass_line() {
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/pass_with_trailer.txt"),
+        "(with unexpected trailer)",
+    );
+}
+
+#[test]
+fn e2fsck_parser_rejects_non_forced_summary() {
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/clean_form_summary.txt"),
+        "/dev/rootfs: clean,",
+    );
+}
+
+#[test]
+fn e2fsck_parser_rejects_mismatch_after_summary() {
+    e2fsck_rejects(
+        include_str!("fixtures/e2fsck/mismatch_after_summary.txt"),
+        "outside pass 5",
+    );
 }
