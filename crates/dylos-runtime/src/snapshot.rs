@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use dylos_core::LabSpec;
 use dylos_core::manifest::{SnapshotManifest, StepDurations, VmManifest};
@@ -23,6 +23,8 @@ use crate::{Lab, LabError, pause_all, resume_all};
 pub struct SnapshotTimings {
     pub freeze_ms: u64,
     pub pause_ms: u64,
+    pub pause_skew_ms: u64,
+    pub pause_skew_us: u64,
     pub api_snapshot_ms: u64,
     pub storage_ms: u64,
     pub fsync_ms: u64,
@@ -482,16 +484,21 @@ async fn run_snapshot_steps(
     state.paused.store(true, Ordering::SeqCst);
 
     let pause_results = join_all(job.vms.iter().map(|vm| async {
-        let started = Instant::now();
         let res = vm.client.pause().await;
-        (vm.node.clone(), res, started)
+        (vm.node.clone(), res, Instant::now())
     }))
     .await;
 
+    let mut first_pause = None;
+    let mut last_pause = None;
     let mut first_pause_err = None;
-    for (node, res, _) in pause_results {
-        if let Err(err) = res
-            && first_pause_err.is_none()
+    for (node, res, finished_at) in pause_results {
+        if res.is_ok() {
+            first_pause =
+                Some(first_pause.map_or(finished_at, |old: Instant| old.min(finished_at)));
+            last_pause = Some(last_pause.map_or(finished_at, |old: Instant| old.max(finished_at)));
+        } else if first_pause_err.is_none()
+            && let Err(err) = res
         {
             first_pause_err = Some(LabError::Api {
                 lab: job.lab_id.clone(),
@@ -505,6 +512,13 @@ async fn run_snapshot_steps(
         return Err(pause_err);
     }
     let pause_ms = u64::try_from(started_pause.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let pause_skew = first_pause
+        .zip(last_pause)
+        .map_or(Duration::ZERO, |(first, last)| {
+            last.saturating_duration_since(first)
+        });
+    let skew_ms = u64::try_from(pause_skew.as_millis()).unwrap_or(u64::MAX);
+    let skew_micros = u64::try_from(pause_skew.as_micros()).unwrap_or(u64::MAX);
 
     // Step 3: Create snapshot directory layout in spawn_blocking
     let store = job.store.clone();
@@ -819,6 +833,8 @@ async fn run_snapshot_steps(
     let timings = SnapshotTimings {
         freeze_ms,
         pause_ms,
+        pause_skew_ms: skew_ms,
+        pause_skew_us: skew_micros,
         api_snapshot_ms,
         storage_ms,
         fsync_ms: max_fsync_ms,
@@ -835,6 +851,8 @@ async fn run_snapshot_steps(
         snapshot = %job.snapshot_id,
         freeze_ms,
         pause_ms,
+        pause_skew_ms = skew_ms,
+        pause_skew_us = skew_micros,
         snapshot_ms,
         api_snapshot_ms,
         storage_ms,

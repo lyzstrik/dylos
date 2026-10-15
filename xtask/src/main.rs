@@ -24,9 +24,24 @@ fn main() {
     }
 }
 
+mod bench;
+
 fn run() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
     match args.next().as_deref() {
+        Some("bench") => {
+            let options = bench::parse_bench_args(args)?;
+            if options.print_help {
+                bench::print_usage();
+                return Ok(());
+            }
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("could not create tokio runtime")?;
+            rt.block_on(bench::run_benchmarks(options))?;
+            Ok(())
+        }
         Some("e2e") => {
             if args.next().is_some() {
                 bail!("e2e does not accept arguments");
