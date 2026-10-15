@@ -406,7 +406,11 @@ fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) 
         fs::create_dir(&root).unwrap();
         let meta = |name: &str| {
             let bytes = format!("{} {name}", node.name);
-            fs::write(root.join(name), &bytes).unwrap();
+            let file_path = root.join(name);
+            fs::write(&file_path, &bytes).unwrap();
+            if name == "vm.mem" {
+                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+            }
             FileMeta {
                 path: PathBuf::from(format!("vms/{}/{name}", node.name)),
                 size: bytes.len() as u64,
@@ -491,6 +495,7 @@ fn restore_verifies_before_creation_and_reflinks_independent_files() {
     lab.remove().unwrap();
     lab.remove().unwrap();
     assert!(!store.base.join("clone").exists());
+    assert!(store.restore("source", &path).is_err());
     let tampered_path = path.join("vms/a/vm.mem");
     let mut perms = fs::metadata(&tampered_path).unwrap().permissions();
     perms.set_mode(0o644);
@@ -519,4 +524,41 @@ fn restore_rejects_missing_vm_and_symlink_files_without_creating_lab() {
     symlink("/etc/passwd", path.join("vms/a/vm.mem")).unwrap();
     assert!(store.restore("clone", &path).is_err());
     assert!(!store.base.join("clone").exists());
+}
+
+#[test]
+fn restore_fails_closed_on_writable_shared_memory_backing() {
+    let (_temp, store, spec) = setup();
+    let (path, _manifest) = restore_fixture(&store, spec);
+    // Intact bytes, so only the permission check can reject it.
+    let mem = path.join("vms/a/vm.mem");
+    fs::set_permissions(&mem, fs::Permissions::from_mode(0o644)).unwrap();
+    let err = store.restore("clone", &path).unwrap_err();
+    assert!(
+        matches!(&err, dylos_store::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    assert!(!store.base.join("clone").exists());
+}
+
+#[test]
+fn shared_backing_must_be_orchestrator_owned_and_unwritable() {
+    use dylos_store::ensure_trusted_read_only;
+    // Root orchestrator, jailer uid 65534.
+    assert!(ensure_trusted_read_only(0, 0o100_444, 0).is_ok());
+    assert!(ensure_trusted_read_only(0, 0o100_400, 0).is_ok());
+    for (owner, mode) in [
+        (65534, 0o100_444), // jailer-owned: its owner could chmod it writable again
+        (1000, 0o100_444),
+        (0, 0o100_644),
+        (0, 0o100_464),
+        (0, 0o100_446),
+    ] {
+        let err = ensure_trusted_read_only(owner, mode, 0).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{owner} {mode:o}"
+        );
+    }
 }

@@ -14,7 +14,7 @@ workspace = true
 [dependencies]
 dylos-core = { path = "../dylos-core" }
 libc = { workspace = true }
-nix = { workspace = true, features = ["fs", "dir"] }
+nix = { workspace = true, features = ["fs", "dir", "user"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
