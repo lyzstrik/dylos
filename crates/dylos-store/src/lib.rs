@@ -797,7 +797,6 @@ impl Store {
                     )
                     .map_err(|e| contextual(&paths.rootfs, e))?;
                     let restored_source = snapshot
-                        .as_ref()
                         .map(|r| r.opener.open(&r.manifest.vms[&node.name].disks[0].path))
                         .transpose()
                         .map_err(|e| contextual(&paths.rootfs, e))?;
@@ -812,7 +811,7 @@ impl Store {
                         opener,
                         manifest,
                         backings,
-                    }) = &snapshot
+                    }) = snapshot
                     {
                         let saved = &manifest.vms[&node.name];
                         // 1. Reflink vm.state so each clone gets its own independent state file
