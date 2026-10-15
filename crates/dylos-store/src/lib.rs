@@ -187,13 +187,62 @@ pub struct DiskCloneTimings {
     pub hash_ms: u64,
 }
 
-/// Test hooks for `save_vm_file_with_hooks`.
-#[doc(hidden)]
-#[derive(Default)]
-pub struct SaveVmHooks {
-    pub after_open: Option<Box<dyn FnOnce()>>,
-    pub before_cleanup: Option<Box<dyn FnOnce()>>,
-    pub force_copy: bool,
+/// A VM state or memory file, opened once without following symlinks. Saving it reads and
+/// moves this descriptor only: a later replacement of the path is neither read nor unlinked.
+#[derive(Debug)]
+pub struct VmFileSource {
+    path: PathBuf,
+    dir: File,
+    name: std::ffi::OsString,
+    file: File,
+    meta: std::fs::Metadata,
+    max_bytes: u64,
+}
+
+impl VmFileSource {
+    /// # Errors
+    /// Rejects symlinks in any component, non-regular files and files over `max_bytes`.
+    pub fn open(path: &Path, max_bytes: u64) -> Result<Self, Error> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let dir = directory(parent, false).map_err(|e| contextual(path, e))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| contextual(path, io::ErrorKind::InvalidInput.into()))?
+            .to_owned();
+        // O_NONBLOCK: opening a FIFO must fail the regular-file check, not hang.
+        let file = open(&dir, &name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
+            .map_err(|e| contextual(path, e))?;
+        let meta = file.metadata().map_err(|e| contextual(path, e))?;
+        if !meta.is_file() {
+            return Err(contextual(
+                path,
+                io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file"),
+            ));
+        }
+        if meta.len() > max_bytes {
+            return Err(contextual(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source file size {} exceeds maximum allowed bound of {max_bytes} bytes",
+                        meta.len()
+                    ),
+                ),
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            dir,
+            name,
+            file,
+            meta,
+            max_bytes,
+        })
+    }
 }
 
 impl Snapshot {
@@ -344,13 +393,7 @@ impl Snapshot {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<(FileMeta, u64), Error> {
-        self.save_vm_file_impl(
-            source_path,
-            node,
-            file_name,
-            max_bytes,
-            SaveVmHooks::default(),
-        )
+        self.save_vm_source(VmFileSource::open(source_path, max_bytes)?, node, file_name)
     }
 
     /// Moves or reflinks a VM state or memory file into the snapshot directory.
@@ -364,114 +407,35 @@ impl Snapshot {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(
-            source_path,
-            node,
-            file_name,
-            max_bytes,
-            SaveVmHooks::default(),
-        )
-        .map(|(meta, _)| meta)
-    }
-
-    /// Moves or reflinks a VM file with an optional test hook called immediately after opening source.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn save_vm_file_with_hook(
-        &self,
-        source_path: &Path,
-        node: &str,
-        file_name: &str,
-        max_bytes: u64,
-        after_open: impl FnOnce() + 'static,
-    ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(
-            source_path,
-            node,
-            file_name,
-            max_bytes,
-            SaveVmHooks {
-                after_open: Some(Box::new(after_open)),
-                ..Default::default()
-            },
-        )
-        .map(|(meta, _)| meta)
-    }
-
-    /// Moves or reflinks a VM file with test hooks for error injection and copy fallback.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn save_vm_file_with_hooks(
-        &self,
-        source_path: &Path,
-        node: &str,
-        file_name: &str,
-        max_bytes: u64,
-        hooks: SaveVmHooks,
-    ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(source_path, node, file_name, max_bytes, hooks)
+        self.save_vm_file_with_timings(source_path, node, file_name, max_bytes)
             .map(|(meta, _)| meta)
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn save_vm_file_impl(
+    /// Moves an opened VM file into the snapshot directory: reflink, or a bounded copy when the
+    /// filesystem has no reflink, then the source is unlinked only after the bounded hash
+    /// succeeded and only if its path still names the opened inode.
+    ///
+    /// # Errors
+    /// Fails closed on a cross-device destination and on growth past the source bound; the
+    /// partial destination is removed and the source kept.
+    pub fn save_vm_source(
         &self,
-        source_path: &Path,
+        source: VmFileSource,
         node: &str,
         file_name: &str,
-        max_bytes: u64,
-        mut hooks: SaveVmHooks,
     ) -> Result<(FileMeta, u64), Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
+        let VmFileSource {
+            path: source_path,
+            dir: source_dir,
+            name: source_name,
+            file: source_file,
+            meta: source_meta,
+            max_bytes,
+        } = source;
+        let source_path = source_path.as_path();
 
-        // 1. Pin every ancestor of source_path
-        let source_parent = source_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let source_dir = directory(source_parent, false).map_err(|e| contextual(source_path, e))?;
-        let source_name = source_path
-            .file_name()
-            .ok_or_else(|| contextual(source_path, io::ErrorKind::InvalidInput.into()))?;
-
-        // 2. Open source no-follow and nonblocking
-        let source_file = open(
-            &source_dir,
-            source_name,
-            OFlag::O_RDONLY | OFlag::O_NONBLOCK,
-        )
-        .map_err(|e| contextual(source_path, e))?;
-
-        // 3. Verify it is a regular file via descriptor and within bounded size
-        let source_meta = source_file
-            .metadata()
-            .map_err(|e| contextual(source_path, e))?;
-        if !source_meta.is_file() {
-            return Err(contextual(
-                source_path,
-                io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file"),
-            ));
-        }
-        if source_meta.len() > max_bytes {
-            return Err(contextual(
-                source_path,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "source file size {} exceeds maximum allowed bound of {} bytes",
-                        source_meta.len(),
-                        max_bytes
-                    ),
-                ),
-            ));
-        }
-
-        if let Some(hook) = hooks.after_open.take() {
-            hook();
-        }
-
-        // 4. Open/create destination vm directory
         let vms = open(&self.directory, "vms".as_ref(), dirs())
             .map_err(|e| contextual(&self.root.join("vms"), e))?;
         let vm_dir = match open(&vms, node.as_ref(), dirs()) {
@@ -481,7 +445,6 @@ impl Snapshot {
             Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
         };
 
-        // 5. Exclusively create destination file
         let dest_path = self.root.join("vms").join(node).join(file_name);
         let mut dest_file = open(
             &vm_dir,
@@ -489,46 +452,21 @@ impl Snapshot {
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
         )
         .map_err(|e| contextual(&dest_path, e))?;
-
         let dest_meta = dest_file
             .metadata()
             .map_err(|e| contextual(&dest_path, e))?;
+        let fail = |err: io::Error| with_cleanup(err, cleanup_dest(&vm_dir, file_name, &dest_path));
 
-        // 6. Check for cross-device: fail closed on EXDEV, NEVER copy!
+        // A cross-device source is never copied: snapshot files must stay on the lab filesystem.
         if source_meta.dev() != dest_meta.dev() {
-            let cleanup_err = {
-                if let Some(hook) = hooks.before_cleanup.take() {
-                    hook();
-                }
-                cleanup_dest(&vm_dir, file_name, &dest_path)
-            };
-            let mut err = io::Error::from_raw_os_error(libc::EXDEV);
-            if let Err(c_err) = cleanup_err {
-                err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
-            }
-            return Err(contextual(source_path, err));
+            return Err(contextual(
+                source_path,
+                fail(io::Error::from_raw_os_error(libc::EXDEV)),
+            ));
         }
 
-        // 7. Reflink source into dest_file; if reflink is unsupported on the same device,
-        // copy from the already verified descriptor into the new exclusively created destination.
-        let skip_reflink = hooks.force_copy;
-
-        let reflink_res = if skip_reflink {
-            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
-        } else {
-            reflink(&source_file, &dest_file)
-        };
-
-        let verified_dest_file = match reflink_res {
-            Ok(()) => {
-                safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
-                    Error::Io {
-                        path: source_path.into(),
-                        source: e,
-                    }
-                })?;
-                dest_file
-            }
+        match reflink(&source_file, &dest_file) {
+            Ok(()) => {}
             Err(err)
                 if matches!(
                     err.raw_os_error(),
@@ -536,51 +474,30 @@ impl Snapshot {
                 ) =>
             {
                 if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
-                    let cleanup_err = {
-                        if let Some(hook) = hooks.before_cleanup.take() {
-                            hook();
-                        }
-                        cleanup_dest(&vm_dir, file_name, &dest_path)
-                    };
-                    let mut err = copy_err;
-                    if let Err(c_err) = cleanup_err {
-                        err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
-                    }
-                    return Err(contextual(&dest_path, err));
+                    return Err(contextual(&dest_path, fail(copy_err)));
                 }
-                safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
-                    Error::Io {
-                        path: source_path.into(),
-                        source: e,
-                    }
-                })?;
-                dest_file
             }
             Err(err) => {
-                let cleanup_err = {
-                    if let Some(hook) = hooks.before_cleanup.take() {
-                        hook();
-                    }
-                    cleanup_dest(&vm_dir, file_name, &dest_path)
-                };
-                if let Err(c_err) = cleanup_err {
-                    return Err(contextual(
-                        &dest_path,
-                        io::Error::other(format!("reflink failed ({err}); additionally {c_err}")),
-                    ));
+                if let Err(cleanup_err) = cleanup_dest(&vm_dir, file_name, &dest_path) {
+                    return Err(contextual(&dest_path, with_cleanup(err, Err(cleanup_err))));
                 }
                 return Err(Error::Reflink {
                     path: dest_path.clone(),
                     source: err,
                 });
             }
-        };
+        }
 
-        // 8. Compute sha256 and size from the verified destination descriptor with bounded read
+        // A reflink clones the current length, so the bound is enforced here as well.
         let t_hash = Instant::now();
-        let (sha256, size) = compute_file_sha256_and_size(&verified_dest_file, max_bytes)
-            .map_err(|e| contextual(&dest_path, e))?;
+        let (sha256, size) = compute_file_sha256_and_size(&dest_file, max_bytes)
+            .map_err(|e| contextual(&dest_path, fail(e)))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
+
+        safe_unlink_source(&source_dir, &source_name, &source_meta).map_err(|e| Error::Io {
+            path: source_path.into(),
+            source: e,
+        })?;
 
         Ok((
             FileMeta {
@@ -924,6 +841,14 @@ fn safe_unlink_source(
     }
 }
 
+/// Keeps the operation error primary and appends the cleanup failure, if any.
+fn with_cleanup(err: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => err,
+        Err(c_err) => io::Error::new(err.kind(), format!("{err}; additionally {c_err}")),
+    }
+}
+
 fn cleanup_dest(vm_dir: &File, file_name: &str, dest_path: &Path) -> Result<(), io::Error> {
     match unlinkat(vm_dir, file_name, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
@@ -1157,4 +1082,27 @@ fn regular_snapshot_file(file: File) -> io::Result<File> {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     Ok(file)
+}
+
+// No public path can make the destination cleanup fail after the destination was created.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_failure_is_appended_to_the_operation_error() {
+        let operation = io::Error::from_raw_os_error(libc::EXDEV);
+        let cleanup = Err(io::Error::from_raw_os_error(libc::EACCES));
+        let combined = with_cleanup(operation, cleanup);
+        assert_eq!(combined.kind(), io::ErrorKind::CrossesDevices);
+        let message = combined.to_string();
+        assert!(message.contains("cross-device"), "{message}");
+        assert!(
+            message.contains("; additionally Permission denied"),
+            "{message}"
+        );
+
+        let alone = with_cleanup(io::Error::from_raw_os_error(libc::EXDEV), Ok(()));
+        assert!(!alone.to_string().contains("additionally"));
+    }
 }
