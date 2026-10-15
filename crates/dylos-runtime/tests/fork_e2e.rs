@@ -25,6 +25,8 @@ const C_V4: &str = "10.0.2.2";
 // A host address in a clone's netns, on the left segment: a destination A has never seen.
 const HOST_V6: &str = "fd64:796c:6f73:1::fe";
 const HOST_V4: &str = "10.0.1.254";
+// DELAY (5 s) plus three PROBE retransmissions (1 s each), with margin for a loaded runner.
+const SETTLE: Duration = Duration::from_secs(20);
 
 fn netns(config: &LabConfig, lab: &Lab) -> PathBuf {
     config.netns_dir.join(format!("dylos-{}", lab.id()))
@@ -85,6 +87,38 @@ async fn capture(config: &LabConfig, lab: &Lab, label: &str) -> String {
         .unwrap();
     }
     out
+}
+
+/// Waits until no guest neighbor entry is in DELAY, PROBE or INCOMPLETE.
+///
+/// A snapshot captures the guests' neighbor state machines mid-flight: B only forwards between A
+/// and C, which never confirms its IPv4 or IPv6 entries, so they are restored in DELAY with a
+/// pending probe. The only first echo lost in CI coincided with those restored transitions
+/// completing (see the PR); once they have completed, single probes must succeed.
+async fn neighbors_settled(config: &LabConfig, lab: &Lab, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let command = "ip neigh show nud delay; ip neigh show nud probe; ip neigh show nud incomplete";
+    loop {
+        let mut pending = String::new();
+        for node in ["A", "B", "C"] {
+            // An exec failure is not a pending transition: fail at once.
+            let out = guest(lab, node, command).await;
+            if !out.trim().is_empty() {
+                writeln!(pending, "{node}: {}", out.trim()).unwrap();
+            }
+        }
+        if pending.is_empty() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            let state = capture(config, lab, "neighbors not settled").await;
+            panic!(
+                "{}: neighbor transitions pending after {timeout:?}:\n{pending}{state}",
+                lab.id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// One echo from `from`, which must be answered: no retry.
@@ -165,77 +199,6 @@ fn assert_echoes_only_in(
             }
         }
     }
-}
-
-/// Firecracker net device counters since the previous flush, per VM and interface.
-async fn fc_net(lab: &Lab) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
-    for vm in lab.vms() {
-        let client = dylos_fc::FcClient::new(vm.paths().api_socket());
-        client
-            .put::<_, serde_json::Value>(
-                "/actions",
-                &dylos_fc::config::InstanceActionInfo::new(
-                    dylos_fc::config::ActionType::FlushMetrics,
-                ),
-            )
-            .await
-            .unwrap();
-        let text = std::fs::read_to_string(vm.paths().root.join("run/metrics.json")).unwrap();
-        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-        for (device, fields) in last.as_object().unwrap() {
-            if !device.starts_with("net_") {
-                continue;
-            }
-            for (field, value) in fields.as_object().unwrap() {
-                if let Some(n) = value.as_u64().filter(|n| *n > 0) {
-                    out.insert(format!("{}.{device}.{field}", vm.node()), n);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Guest IP and ICMP SNMP counters of every node.
-async fn snmp(lab: &Lab) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
-    for node in ["A", "B", "C"] {
-        let text = guest(lab, node, "cat /proc/net/snmp").await;
-        let lines: Vec<_> = text.lines().collect();
-        for pair in lines.windows(2) {
-            let (names, values) = (pair[0], pair[1]);
-            for prefix in ["Ip:", "Icmp:"] {
-                let header = names
-                    .split_whitespace()
-                    .nth(1)
-                    .is_some_and(|n| n.parse::<u64>().is_err());
-                if header && names.starts_with(prefix) && values.starts_with(prefix) {
-                    for (n, v) in names
-                        .split_whitespace()
-                        .zip(values.split_whitespace())
-                        .skip(1)
-                    {
-                        if let Ok(v) = v.parse::<u64>() {
-                            out.insert(format!("{node}.{prefix}{n}"), v);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-fn delta(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> String {
-    after
-        .iter()
-        .filter_map(|(k, v)| {
-            let d = v.saturating_sub(before.get(k).copied().unwrap_or(0));
-            (d > 0).then(|| format!("{k}+{d}"))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -380,39 +343,6 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
             );
         }
 
-        // First-packet investigation: one IPv4 probe per clone right after the fork.
-        let mut lost_probes = 0;
-        for clone in &clones {
-            let fc_restore = fc_net(clone).await;
-            let snmp_before = snmp(clone).await;
-            let out = clone
-                .exec(
-                    "A",
-                    "ping -4 -c 1 -W 5 10.0.2.2 2>&1",
-                    Duration::from_secs(10),
-                )
-                .await
-                .unwrap();
-            let fc_probe = fc_net(clone).await;
-            let snmp_after = snmp(clone).await;
-            eprintln!("PROBE {} exit={}", clone.id(), out.exit_code);
-            eprintln!("FC-SINCE-RESTORE {} {fc_restore:?}", clone.id());
-            eprintln!("FC-PROBE {} {fc_probe:?}", clone.id());
-            eprintln!(
-                "SNMP-PROBE {} {}",
-                clone.id(),
-                delta(&snmp_before, &snmp_after)
-            );
-            if !out.success() {
-                lost_probes += 1;
-                eprintln!("{}", capture(&config, clone, "after-lost-probe").await);
-            }
-        }
-        eprintln!(
-            "PROBE summary: {lost_probes}/{} first IPv4 probes lost",
-            clones.len()
-        );
-
         // Shared, immutable memory backing; private state.
         for node in ["A", "B", "C"] {
             let file = |c: &Lab, name: &str| {
@@ -442,6 +372,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
 
         // Every clone works on its own: one echo per family, no retry (ADR-0002: IPv6 first).
         for clone in &clones {
+            neighbors_settled(&config, clone, SETTLE).await;
             dual_stack(&config, clone, "A", C_V6, C_V4).await;
         }
 
@@ -527,6 +458,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         );
         let opener = dylos_store::SnapshotOpener::new(&snapshot).unwrap();
         manifest.verify(opener.verify_opener()).unwrap();
+        neighbors_settled(&config, &clones[1], SETTLE).await;
         dual_stack(&config, &clones[1], "A", C_V6, C_V4).await;
 
         // Independent teardown of nine clones; the survivor runs nothing until measured again.
