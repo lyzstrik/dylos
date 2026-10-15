@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use dylos_core::LabSpec;
 use dylos_runtime::jailer::JailerConfig;
-use dylos_runtime::{Lab, LabConfig, ProcessState, pause_all, resume_all};
+use dylos_runtime::{Lab, LabConfig, ProcessState};
 use futures_util::future::join_all;
 
 #[tokio::test]
@@ -190,10 +190,10 @@ async fn measure_pause_cycles(lab: &mut Lab) {
     let mut total = Duration::ZERO;
     let mut maximum = Duration::ZERO;
     for _ in 0..50 {
-        let skew = pause_all(lab).await.expect("pause cycle failed");
+        let skew = lab.pause_all().await.expect("pause cycle failed");
         total += skew;
         maximum = maximum.max(skew);
-        resume_all(lab).await.expect("resume cycle failed");
+        lab.resume_all().await.expect("resume cycle failed");
     }
     assert!(
         maximum < Duration::from_millis(100),

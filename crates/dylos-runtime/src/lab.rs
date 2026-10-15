@@ -95,24 +95,19 @@ pub struct Lab {
 }
 
 impl Lab {
-    #[must_use]
-    pub fn id(&self) -> &str {
-        &self.id
+    /// Pauses every VM concurrently and returns the confirmation skew.
+    /// Freeze the fabric first for a consistent snapshot; run this future to completion.
+    /// # Errors
+    /// Resumes every VM after a pause failure, preserving rollback errors.
+    pub async fn pause_all(&mut self) -> Result<Duration> {
+        crate::pause_all(&self.id, &self.vms).await
     }
 
-    /// Constructs a VM-only lab for unprivileged API tests.
-    #[cfg(feature = "test-hooks")]
-    pub fn from_test_vms(id: &str, vms: Vec<Vm>) -> Self {
-        Self {
-            id: id.into(),
-            storage: None,
-            network: None,
-            vms,
-            listener: None,
-            lock: None,
-            span: tracing::info_span!("lab", lab = id),
-            cleanup_on_drop: false,
-        }
+    /// Resumes every VM concurrently and waits for all responses.
+    /// # Errors
+    /// Returns the first failure and logs every failed response.
+    pub async fn resume_all(&mut self) -> Result<()> {
+        crate::resume_all(&self.id, &self.vms).await
     }
 
     /// # Errors
