@@ -202,13 +202,11 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         )
         .await;
 
+        let source_b = capture(&config, &original, "source-before-snapshot").await;
+        eprintln!("{source_b}");
         let manifest = original.snapshot("snap").await.unwrap();
         let snapshot = config.store.snapshot_dir("src", "snap");
 
-        // Tear down source lab to verify clones are independent and reduce runner load
-        original.teardown().await.unwrap();
-        assert!(!config.store.base.join("src").exists());
-        assert!(!config.netns_dir.join("dylos-src").exists());
 
         // Fork 10 simultaneous clones in parallel with deterministic clone identifiers
         let clone_count = 10;
@@ -244,22 +242,26 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
             );
         }
 
-        // Evidence capture for the first-packet investigation: one probe per family, no retry.
-        for (i, clone) in clones.iter().enumerate() {
-            let v4 = "ping -4 -c 1 -W 3 10.0.2.2 2>&1";
-            let v6 = "ping -6 -c 1 -W 3 fd64:796c:6f73:2::2 2>&1";
-            let order = if i % 2 == 0 { [v4, v6] } else { [v6, v4] };
-            let before = capture(&config, clone, "after-restore").await;
-            let first = single_probe(clone, order[0]).await;
-            let mid = capture(&config, clone, "after-first-probe").await;
-            let second = single_probe(clone, order[1]).await;
-            let after = capture(&config, clone, "after-second-probe").await;
-            eprintln!("PROBE {} first[{}]: {first}", clone.id(), order[0]);
-            eprintln!("PROBE {} second[{}]: {second}", clone.id(), order[1]);
-            if i < 2 || !first.starts_with("exit=0") || !second.starts_with("exit=0") {
-                eprintln!("{before}{mid}{after}");
+        // Evidence capture for the first-packet investigation, under the conditions of the
+        // failing run: source still running, IPv4 first, one probe, right after the fork.
+        let mut lost = 0;
+        for clone in &clones {
+            let first = single_probe(clone, "ping -4 -c 1 -W 5 10.0.2.2 2>&1").await;
+            eprintln!("PROBE {} ipv4-first: {first}", clone.id());
+            if !first.starts_with("exit=0") {
+                lost += 1;
+                eprintln!("{}", capture(&config, clone, "after-lost-probe").await);
+                let again = single_probe(clone, "ping -4 -c 1 -W 5 10.0.2.2 2>&1").await;
+                eprintln!("PROBE {} ipv4-again: {again}", clone.id());
+                eprintln!("{}", capture(&config, clone, "after-second-probe").await);
             }
         }
+        eprintln!("PROBE summary: {lost}/{} first IPv4 probes lost", clones.len());
+
+        // Tear down source lab to verify clones are independent and reduce runner load
+        original.teardown().await.unwrap();
+        assert!(!config.store.base.join("src").exists());
+        assert!(!config.netns_dir.join("dylos-src").exists());
 
         // 1. Verify memory sharing and read-only immutable backing across all clones
         for node in ["A", "B", "C"] {
