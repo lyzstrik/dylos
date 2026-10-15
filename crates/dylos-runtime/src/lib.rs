@@ -20,4 +20,4 @@ pub mod vm;
 
 pub use error::{Error, Result};
 pub use lab::{Lab, LabConfig, LabError};
-pub use vm::{ProcessState, Timeouts, Vm, VmSpec};
+pub use vm::{ExecOutput, ProcessState, Timeouts, Vm, VmSpec};
