@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 
 use dylos_core::LabSpec;
 use dylos_runtime::jailer::JailerConfig;
-use dylos_runtime::{Lab, LabConfig, ProcessState};
+use dylos_runtime::{Lab, LabConfig, ProcessState, Vm};
 use dylos_store::SnapshotOpener;
 use futures_util::future::join_all;
 
 mod support;
+
+use support::{StaleSummaryCounters, verify_e2fsck_readonly_output};
 
 fn check_prerequisites() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -226,6 +228,8 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         advanced,
         "workload failed to show increasing write activity before capture"
     );
+    let (alloc_before, alloc_at_capture) = wait_for_allocation_progress(&lab.vms()[0]).await;
+    eprintln!("Observed allocation churn cycles {alloc_before}->{alloc_at_capture} before capture");
 
     // Snapshot during continuous writes
     let manifest = lab.snapshot("snap-writer").await.expect("snapshot failed");
@@ -242,59 +246,144 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         "cloned rootfs missing: {}",
         cloned_disk.display()
     );
-
-    // Replay the ext4 journal on the cloned disk image using journal-only replay.
-    // -E journal_only replays the journal transactions without performing arbitrary filesystem repairs.
-    let journal_output = Command::new("e2fsck")
-        .args(["-y", "-E", "journal_only", cloned_disk.to_str().unwrap()])
-        .output()
-        .expect("failed to run e2fsck -y -E journal_only");
-
-    let stdout = String::from_utf8_lossy(&journal_output.stdout);
-    let stderr = String::from_utf8_lossy(&journal_output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    eprintln!(
-        "e2fsck -E journal_only on cloned disk: exit={:?}\n{combined}",
-        journal_output.status
-    );
-
+    let snapshot_stale = recover_and_verify(&cloned_disk, "cloned disk");
+    let captured_cycles = recorded_allocation_cycles(&cloned_disk);
     assert!(
-        matches!(journal_output.status.code(), Some(0..=2)),
-        "e2fsck journal_only failed: exit {:?}\n{combined}",
-        journal_output.status
+        captured_cycles >= alloc_at_capture,
+        "cloned disk records {captured_cycles} allocation cycles, but {alloc_at_capture} were durable before capture"
     );
 
-    // Verify the first pass only replayed the journal and did not perform structural checks or repairs
+    // Ordinary-crash control: the same image and workload, killed without any snapshot step,
+    // then recovered and verified exactly like the clone.
+    let (_, alloc_at_crash) = wait_for_allocation_progress(&lab.vms()[0]).await;
+    let pid = lab.vms()[0].pid().expect("VM process id");
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(pid).unwrap()),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let mut state = lab.vms()[0].state();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        state.wait_for(|s| *s != ProcessState::Running),
+    )
+    .await
+    .expect("killed VM did not exit")
+    .unwrap();
+    let crashed_disk = dir.path().join("crashed-rootfs.ext4");
+    fs::copy(lab.root().join("vms/writer/rootfs.ext4"), &crashed_disk).unwrap();
+    let crash_stale = recover_and_verify(&crashed_disk, "crashed disk");
+    let crash_cycles = recorded_allocation_cycles(&crashed_disk);
     assert!(
-        !combined.contains("Pass 1")
-            && !combined.contains("Pass 2")
-            && !combined.contains("Pass 3")
-            && !combined.contains("Pass 4")
-            && !combined.contains("Pass 5")
-            && !combined.contains("Fix?")
-            && !combined.contains("FIXED")
-            && !combined.contains("Free blocks count wrong")
-            && !combined.contains("Free inodes count wrong"),
-        "e2fsck first pass performed structural checks or repairs beyond journal replay:\n{combined}"
-    );
-
-    // Verify subsequent read-only check confirms clean filesystem or allowlisted superblock counter mismatch
-    let ro_output = Command::new("e2fsck")
-        .args(["-fn", cloned_disk.to_str().unwrap()])
-        .output()
-        .expect("failed to run e2fsck -fn");
-    let ro_combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&ro_output.stdout),
-        String::from_utf8_lossy(&ro_output.stderr)
+        crash_cycles >= alloc_at_crash,
+        "crashed disk records {crash_cycles} allocation cycles, but {alloc_at_crash} were durable before the crash"
     );
     eprintln!(
-        "e2fsck -fn on cloned disk: exit={:?}\n{ro_combined}",
-        ro_output.status
+        "Stale superblock counters: snapshot={snapshot_stale:?} ordinary crash={crash_stale:?}"
     );
-    support::verify_e2fsck_readonly_output(&ro_combined, ro_output.status.code())
-        .expect("e2fsck -fn reported unresolved filesystem diagnostics on cloned disk");
+    assert!(
+        !snapshot_stale.free_blocks || crash_stale.free_blocks,
+        "the snapshot shows a stale free-blocks counter that an ordinary crash does not"
+    );
 
     // Clean teardown
     lab.teardown().await.expect("teardown failed");
+}
+
+/// Waits until the guest reports two increasing allocation cycle counts, each printed only
+/// after the count is durable on disk; fails on any reported workload error.
+async fn wait_for_allocation_progress(vm: &Vm) -> (u64, u64) {
+    let started = Instant::now();
+    let mut first = None;
+    loop {
+        let output = vm.output();
+        if let Some(failure) = output.iter().find(|l| l.contains("dylos: churn failed")) {
+            panic!("guest workload failed: {failure}");
+        }
+        let latest = output.iter().rev().find_map(|line| {
+            line.trim()
+                .strip_prefix("dylos: alloc-cycles ")
+                .and_then(|n| n.parse::<u64>().ok())
+        });
+        match (first, latest) {
+            (None, Some(n)) => first = Some(n),
+            (Some(f), Some(n)) if n > f => return (f, n),
+            _ => {}
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "no allocation churn progress within 60s; output tail: {output:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Replays the journal only, then requires a clean read-only check apart from stale
+/// superblock summary counters.
+fn recover_and_verify(disk: &Path, what: &str) -> StaleSummaryCounters {
+    let disk = disk.to_str().unwrap();
+    // -E journal_only replays committed transactions without any other repair.
+    let journal = Command::new("e2fsck")
+        .args(["-y", "-E", "journal_only", disk])
+        .output()
+        .expect("failed to run e2fsck -y -E journal_only");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&journal.stdout),
+        String::from_utf8_lossy(&journal.stderr)
+    );
+    eprintln!(
+        "e2fsck -E journal_only on {what}: exit={:?}\n{combined}",
+        journal.status
+    );
+    assert!(
+        matches!(journal.status.code(), Some(0..=2)),
+        "e2fsck journal_only failed on {what}: exit {:?}\n{combined}",
+        journal.status
+    );
+    for marker in [
+        "Pass 1",
+        "Pass 2",
+        "Pass 3",
+        "Pass 4",
+        "Pass 5",
+        "Fix?",
+        "FIXED",
+        "count wrong",
+    ] {
+        assert!(
+            !combined.contains(marker),
+            "journal replay on {what} went beyond the journal ({marker}):\n{combined}"
+        );
+    }
+
+    let check = Command::new("e2fsck")
+        .args(["-fn", disk])
+        .output()
+        .expect("failed to run e2fsck -fn");
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    eprintln!("e2fsck -fn on {what}: exit={:?}\n{combined}", check.status);
+    verify_e2fsck_readonly_output(&combined, check.status.code())
+        .unwrap_or_else(|error| panic!("e2fsck -fn on {what}: {error}"))
+}
+
+/// Reads the guest's durable allocation cycle count from a recovered image.
+fn recorded_allocation_cycles(disk: &Path) -> u64 {
+    let output = Command::new("debugfs")
+        .args(["-R", "cat /var/log/alloc_churn/cycles"])
+        .arg(disk)
+        .output()
+        .expect("failed to run debugfs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse().unwrap_or_else(|_| {
+        panic!(
+            "no allocation cycle count in {}: {text:?} {}",
+            disk.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
 }

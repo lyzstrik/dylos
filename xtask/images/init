@@ -6,31 +6,44 @@ mount -t devtmpfs devtmpfs /dev
 /sbin/report-readiness
 dylos-agent &
 if grep -q "write_churn=1" /proc/cmdline; then
-    # Fixed-size overwrite churn workload
+    # A failed step stops its loop and prints a "dylos: churn failed" line that fails the test.
+    # Overwrite churn: rewrites the blocks of one preallocated file.
     (
         seek=0
         while :; do
-            dd if=/dev/urandom of=/var/log/churn.dat bs=4k count=1 seek="$seek" conv=notrunc 2>/dev/null
+            dd if=/dev/urandom of=/var/log/churn.dat bs=4k count=1 seek="$seek" conv=notrunc 2>/dev/null &&
+                sync || {
+                echo "dylos: churn failed: overwrite of block $seek" >/dev/console
+                exit 1
+            }
             seek=$(( (seek + 1) % 1024 ))
-            sync
         done
     ) &
-    # Complementary allocation-heavy workload (create, append, rename, delete files in a loop)
+    # Allocation churn: each cycle deletes, creates, appends to and renames a file in one of
+    # 16 slots (bounded retained data), then durably records the cycle count before printing
+    # it, so a printed count is also on disk.
     (
-        mkdir -p /var/log/alloc_churn
+        dir=/var/log/alloc_churn
         i=0
+        fail() {
+            echo "dylos: churn failed: allocation cycle $i: $1" >/dev/console
+            exit 1
+        }
+        mkdir -p "$dir" || fail mkdir
         while :; do
             slot=$(( i % 16 ))
-            # Delete older file in this slot (frees inode and blocks)
-            rm -f "/var/log/alloc_churn/file_${slot}.dat"
-            # Create new file (allocates inode and blocks)
-            dd if=/dev/urandom of="/var/log/alloc_churn/file_${slot}.tmp" bs=4k count=$(( (i % 8) + 1 )) 2>/dev/null
-            # Append more blocks (exercises extent growth and dynamic block allocation)
-            dd if=/dev/urandom of="/var/log/alloc_churn/file_${slot}.tmp" bs=4k count=2 conv=notrunc oflag=append 2>/dev/null
-            # Rename (exercises directory entry modification and dir_index)
-            mv "/var/log/alloc_churn/file_${slot}.tmp" "/var/log/alloc_churn/file_${slot}.dat"
-            sync
+            rm -f "$dir/file_$slot.dat" || fail delete
+            dd if=/dev/urandom of="$dir/file_$slot.tmp" bs=4k count=$(( (i % 8) + 1 )) 2>/dev/null ||
+                fail create
+            dd if=/dev/urandom of="$dir/file_$slot.tmp" bs=4k count=2 conv=notrunc oflag=append 2>/dev/null ||
+                fail append
+            mv "$dir/file_$slot.tmp" "$dir/file_$slot.dat" || fail rename
             i=$(( i + 1 ))
+            echo "$i" >"$dir/cycles.tmp" && mv "$dir/cycles.tmp" "$dir/cycles" || fail record
+            sync || fail sync
+            if [ $(( i % 8 )) -eq 0 ]; then
+                echo "dylos: alloc-cycles $i" >/dev/console
+            fi
         done
     ) &
 fi
