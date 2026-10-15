@@ -74,6 +74,20 @@ async fn launch_waits_for_api_and_shutdown_is_graceful_and_idempotent() {
 }
 
 #[tokio::test]
+async fn launcher_has_its_own_process_group() {
+    use nix::unistd::{Pid, getpgid, getpgrp};
+
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let pid = Pid::from_raw(i32::try_from(vm.pid().unwrap()).unwrap());
+    assert_eq!(getpgid(Some(pid)).unwrap(), pid);
+    assert_ne!(getpgid(Some(pid)).unwrap(), getpgrp());
+    vm.shutdown().await.unwrap();
+    assert_eq!(exit_state(&vm).await, exited(0));
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
 async fn shutdown_escalates_to_sigterm() {
     let sandbox = Sandbox::new(Mode::IgnoreCtrlAltDel);
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
