@@ -6,6 +6,7 @@
 )]
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -90,6 +91,52 @@ async fn assert_dual_stack(lab: &Lab, from: &str, to_v6: &str, to_v4: &str, time
             v4_ok,
             "{from} -> {to_v4} (IPv4) ping timed out after {timeout:?}: {last_v4_diag}\nNeigh: {neigh:?}\nRoute: {route:?}"
         );
+    }
+}
+
+async fn capture(config: &LabConfig, lab: &Lab, label: &str) -> String {
+    let mut out = format!("==== {} {label} ====\n", lab.id());
+    for node in ["A", "B", "C"] {
+        let res = lab
+            .exec(
+                node,
+                "ip -s -4 neigh show; ip -s -6 neigh show; ip -s link show",
+                Duration::from_secs(10),
+            )
+            .await;
+        let text = match res {
+            Ok(o) => o.stdout,
+            Err(e) => format!("exec error: {e}"),
+        };
+        writeln!(out, "-- guest {node}:\n{text}").unwrap();
+    }
+    let netns = config.netns_dir.join(format!("dylos-{}", lab.id()));
+    for args in [
+        vec!["ip", "-s", "link", "show"],
+        vec!["bridge", "fdb", "show"],
+    ] {
+        let o = tokio::process::Command::new("nsenter")
+            .arg(format!("--net={}", netns.display()))
+            .args(&args)
+            .output()
+            .await
+            .unwrap();
+        writeln!(
+            out,
+            "-- host {}:\n{}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+        .unwrap();
+    }
+    out
+}
+
+async fn single_probe(lab: &Lab, cmd: &str) -> String {
+    match lab.exec("A", cmd, Duration::from_secs(10)).await {
+        Ok(o) => format!("exit={} {}", o.exit_code, o.stdout.replace('\n', " | ")),
+        Err(e) => format!("exec error: {e}"),
     }
 }
 
@@ -195,6 +242,23 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
                 clone.id(),
                 latency.as_millis()
             );
+        }
+
+        // Evidence capture for the first-packet investigation: one probe per family, no retry.
+        for (i, clone) in clones.iter().enumerate() {
+            let v4 = "ping -4 -c 1 -W 3 10.0.2.2 2>&1";
+            let v6 = "ping -6 -c 1 -W 3 fd64:796c:6f73:2::2 2>&1";
+            let order = if i % 2 == 0 { [v4, v6] } else { [v6, v4] };
+            let before = capture(&config, clone, "after-restore").await;
+            let first = single_probe(clone, order[0]).await;
+            let mid = capture(&config, clone, "after-first-probe").await;
+            let second = single_probe(clone, order[1]).await;
+            let after = capture(&config, clone, "after-second-probe").await;
+            eprintln!("PROBE {} first[{}]: {first}", clone.id(), order[0]);
+            eprintln!("PROBE {} second[{}]: {second}", clone.id(), order[1]);
+            if i < 2 || !first.starts_with("exit=0") || !second.starts_with("exit=0") {
+                eprintln!("{before}{mid}{after}");
+            }
         }
 
         // 1. Verify memory sharing and read-only immutable backing across all clones
