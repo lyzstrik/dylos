@@ -352,8 +352,8 @@ async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
                 .exists()
         );
         // Verify partial jail-side snapshot files are removed on error
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
 
     lab.teardown().await.unwrap();
@@ -404,8 +404,8 @@ async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
                 .exists()
         );
         // Partial jail files must be cleaned up
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
 
     lab.teardown().await.unwrap();
@@ -472,8 +472,8 @@ async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
                 .join(format!("{}.resumed", vm.paths().id))
                 .exists()
         );
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
 
     lab.teardown().await.unwrap();
@@ -627,8 +627,8 @@ async fn snapshot_in_flight_cancellation_during_capture() {
         || {
             !vm0_root.join("is-paused").exists()
                 && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
-                && !vm0_root.join("vm.state").exists()
-                && !vm0_root.join("vm.mem").exists()
+                && !vm0_root.join("snap.state").exists()
+                && !vm0_root.join("snap.mem").exists()
         },
     )
     .await;
@@ -670,8 +670,8 @@ async fn snapshot_in_flight_cancellation_during_storage() {
         || {
             !vm0_root.join("is-paused").exists()
                 && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
-                && !vm0_root.join("vm.state").exists()
-                && !vm0_root.join("vm.mem").exists()
+                && !vm0_root.join("snap.state").exists()
+                && !vm0_root.join("snap.mem").exists()
         },
     )
     .await;
@@ -807,12 +807,12 @@ async fn snapshot_panic_during_capture_recovers_cleanly() {
     );
     // Verify no leftover jail snapshot files
     assert!(
-        !vm0_root.join("vm.state").exists(),
-        "vm.state must be cleaned up on panic"
+        !vm0_root.join("snap.state").exists(),
+        "snap.state must be cleaned up on panic"
     );
     assert!(
-        !vm0_root.join("vm.mem").exists(),
-        "vm.mem must be cleaned up on panic"
+        !vm0_root.join("snap.mem").exists(),
+        "snap.mem must be cleaned up on panic"
     );
     // Verify partial snapshot is removed
     assert!(

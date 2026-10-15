@@ -443,8 +443,8 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
                 stream.shutdown().await.unwrap();
                 continue;
             }
-            std::fs::write(root.join("vm.state"), b"fake vm state content").unwrap();
-            std::fs::write(root.join("vm.mem"), b"fake vm memory content").unwrap();
+            std::fs::write(root.join("snap.state"), b"fake vm state content").unwrap();
+            std::fs::write(root.join("snap.mem"), b"fake vm memory content").unwrap();
             std::fs::write(root.join("capture-done"), b"").unwrap();
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
