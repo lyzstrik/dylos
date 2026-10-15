@@ -4,6 +4,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use dylos_core::manifest::SnapshotManifest;
 use dylos_core::{LabSpec, guest_net};
 use dylos_fc::config::{BootSource, Drive, MachineConfiguration, NetworkInterface};
 use dylos_net::{FabricPlan, LabNetwork};
@@ -15,6 +16,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::Instrument;
 
 use crate::jailer::{ChrootFile, JailPaths, JailerConfig};
+use crate::snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings};
 use crate::{ProcessState, Timeouts, Vm, VmSpec};
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +68,7 @@ pub struct LabConfig {
     pub netns_dir: PathBuf,
     pub timeouts: Timeouts,
     pub boot_timeout: Duration,
+    pub extra_boot_args: Option<String>,
 }
 
 impl Default for LabConfig {
@@ -77,6 +80,7 @@ impl Default for LabConfig {
             netns_dir: "/run/netns".into(),
             timeouts: Timeouts::default(),
             boot_timeout: Duration::from_secs(30),
+            extra_boot_args: None,
         }
     }
 }
@@ -85,6 +89,8 @@ impl Default for LabConfig {
 #[must_use]
 pub struct Lab {
     id: String,
+    store: dylos_store::Store,
+    spec: LabSpec,
     storage: Option<dylos_store::Lab>,
     network: Option<LabNetwork>,
     vms: Vec<Vm>,
@@ -92,6 +98,7 @@ pub struct Lab {
     lock: Option<Flock<File>>,
     span: tracing::Span,
     cleanup_on_drop: bool,
+    snapshots: SnapshotSlot,
 }
 
 impl Lab {
@@ -128,6 +135,8 @@ impl Lab {
             let storage = blocking(lab_id, move || Ok(store.create(&id, &spec_copy)?)).await?;
             let mut lab = Self {
                 id: lab_id.into(),
+                store: config.store.clone(),
+                spec: spec.clone(),
                 storage: Some(storage),
                 network: None,
                 vms: Vec::new(),
@@ -135,6 +144,7 @@ impl Lab {
                 lock: None,
                 span: span.clone(),
                 cleanup_on_drop: true,
+                snapshots: SnapshotSlot::default(),
             };
             let result = lab.bring_up(config, spec, plan).await;
             if let Err(operation) = result {
@@ -206,12 +216,9 @@ impl Lab {
         );
         let started = Instant::now();
         complete(
-            join_all(
-                self.vms
-                    .iter()
-                    .zip(&spec.nodes)
-                    .map(|(vm, node)| configure_vm(&self.id, spec, node, vm)),
-            )
+            join_all(self.vms.iter().zip(&spec.nodes).map(|(vm, node)| {
+                configure_vm(&self.id, spec, node, vm, config.extra_boot_args.as_deref())
+            }))
             .await,
         )?;
         tracing::info!(
@@ -265,36 +272,148 @@ impl Lab {
         &self.vms
     }
 
-    /// Serves root-only teardown requests and tears down if any VM exits unexpectedly.
+    /// Runs the consistent snapshot sequence of ADR-0001 on every VM of the lab.
+    ///
+    /// # Errors
+    /// Returns [`LabError`] on failure at any step or rollback.
+    pub async fn snapshot(&mut self, snapshot_id: &str) -> Result<SnapshotManifest> {
+        self.snapshot_with_timings(snapshot_id)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// As [`Lab::snapshot`], also returning step durations.
+    ///
+    /// # Errors
+    /// Returns [`LabError`] on failure at any step or rollback.
+    pub async fn snapshot_with_timings(
+        &mut self,
+        snapshot_id: &str,
+    ) -> Result<(SnapshotManifest, SnapshotTimings)> {
+        let request = SnapshotRequest {
+            lab_id: &self.id,
+            snapshot_id,
+            spec: &self.spec,
+            store: &self.store,
+            storage: self.storage.as_ref(),
+            vms: &self.vms,
+            network: self.network.as_ref(),
+        };
+        crate::snapshot_vms(request, &self.snapshots).await
+    }
+
+    #[must_use]
+    pub fn has_active_snapshot(&self) -> bool {
+        self.snapshots.is_active()
+    }
+
+    /// Waits until the in-flight snapshot task, if any, has finished its recovery.
+    pub async fn wait_for_active_snapshot(&self) {
+        self.snapshots.wait().await;
+    }
+
+    /// Serves root-only teardown and snapshot requests, and tears down if any VM exits unexpectedly.
     /// # Errors
     /// Reports socket, VM exit, and cleanup failures. A response is sent only after cleanup.
+    #[allow(clippy::too_many_lines)]
     pub async fn supervise(mut self) -> Result<()> {
+        let span = self.span.clone();
         let result = async {
-            let listener = self.listener.as_ref().ok_or_else(|| invalid(&self.id, "lab already stopped"))?;
+            let listener = self
+                .listener
+                .take()
+                .ok_or_else(|| invalid(&self.id, "lab already stopped"))?;
+            let states: Vec<_> = self.vms.iter().map(Vm::state).collect();
             let exits = futures_util::stream::FuturesUnordered::new();
-            for vm in &self.vms {
-                let mut state = vm.state();
+            for mut state in states {
                 exits.push(async move {
                     let _exit = state.wait_for(|s| *s != ProcessState::Running).await;
                 });
             }
             tokio::pin!(exits);
-            loop {
+            let has_vms = !self.vms.is_empty();
+            let res = loop {
                 use futures_util::StreamExt;
                 tokio::select! {
-                    _ = exits.next(), if !self.vms.is_empty() => return Err(invalid(&self.id, "VM exited unexpectedly")),
+                    _ = exits.next(), if has_vms => break Err(invalid(&self.id, "VM exited unexpectedly")),
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.map_err(|e| io(&self.id, e))?;
                         let credentials = stream.peer_cred().map_err(|e| io(&self.id, e))?;
                         if credentials.uid() != nix::unistd::geteuid().as_raw() { continue; }
-                        let mut request = [0; 9];
-                        if matches!(tokio::time::timeout(Duration::from_secs(1), stream.read_exact(&mut request)).await, Ok(Ok(_))) && &request == b"teardown\n" {
-                            return Ok(stream);
+                        let mut buf = Vec::new();
+                        let mut byte = [0u8; 1];
+                        let read_res = tokio::time::timeout(Duration::from_secs(2), async {
+                            loop {
+                                let n = stream.read(&mut byte).await?;
+                                if n == 0 || byte[0] == b'\n' { break; }
+                                buf.push(byte[0]);
+                                if buf.len() > 256 {
+                                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "command too long"));
+                                }
+                            }
+                            Ok::<_, std::io::Error>(())
+                        }).await;
+
+                        if let Ok(Ok(())) = read_res {
+                            let line = String::from_utf8_lossy(&buf);
+                            let trimmed = line.trim();
+                            if trimmed == "teardown" {
+                                break Ok(stream);
+                            } else if trimmed == "snapshot"
+                                || trimmed.starts_with("snapshot ")
+                                || trimmed.starts_with("snapshot\t")
+                            {
+                                let mut parts = trimmed.split_whitespace();
+                                let _cmd = parts.next();
+                                let maybe_id = parts.next();
+                                if parts.next().is_some() {
+                                    let _ = stream
+                                        .write_all(b"err invalid command: too many arguments\n")
+                                        .await;
+                                    continue;
+                                }
+                                let snap_id = match maybe_id {
+                                    Some(id) => {
+                                        if let Err(e) = dylos_core::validate_name(id, 32) {
+                                            let _ = stream
+                                                .write_all(
+                                                    format!("err invalid snapshot id: {e}\n")
+                                                        .as_bytes(),
+                                                )
+                                                .await;
+                                            continue;
+                                        }
+                                        id.to_string()
+                                    }
+                                    None => format!(
+                                        "snap-{}",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    ),
+                                };
+                                let res = self.snapshot(&snap_id).await;
+                                match res {
+                                    Ok(_) => {
+                                        let _ = stream
+                                            .write_all(format!("ok {snap_id}\n").as_bytes())
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        let _ = stream
+                                            .write_all(format!("err {e}\n").as_bytes())
+                                            .await;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
-            }
-        }.instrument(self.span.clone()).await;
+            };
+            self.listener = Some(listener);
+            res
+        }.instrument(span).await;
         let cleanup = self.teardown().await;
         match (result, cleanup) {
             (Ok(mut stream), Ok(())) => {
@@ -312,6 +431,7 @@ impl Lab {
     /// # Errors
     /// Cleanup failures preserve remaining owned resources for a retry.
     pub async fn teardown(&mut self) -> Result<()> {
+        self.wait_for_active_snapshot().await;
         async {
             let started = Instant::now();
             complete(
@@ -481,6 +601,57 @@ impl Lab {
         .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
     }
 
+    /// Requests a snapshot over the control socket.
+    /// # Errors
+    /// Connection, timeout or protocol failure. A timeout leaves the server outcome unknown.
+    pub async fn request_snapshot(
+        socket: &Path,
+        snapshot_id: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String> {
+        let id = socket.to_string_lossy();
+        tokio::time::timeout(timeout, async {
+            let mut stream = UnixStream::connect(socket).await.map_err(|e| io(&id, e))?;
+            let cmd = match snapshot_id {
+                Some(snap) => format!("snapshot {snap}\n"),
+                None => "snapshot\n".to_string(),
+            };
+            stream
+                .write_all(cmd.as_bytes())
+                .await
+                .map_err(|e| io(&id, e))?;
+            let mut reply_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                let n = stream.read(&mut byte).await.map_err(|e| io(&id, e))?;
+                if n == 0 || byte[0] == b'\n' {
+                    break;
+                }
+                reply_buf.push(byte[0]);
+                if reply_buf.len() > 1024 {
+                    return Err(invalid(&id, "response too long"));
+                }
+            }
+            let reply = String::from_utf8_lossy(&reply_buf);
+            let trimmed = reply.trim();
+            if let Some(rest) = trimmed.strip_prefix("ok") {
+                let snap = rest.trim();
+                let actual_id = if snap.is_empty() {
+                    snapshot_id.unwrap_or("").to_string()
+                } else {
+                    snap.to_string()
+                };
+                Ok(actual_id)
+            } else if let Some(err_msg) = trimmed.strip_prefix("err ") {
+                Err(invalid(&id, err_msg.trim()))
+            } else {
+                Err(invalid(&id, &format!("invalid snapshot response: {reply}")))
+            }
+        })
+        .await
+        .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
+    }
+
     /// Cleans a crashed supervisor's lab by name, using its persisted spec, never a saved PID.
     /// A live supervisor holds an exclusive directory lock and cannot be bypassed.
     /// # Errors
@@ -608,7 +779,13 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm) -> Result<()> {
+async fn configure_vm(
+    id: &str,
+    spec: &LabSpec,
+    node: &dylos_core::Node,
+    vm: &Vm,
+    extra_boot: Option<&str>,
+) -> Result<()> {
     let vcpus = u8::try_from(node.vcpus).map_err(|_| invalid(id, "invalid vCPU count"))?;
     let boot_args = guest_net::boot_args(spec, node)?;
     async {
@@ -617,8 +794,12 @@ async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm
             api.put_machine_config(&MachineConfiguration::new(vcpus, node.memory as usize))
                 .await?;
             let mut boot = BootSource::new("/vmlinux.bin");
+            let extra_boot_args = match extra_boot {
+                Some(args) => format!(" {args}"),
+                None => String::new(),
+            };
             boot.boot_args = Some(format!(
-                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda {boot_args}"
+                "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda {boot_args}{extra_boot_args}"
             ));
             api.put_boot_source(&boot).await?;
             let mut drive = Drive::new("rootfs", true);
@@ -648,12 +829,16 @@ async fn configure_vm(id: &str, spec: &LabSpec, node: &dylos_core::Node, vm: &Vm
 
 impl Drop for Lab {
     fn drop(&mut self) {
-        if !self.cleanup_on_drop || self.storage.is_none() {
+        if !self.cleanup_on_drop
+            || (self.storage.is_none() && self.vms.is_empty() && !self.has_active_snapshot())
+        {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let mut owned = Self {
                 id: self.id.clone(),
+                store: self.store.clone(),
+                spec: self.spec.clone(),
                 storage: self.storage.take(),
                 network: self.network.take(),
                 vms: std::mem::take(&mut self.vms),
@@ -661,6 +846,7 @@ impl Drop for Lab {
                 lock: self.lock.take(),
                 span: self.span.clone(),
                 cleanup_on_drop: false,
+                snapshots: self.snapshots.clone(),
             };
             runtime.spawn(async move {
                 if let Err(error) = owned.teardown().await {

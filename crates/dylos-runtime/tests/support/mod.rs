@@ -48,6 +48,8 @@ pub enum Mode {
     LabConfigureFailure,
     LabNetworkFailure,
     LabCrashOnFlush,
+    /// `LabReady` without its configuration barriers, with the `ParallelPause` and snapshot fakes.
+    LabSnapshot,
 }
 
 pub struct Sandbox {
@@ -193,7 +195,7 @@ async fn parallel_pause_reply(
     request: &str,
     stream: &mut UnixStream,
 ) -> bool {
-    if mode == "ParallelPause" && request.starts_with("PATCH /vm ") {
+    if matches!(mode, "ParallelPause" | "LabSnapshot") && request.starts_with("PATCH /vm ") {
         let root = sock.parent().unwrap().parent().unwrap();
         let action = if request.contains("Paused") {
             "paused"
@@ -227,6 +229,17 @@ async fn parallel_pause_reply(
         std::fs::write(sandbox.join(format!("{id}.{action}-barrier")), b"").unwrap();
         if action == "paused" {
             std::fs::write(root.join("is-paused"), b"").unwrap();
+            assert_taps_down(
+                sandbox,
+                "barrier violation: fabric must be frozen before VMs are paused, but TAP is UP",
+            );
+            if root.join("stall-pause").exists() {
+                std::fs::write(root.join("pause-started"), b"").unwrap();
+                wait_until("pause stall released", Duration::from_secs(5), || {
+                    !root.join("stall-pause").exists()
+                })
+                .await;
+            }
             if root.join("drop-paused").exists() {
                 stream.shutdown().await.unwrap();
                 return true;
@@ -240,11 +253,94 @@ async fn parallel_pause_reply(
             stream.shutdown().await.unwrap();
             return true;
         }
-        if action == "resumed" && root.join("is-paused").exists() {
-            std::fs::remove_file(root.join("is-paused")).unwrap();
+        if action == "resumed" {
+            if root.join("is-paused").exists() {
+                std::fs::remove_file(root.join("is-paused")).unwrap();
+            }
+            let jail = root.parent().unwrap();
+            let parent = jail.parent().unwrap();
+            let own_id = jail.file_name().unwrap().to_str().unwrap();
+            if let Some((prefix, _)) = own_id.rsplit_once('-') {
+                let any_captured = ["A", "B", "C"].iter().any(|node| {
+                    let r = parent.join(format!("{prefix}-{node}/root"));
+                    r.join("capture-done").exists() || r.join("snapshot-started").exists()
+                });
+                if any_captured {
+                    for node in ["A", "B", "C"] {
+                        let r = parent.join(format!("{prefix}-{node}/root"));
+                        assert!(
+                            r.join("capture-done").exists(),
+                            "barrier violation: VM resumed before capture finished for {node}"
+                        );
+                    }
+                }
+            }
+            if root.join("stall-resume").exists() {
+                std::fs::write(root.join("resume-started"), b"").unwrap();
+                wait_until("resume stall released", Duration::from_secs(5), || {
+                    !root.join("stall-resume").exists()
+                })
+                .await;
+            }
+            assert_taps_down(
+                sandbox,
+                "barrier violation: fabric must remain frozen until all VMs resumed, but TAP is UP",
+            );
         }
     }
     false
+}
+
+pub fn assert_taps_down(sandbox: &Path, barrier_msg: &str) {
+    let netns_dir = sandbox.join("netns");
+    if !netns_dir.exists() {
+        return;
+    }
+    let entries = std::fs::read_dir(&netns_dir)
+        .expect("failed to read netns directory")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("failed to read netns directory entry");
+    assert!(
+        !entries.is_empty(),
+        "netns directory exists but contains no netns entries"
+    );
+    for entry in entries {
+        let netns_path = entry.path();
+        let output = std::process::Command::new("nsenter")
+            .args([
+                format!("--net={}", netns_path.display()).as_str(),
+                "ip",
+                "link",
+                "show",
+            ])
+            .output()
+            .expect("failed to run nsenter ip link show");
+        assert!(
+            output.status.success(),
+            "nsenter ip link show failed on {}: status {:?}, stderr: {}",
+            netns_path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let link_out = String::from_utf8_lossy(&output.stdout);
+        for tap in ["tap-A-eth0", "tap-B-eth0", "tap-C-eth0"] {
+            let mut found = false;
+            for line in link_out.lines() {
+                if line.contains(tap) {
+                    found = true;
+                    assert!(
+                        !line.contains(",UP") && !line.contains("<UP,"),
+                        "{barrier_msg}: {line}"
+                    );
+                }
+            }
+            assert!(
+                found,
+                "missing expected TAP interface {tap} in netns {}: output:\n{link_out}",
+                netns_path.display()
+            );
+        }
+    }
 }
 
 async fn check_lab_request(
@@ -259,6 +355,7 @@ async fn check_lab_request(
     parallel_pause_reply(mode, sandbox, sock, request, stream).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
     match mode {
@@ -302,7 +399,10 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             continue;
         }
         if request.contains("InstanceStart") {
-            if mode == "LabReady" || mode == "LabPartialLaunch" || mode == "LabCrashOnFlush" {
+            if matches!(
+                mode,
+                "LabReady" | "LabPartialLaunch" | "LabCrashOnFlush" | "LabSnapshot"
+            ) {
                 println!("dylos: ready");
             }
             if mode == "LabNetworkFailure" {
@@ -325,6 +425,33 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         }
         if mode == "StallActions" && request.starts_with("PUT /actions ") {
             stalled.push(stream);
+            continue;
+        }
+        if request.starts_with("PUT /snapshot/create ") {
+            let root = sock.parent().unwrap().parent().unwrap();
+            if root.join("stall-snapshot").exists() {
+                std::fs::write(root.join("snapshot-started"), b"").unwrap();
+                wait_until("snapshot stall released", Duration::from_secs(5), || {
+                    !root.join("stall-snapshot").exists()
+                })
+                .await;
+            }
+            if root.join("fail-snapshot").exists() {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                continue;
+            }
+            std::fs::write(root.join("vm.state"), b"fake vm state content").unwrap();
+            std::fs::write(root.join("vm.mem"), b"fake vm memory content").unwrap();
+            std::fs::write(root.join("capture-done"), b"").unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
             continue;
         }
         let reply = if mode == "LabConfigureFailure" && request.starts_with("PUT /boot-source ") {
@@ -561,4 +688,182 @@ fn normalize_lab_request(mode: &str, request: String) -> String {
     } else {
         request
     }
+}
+
+/// Superblock-wide summary counters that a read-only `e2fsck -fn` reported as stale.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct StaleSummaryCounters {
+    pub free_blocks: bool,
+    pub free_inodes: bool,
+}
+
+const E2FSCK_PASSES: [&str; 5] = [
+    "Pass 1: Checking inodes, blocks, and sizes",
+    "Pass 2: Checking directory structure",
+    "Pass 3: Checking directory connectivity",
+    "Pass 4: Checking reference counts",
+    "Pass 5: Checking group summary information",
+];
+
+/// Verifies the output of a read-only `e2fsck -fn` on a recovered disk image.
+///
+/// ext4 keeps free block and inode counts in per-CPU counters and writes the superblock-wide
+/// totals (`s_free_blocks_count`, `s_free_inodes_count`) only on a clean unmount or a
+/// superblock commit; group descriptors and bitmaps are journaled. An image of a mounted,
+/// writing filesystem (a crash or a crash-consistent snapshot) can therefore carry stale
+/// superblock totals after journal replay. Those two pass-5 diagnostics, each followed by the
+/// `-n` answer `Fix? no`, are the only ones accepted; any group-level, bitmap or structural
+/// diagnostic is rejected.
+///
+/// The transcript must also be complete: status 0, all five passes once and in order, and one
+/// final `<device>: N/N files (P% non-contiguous), N/N blocks` summary after pass 5.
+pub fn verify_e2fsck_readonly_output(
+    output: &str,
+    exit_code: Option<i32>,
+) -> Result<StaleSummaryCounters, String> {
+    if exit_code != Some(0) {
+        return Err(format!(
+            "e2fsck exited with non-zero status: {exit_code:?}\nOutput:\n{output}"
+        ));
+    }
+    let mut stale = StaleSummaryCounters::default();
+    let mut passes = 0;
+    let mut summary = false;
+    let mut banner = false;
+    let mut library = false;
+    let mut lines = output
+        .lines()
+        .map(str::trim)
+        .enumerate()
+        .filter(|(_, line)| !line.is_empty());
+    while let Some((index, line)) = lines.next() {
+        let lineno = index + 1;
+        let reject = |why: &str| Err(format!("line {lineno}: {why}: {line:?}"));
+        if passes < E2FSCK_PASSES.len() && line == E2FSCK_PASSES[passes] {
+            if summary {
+                return reject("e2fsck pass after the final summary");
+            }
+            passes += 1;
+        } else if !banner && is_e2fsck_banner(line) {
+            banner = true;
+        } else if !library && line.starts_with("Using EXT2FS Library version ") {
+            library = true;
+        } else if passes == E2FSCK_PASSES.len() && !summary && is_e2fsck_summary(line) {
+            summary = true;
+        } else if let Some(counter) = stale_summary_counter(line) {
+            if passes != E2FSCK_PASSES.len() || summary {
+                return reject("superblock counter mismatch outside pass 5");
+            }
+            let seen = match counter {
+                SummaryCounter::FreeBlocks => &mut stale.free_blocks,
+                SummaryCounter::FreeInodes => &mut stale.free_inodes,
+            };
+            if std::mem::replace(seen, true) {
+                return reject("repeated superblock counter mismatch");
+            }
+            match lines.next() {
+                Some((_, prompt)) if is_fix_no_prompt(prompt) => {}
+                next => {
+                    return Err(format!(
+                        "line {lineno}: expected 'Fix? no' after allowlisted superblock counter mismatch, got: {:?}",
+                        next.map(|(_, l)| l)
+                    ));
+                }
+            }
+        } else {
+            return reject("unallowlisted e2fsck diagnostic or error");
+        }
+    }
+    if passes != E2FSCK_PASSES.len() {
+        return Err(format!(
+            "incomplete e2fsck transcript: missing {:?}\nOutput:\n{output}",
+            E2FSCK_PASSES[passes]
+        ));
+    }
+    if !summary {
+        return Err(format!(
+            "incomplete e2fsck transcript: missing final summary\nOutput:\n{output}"
+        ));
+    }
+    Ok(stale)
+}
+
+enum SummaryCounter {
+    FreeBlocks,
+    FreeInodes,
+}
+
+/// Only the superblock-wide form: the group form reads `... wrong for group #N (...)`.
+fn stale_summary_counter(line: &str) -> Option<SummaryCounter> {
+    let (counter, rest) = if let Some(rest) = line.strip_prefix("Free blocks count wrong (") {
+        (SummaryCounter::FreeBlocks, rest)
+    } else {
+        (
+            SummaryCounter::FreeInodes,
+            line.strip_prefix("Free inodes count wrong (")?,
+        )
+    };
+    let (recorded, actual) = rest.strip_suffix(").")?.split_once(", counted=")?;
+    (is_number(recorded) && is_number(actual)).then_some(counter)
+}
+
+fn is_number(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// `e2fsck 1.47.0 (5-Feb-2023)`
+fn is_e2fsck_banner(line: &str) -> bool {
+    line.strip_prefix("e2fsck ")
+        .and_then(|rest| rest.split_once(" ("))
+        .is_some_and(|(version, date)| {
+            !version.is_empty()
+                && version.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+                && date.ends_with(')')
+                && !date[..date.len() - 1].contains(['(', ')'])
+        })
+}
+
+/// `<device>: 885/32768 files (1.7% non-contiguous), 28698/131072 blocks`; a forced check
+/// never prints the `clean,` form.
+fn is_e2fsck_summary(line: &str) -> bool {
+    let Some((device, rest)) = line.rsplit_once(": ") else {
+        return false;
+    };
+    let ratio = |text: &str| {
+        text.split_once('/')
+            .is_some_and(|(a, b)| is_number(a) && is_number(b))
+    };
+    let Some((files, rest)) = rest.split_once(" files (") else {
+        return false;
+    };
+    let Some((fragmented, blocks)) = rest.split_once("% non-contiguous), ") else {
+        return false;
+    };
+    !device.is_empty()
+        && ratio(files)
+        && fragmented
+            .split_once('.')
+            .map_or(is_number(fragmented), |(a, b)| is_number(a) && is_number(b))
+        && blocks.strip_suffix(" blocks").is_some_and(ratio)
+}
+
+fn is_fix_no_prompt(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed == "Fix? no" {
+        return true;
+    }
+    if let Some(rest) = trimmed.strip_prefix("Fix") {
+        if let Some(after_q) = rest.strip_prefix("? no") {
+            return after_q.is_empty();
+        }
+        if let Some(bracket_end) = rest.find(">?") {
+            let num = &rest[1..bracket_end];
+            let after_q = rest[bracket_end + 2..].trim_start();
+            return rest.starts_with('<')
+                && !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit())
+                && after_q == "no";
+        }
+    }
+    false
 }

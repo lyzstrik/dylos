@@ -5,6 +5,48 @@ mount -t devtmpfs devtmpfs /dev
 /sbin/net-setup-guard
 /sbin/report-readiness
 dylos-agent &
+if grep -q "write_churn=1" /proc/cmdline; then
+    # A failed step stops its loop and prints a "dylos: churn failed" line that fails the test.
+    # Overwrite churn: rewrites the blocks of one preallocated file.
+    (
+        seek=0
+        while :; do
+            dd if=/dev/urandom of=/var/log/churn.dat bs=4k count=1 seek="$seek" conv=notrunc 2>/dev/null &&
+                sync || {
+                echo "dylos: churn failed: overwrite of block $seek" >/dev/console
+                exit 1
+            }
+            seek=$(( (seek + 1) % 1024 ))
+        done
+    ) &
+    # Allocation churn: each cycle deletes, creates, appends to and renames a file in one of
+    # 16 slots (bounded retained data), then durably records the cycle count before printing
+    # it, so a printed count is also on disk.
+    (
+        dir=/var/log/alloc_churn
+        i=0
+        fail() {
+            echo "dylos: churn failed: allocation cycle $i: $1" >/dev/console
+            exit 1
+        }
+        mkdir -p "$dir" || fail mkdir
+        while :; do
+            slot=$(( i % 16 ))
+            rm -f "$dir/file_$slot.dat" || fail delete
+            dd if=/dev/urandom of="$dir/file_$slot.tmp" bs=4k count=$(( (i % 8) + 1 )) 2>/dev/null ||
+                fail create
+            dd if=/dev/urandom of="$dir/file_$slot.tmp" bs=4k count=2 conv=notrunc oflag=append 2>/dev/null ||
+                fail append
+            mv "$dir/file_$slot.tmp" "$dir/file_$slot.dat" || fail rename
+            i=$(( i + 1 ))
+            echo "$i" >"$dir/cycles.tmp" && mv "$dir/cycles.tmp" "$dir/cycles" || fail record
+            sync || fail sync
+            if [ $(( i % 8 )) -eq 0 ]; then
+                echo "dylos: alloc-cycles $i" >/dev/console
+            fi
+        done
+    ) &
+fi
 # PID 1 must survive console logout; Alpine BusyBox provides setsid -c, not cttyhack.
 while :; do
     setsid -c /bin/sh -i </dev/ttyS0 >/dev/ttyS0 2>&1

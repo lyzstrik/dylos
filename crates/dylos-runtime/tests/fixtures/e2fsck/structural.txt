@@ -1,0 +1,3 @@
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Inode 12 has illegal block(s).  Clear? no

@@ -97,6 +97,7 @@ pub struct Vm {
     readiness: watch::Receiver<Readiness>,
     boot_start: Instant,
     output_tasks_done: mpsc::Receiver<()>,
+    node: String,
 }
 
 impl Vm {
@@ -147,7 +148,7 @@ impl Vm {
                     });
                 }
             };
-            let mut vm = Self::start(child, jail, spec.timeouts, boot_start);
+            let mut vm = Self::start(child, jail, spec.timeouts, boot_start, spec.node.clone());
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
                 vm.send_signal(Signal::SIGKILL);
@@ -163,7 +164,13 @@ impl Vm {
         .await
     }
 
-    fn start(mut child: Child, jail: Jail, timeouts: Timeouts, boot_start: Instant) -> Self {
+    fn start(
+        mut child: Child,
+        jail: Jail,
+        timeouts: Timeouts,
+        boot_start: Instant,
+        node: String,
+    ) -> Self {
         let paths = jail.paths().clone();
         let pid = child.id();
         let mut tasks = Vec::new();
@@ -225,7 +232,13 @@ impl Vm {
             readiness,
             boot_start,
             output_tasks_done: done_rx,
+            node,
         }
+    }
+
+    #[must_use]
+    pub fn node(&self) -> &str {
+        &self.node
     }
 
     #[must_use]
