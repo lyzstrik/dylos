@@ -23,6 +23,7 @@ pub enum Mode {
     /// Serves the API; exits 0 on `SendCtrlAltDel`, 7 after `FlushMetrics` if `crash_on_flush`.
     Serve,
     ParallelPause,
+    Echo,
     CrashOnFlush,
     /// Answers `SendCtrlAltDel` but keeps running; dies on SIGTERM.
     IgnoreCtrlAltDel,
@@ -259,6 +260,7 @@ async fn check_lab_request(
     parallel_pause_reply(mode, sandbox, sock, request, stream).await
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
     match mode {
@@ -276,9 +278,14 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         None
     };
     let listener = UnixListener::bind(&sock).unwrap();
-    if mode == "EarlyReadiness" {
+    if mode == "EarlyReadiness" || mode == "Echo" {
         println!("dylos: ready");
-        println!("early marker forwarded");
+        if mode == "EarlyReadiness" {
+            println!("early marker forwarded");
+        }
+    }
+    if mode == "Echo" || mode.starts_with("Lab") {
+        spawn_echo_responder(mode);
     }
     let mut stalled = Vec::new();
     loop {
@@ -341,7 +348,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             return 0;
         }
         if request.contains("SendCtrlAltDel")
-            && (matches!(mode, "Serve" | "ParallelPause") || mode.starts_with("Lab"))
+            && (matches!(mode, "Serve" | "ParallelPause" | "Echo") || mode.starts_with("Lab"))
         {
             return 0;
         }
@@ -561,4 +568,29 @@ fn normalize_lab_request(mode: &str, request: String) -> String {
     } else {
         request
     }
+}
+
+fn spawn_echo_responder(mode: &str) {
+    let mode = mode.to_string();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines().map_while(Result::ok) {
+            let cmd = if mode.starts_with("Lab") && line.contains("ping ") {
+                line.replace("ping ", ": ")
+            } else {
+                line
+            };
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .output();
+            if let Ok(out) = output {
+                let mut stdout = std::io::stdout().lock();
+                let _ = stdout.write_all(&out.stdout);
+                let _ = stdout.write_all(&out.stderr);
+                let _ = stdout.flush();
+            }
+        }
+    });
 }

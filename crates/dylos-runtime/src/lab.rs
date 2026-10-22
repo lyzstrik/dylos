@@ -240,6 +240,7 @@ impl Lab {
             }))
             .await,
         )?;
+        self.verify_readiness(spec).await?;
         let socket = self.control_socket();
         self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -263,6 +264,127 @@ impl Lab {
     #[must_use]
     pub fn vms(&self) -> &[Vm] {
         &self.vms
+    }
+
+    /// Returns a reference to the VM with the given node name, if present.
+    #[must_use]
+    pub fn vm(&self, node: &str) -> Option<&Vm> {
+        self.vms.iter().find(|vm| vm.node() == node)
+    }
+
+    /// Executes a command in the specified guest VM.
+    ///
+    /// # Errors
+    /// Returns [`LabError::Invalid`] if the node is not found, or any error from `Vm::exec`.
+    pub async fn exec(
+        &self,
+        node: &str,
+        cmd: &str,
+        timeout: Duration,
+    ) -> Result<crate::vm::ExecOutput> {
+        let vm = self.vm(node).ok_or_else(|| LabError::Invalid {
+            lab: self.id.clone(),
+            message: format!("VM node '{node}' not found"),
+        })?;
+        vm.exec(cmd, timeout).await.map_err(LabError::from)
+    }
+
+    async fn verify_readiness(&self, spec: &LabSpec) -> Result<()> {
+        let mut v6_probes = Vec::new();
+        let mut v4_probes = Vec::new();
+
+        for node in &spec.nodes {
+            for route in &node.static_routes {
+                for peer in &spec.nodes {
+                    if peer.name == node.name {
+                        continue;
+                    }
+                    for iface in &peer.interfaces {
+                        let ip_v6 = std::net::IpAddr::V6(iface.ipv6.addr());
+                        if route.destination.contains(&ip_v6) {
+                            v6_probes.push((
+                                node.name.clone(),
+                                "-6",
+                                iface.ipv6.addr().to_string(),
+                            ));
+                        }
+                        if let Some(ipv4) = iface.ipv4 {
+                            let ip_v4 = std::net::IpAddr::V4(ipv4.addr());
+                            if route.destination.contains(&ip_v4) {
+                                v4_probes.push((node.name.clone(), "-4", ipv4.addr().to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if v6_probes.is_empty() && v4_probes.is_empty() {
+            for node in &spec.nodes {
+                for iface in &node.interfaces {
+                    for peer in &spec.nodes {
+                        if peer.name == node.name {
+                            continue;
+                        }
+                        for peer_iface in &peer.interfaces {
+                            if peer_iface.segment == iface.segment {
+                                v6_probes.push((
+                                    node.name.clone(),
+                                    "-6",
+                                    peer_iface.ipv6.addr().to_string(),
+                                ));
+                                if let Some(peer_ipv4) = peer_iface.ipv4 {
+                                    v4_probes.push((
+                                        node.name.clone(),
+                                        "-4",
+                                        peer_ipv4.addr().to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        v6_probes.dedup();
+        v4_probes.dedup();
+
+        // IPv6-first (ADR-0002)
+        for (node, family, target) in &v6_probes {
+            self.probe_peer(node, family, target).await?;
+        }
+
+        // Then IPv4
+        for (node, family, target) in &v4_probes {
+            self.probe_peer(node, family, target).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn probe_peer(&self, node: &str, family: &str, target: &str) -> Result<()> {
+        let cmd = format!("ping {family} -c 1 -W 1 {target}");
+        let mut last_err = String::new();
+        for _ in 0..3 {
+            match self.exec(node, &cmd, Duration::from_secs(2)).await {
+                Ok(out) if out.success() => return Ok(()),
+                Ok(out) => {
+                    last_err = out.stdout;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        Err(LabError::Vm(crate::Error::ReadinessFailed {
+            id: node.to_string(),
+            line: format!(
+                "across-lab connectivity probe failed: {node} cannot ping {target} ({family}): {last_err}"
+            ),
+        }))
     }
 
     /// Serves root-only teardown requests and tears down if any VM exits unexpectedly.
