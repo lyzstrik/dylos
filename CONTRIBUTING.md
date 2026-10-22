@@ -12,6 +12,8 @@ Verify your environment with:
 just host-check
 ```
 
+Optional: `.mcp.json` declares a project-scoped `rust-analyzer` MCP server for coding agents. Install it with `cargo install rust-analyzer-mcp`. It also needs `rust-analyzer` (`rustup component add rust-analyzer`).
+
 ## Workflow
 
 1. **Issues**: Every change starts from an issue (tracked in Linear as `LYZ-xx`).
