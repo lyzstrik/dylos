@@ -1,19 +1,23 @@
 //! Benchmarks for Dylos technical spike.
 //!
 //! Measures cold boot latency, snapshot freeze/pause/total timings,
-//! parallel clone fork latencies (fork -n 1, 10, 20), and per-clone PSS at rest
-//! on a 5-VM lab (256 MiB each).
+//! parallel clone fork latencies (fork -n 1, 10, 20), and per-clone PSS once its reading
+//! settles, on a 5-VM lab (256 MiB each).
 #![forbid(unsafe_code)]
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::too_many_lines,
-    clippy::similar_names
+    clippy::similar_names,
+    clippy::missing_errors_doc,
+    clippy::must_use_candidate
 )]
 
-use std::collections::BTreeMap;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
+use std::fs::{self, DirBuilder};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -131,14 +135,14 @@ pub fn print_usage() {
          \n\
          Runs quantified benchmarks for the Dylos technical spike on a 5-VM lab.\n\
          Measures cold boot latency, snapshot freeze/pause/total timings, parallel\n\
-         clone fork latencies (fork -n 1, 10, 20), and per-clone PSS at rest.\n\
+         clone fork latencies (fork -n 1, 10, 20), and per-clone PSS after it settles.\n\
          \n\
          Options:\n\
            --quick                Run in reduced mode (default {DEFAULT_REPETITIONS_QUICK} repetitions) for CI verification\n\
            --repetitions <N>      Number of repetitions per measurement (default: {DEFAULT_REPETITIONS_FULL}, or {DEFAULT_REPETITIONS_QUICK} with --quick)\n\
            --fork-counts <LIST>   Comma-separated clone counts to benchmark (default: 1,10,20)\n\
            --output <PATH>        Write Markdown report directly to specified file\n\
-           --tmp-dir <PATH>       Override temporary storage directory (must support reflink)\n\
+           --tmp-dir <PATH>       Parent for the private run directory (must support reflink; it and its ancestors must be operator-controlled; only the run child is removed)\n\
            -h, --help             Show this help message\n"
     );
 }
@@ -300,22 +304,18 @@ impl MetricSamples {
         self.values.is_empty()
     }
 
-    #[allow(dead_code)]
     pub fn count(&self) -> usize {
         self.values.len()
     }
 
-    #[allow(dead_code)]
     pub fn min(&self) -> f64 {
         self.values.iter().copied().fold(f64::NAN, f64::min)
     }
 
-    #[allow(dead_code)]
     pub fn max(&self) -> f64 {
         self.values.iter().copied().fold(f64::NAN, f64::max)
     }
 
-    #[allow(dead_code)]
     pub fn mean(&self) -> f64 {
         if self.values.is_empty() {
             return 0.0;
@@ -349,92 +349,264 @@ pub fn percentile(values: &[f64], pct: f64) -> f64 {
     sorted[lower] * (1.0 - weight) + sorted[upper] * weight
 }
 
+/// README fork criterion: one clone ready in under this many milliseconds.
+const CLONE_BUDGET_MS: f64 = 500.0;
+const SNAPSHOT_BUDGET_MS: f64 = 1000.0;
+const FREEZE_BUDGET_MS: f64 = 1000.0;
+const SKEW_BUDGET_MS: f64 = 100.0;
+const PSS_BUDGET_MIB: f64 = 256.0;
+
+/// True when `samples` holds data and its p95 is under `limit`; missing data never passes.
+fn p95_under(samples: Option<&MetricSamples>, limit: f64) -> bool {
+    samples.is_some_and(|s| !s.is_empty() && s.p95() < limit)
+}
+
+fn go(ok: bool) -> &'static str {
+    if ok { "GO" } else { "NO-GO" }
+}
+
+fn pass(ok: bool) -> &'static str {
+    if ok { "PASS" } else { "FAIL" }
+}
+
+/// Median and p95 of `samples` divided by `divisor`, or "no data" when there are none.
+fn stat(
+    samples: Option<&MetricSamples>,
+    divisor: f64,
+    precision: usize,
+    unit: &str,
+) -> (String, String) {
+    match samples.filter(|s| !s.is_empty()) {
+        Some(s) => (
+            format!("{:.precision$} {unit}", s.median() / divisor),
+            format!("{:.precision$} {unit}", s.p95() / divisor),
+        ),
+        None => ("no data".into(), "no data".into()),
+    }
+}
+
+/// One line of the results table, shared by the console and Markdown renderers.
+pub struct Row {
+    pub label: String,
+    pub threshold: String,
+    pub median: String,
+    pub p95: String,
+    pub verdict: String,
+}
+
+impl Row {
+    fn new(label: &str, threshold: &str, (median, p95): (String, String), verdict: &str) -> Self {
+        Self {
+            label: label.into(),
+            threshold: threshold.into(),
+            median,
+            p95,
+            verdict: verdict.into(),
+        }
+    }
+}
+
 /// Aggregated benchmark results across all measurements.
 #[derive(Debug, Clone)]
 pub struct BenchResults {
     pub host: HostConfig,
     pub repetitions: usize,
     pub is_quick: bool,
+    /// Detected from the environment when the run starts, so rendering stays deterministic.
+    pub ci_runner: bool,
     pub cold_boot_ms: MetricSamples,
     pub freeze_duration_ms: MetricSamples,
     pub pause_skew_ms: MetricSamples,
     pub snapshot_duration_ms: MetricSamples,
-    /// Batch wall time from fork invocation through all clones ready.
+    /// End-to-end `Lab::fork_with` duration for the whole batch of clones.
     pub fork_wall_time_ms: BTreeMap<usize, MetricSamples>,
-    /// Amortized wall time per clone (batch wall time / clone count).
+    /// Batch duration divided by the clone count.
     pub fork_amortized_ms: BTreeMap<usize, MetricSamples>,
     /// Per-clone restore sub-interval from netns creation through fabric thaw.
     pub fork_restore_ms: BTreeMap<usize, MetricSamples>,
-    /// Per-clone Proportional Set Size (PSS) at rest, grouped by clone count.
+    /// Per-clone PSS after the settling condition ended, grouped by clone count.
     pub per_clone_pss_kib: BTreeMap<usize, MetricSamples>,
+    /// Clones per count whose PSS had not settled when the deadline expired.
+    pub pss_unsettled: BTreeMap<usize, usize>,
 }
 
 impl BenchResults {
     pub fn freeze_verdict(&self) -> &'static str {
-        if !self.freeze_duration_ms.is_empty() && self.freeze_duration_ms.p95() < 1000.0 {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        pass(p95_under(Some(&self.freeze_duration_ms), FREEZE_BUDGET_MS))
     }
 
     pub fn skew_verdict(&self) -> &'static str {
-        if !self.pause_skew_ms.is_empty() && self.pause_skew_ms.p95() < 100.0 {
-            "PASS"
-        } else {
-            "FAIL"
-        }
+        pass(p95_under(Some(&self.pause_skew_ms), SKEW_BUDGET_MS))
     }
 
     pub fn snapshot_verdict(&self) -> &'static str {
-        if !self.snapshot_duration_ms.is_empty() && self.snapshot_duration_ms.p95() < 1000.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
+        go(p95_under(
+            Some(&self.snapshot_duration_ms),
+            SNAPSHOT_BUDGET_MS,
+        ))
+    }
+
+    /// Every clone count that any fork or PSS measurement mentions.
+    pub fn fork_counts(&self) -> BTreeSet<usize> {
+        [
+            &self.fork_wall_time_ms,
+            &self.fork_amortized_ms,
+            &self.fork_restore_ms,
+            &self.per_clone_pss_kib,
+        ]
+        .into_iter()
+        .flat_map(|map| map.keys().copied())
+        .collect()
+    }
+
+    fn end_to_end_ok(&self, count: usize) -> bool {
+        p95_under(
+            self.fork_wall_time_ms.get(&count),
+            CLONE_BUDGET_MS * count as f64,
+        )
+    }
+
+    fn amortized_ok(&self, count: usize) -> bool {
+        p95_under(self.fork_amortized_ms.get(&count), CLONE_BUDGET_MS)
+    }
+
+    /// The README criterion is judged on the complete fork operation, never on the restore
+    /// sub-interval; the sub-interval only has to be present so the breakdown is complete.
+    fn fork_count_ok(&self, count: usize) -> bool {
+        self.end_to_end_ok(count)
+            && self.amortized_ok(count)
+            && self
+                .fork_restore_ms
+                .get(&count)
+                .is_some_and(|s| !s.is_empty())
     }
 
     pub fn fork_verdict(&self) -> &'static str {
-        if self.fork_restore_ms.is_empty() {
-            return "NO-GO";
-        }
-        for samples in self.fork_restore_ms.values() {
-            if samples.is_empty() || samples.p95() >= 500.0 {
-                return "NO-GO";
-            }
-        }
-        "GO"
+        let counts = self.fork_counts();
+        go(!counts.is_empty() && counts.iter().all(|&c| self.fork_count_ok(c)))
+    }
+
+    fn pss_count_ok(&self, count: usize) -> bool {
+        p95_under(self.per_clone_pss_kib.get(&count), PSS_BUDGET_MIB * 1024.0)
+            && self.pss_unsettled.get(&count).copied().unwrap_or(0) == 0
     }
 
     pub fn pss_verdict(&self) -> &'static str {
-        if self.per_clone_pss_kib.is_empty() {
-            return "FAIL";
-        }
-        for samples in self.per_clone_pss_kib.values() {
-            if samples.is_empty() || samples.p95() / 1024.0 >= 256.0 {
-                return "FAIL";
-            }
-        }
-        "PASS"
+        let counts = self.fork_counts();
+        pass(!counts.is_empty() && counts.iter().all(|&c| self.pss_count_ok(c)))
+    }
+
+    /// Names of the criteria that failed or have no measurement, in report order.
+    pub fn failing_criteria(&self) -> Vec<&'static str> {
+        [
+            ("snapshot", self.snapshot_verdict() == "GO"),
+            ("fork", self.fork_verdict() == "GO"),
+            ("freeze", self.freeze_verdict() == "PASS"),
+            ("pause skew", self.skew_verdict() == "PASS"),
+            ("PSS", self.pss_verdict() == "PASS"),
+        ]
+        .into_iter()
+        .filter_map(|(name, ok)| (!ok).then_some(name))
+        .collect()
     }
 
     pub fn overall_verdict(&self) -> String {
-        let is_snap_go = self.snapshot_verdict() == "GO";
-        let is_fork_go = self.fork_verdict() == "GO";
-        let is_freeze_pass = self.freeze_verdict() == "PASS";
-        let is_skew_pass = self.skew_verdict() == "PASS";
-        let is_pss_pass = self.pss_verdict() == "PASS";
-
-        if !is_snap_go || !is_fork_go || !is_freeze_pass || !is_skew_pass || !is_pss_pass {
-            if !is_snap_go && self.is_quick {
-                return String::from("NO-GO (CI indicative; snapshot exceeds threshold)");
-            }
-            return String::from("NO-GO");
+        let failing = self.failing_criteria();
+        if failing.is_empty() {
+            String::from(
+                "PENDING (measured criteria pass; awaiting LYZ-27 endurance suite and bare-metal reference run)",
+            )
+        } else {
+            format!("NO-GO (not met or not measured: {})", failing.join(", "))
         }
+    }
 
-        String::from(
-            "PENDING (measured criteria pass; awaiting LYZ-27 endurance suite and bare-metal reference run)",
-        )
+    /// True for a full run outside CI, the only run the README reference numbers can come from.
+    pub fn is_reference_run(&self) -> bool {
+        !self.is_quick && !self.ci_runner
+    }
+
+    pub fn mode_label(&self) -> &'static str {
+        match (self.is_quick, self.ci_runner) {
+            (true, true) => "CI runner, quick run (indicative)",
+            (true, false) => "non-CI host, quick run (indicative)",
+            (false, true) => "CI runner, full run",
+            (false, false) => "non-CI host, full run (reference)",
+        }
+    }
+
+    fn pss_count_verdict(&self, count: usize) -> String {
+        let unsettled = self.pss_unsettled.get(&count).copied().unwrap_or(0);
+        if unsettled > 0 {
+            format!("FAIL ({unsettled} unsettled)")
+        } else {
+            pass(self.pss_count_ok(count)).into()
+        }
+    }
+
+    /// All measurement lines with their thresholds and verdicts.
+    pub fn rows(&self) -> Vec<Row> {
+        let mut rows = vec![
+            Row::new(
+                "Cold boot (5 VMs)",
+                "baseline",
+                stat(Some(&self.cold_boot_ms), 1.0, 1, "ms"),
+                "INFO",
+            ),
+            Row::new(
+                "Fabric freeze duration",
+                "< 1000 ms",
+                stat(Some(&self.freeze_duration_ms), 1.0, 1, "ms"),
+                self.freeze_verdict(),
+            ),
+            Row::new(
+                "Pause confirmation skew",
+                "< 100 ms",
+                stat(Some(&self.pause_skew_ms), 1.0, 3, "ms"),
+                self.skew_verdict(),
+            ),
+            Row::new(
+                "Total snapshot (5 VMs)",
+                "< 1000 ms",
+                stat(Some(&self.snapshot_duration_ms), 1.0, 1, "ms"),
+                self.snapshot_verdict(),
+            ),
+        ];
+        for count in self.fork_counts() {
+            let budget = CLONE_BUDGET_MS * count as f64;
+            rows.push(Row::new(
+                &format!("Fork end-to-end (n={count})"),
+                &format!("< {budget:.0} ms"),
+                stat(self.fork_wall_time_ms.get(&count), 1.0, 1, "ms"),
+                go(self.end_to_end_ok(count)),
+            ));
+            rows.push(Row::new(
+                &format!("Fork amortized per clone (n={count})"),
+                &format!("< {CLONE_BUDGET_MS:.0} ms/clone"),
+                stat(self.fork_amortized_ms.get(&count), 1.0, 1, "ms"),
+                go(self.amortized_ok(count)),
+            ));
+            let restore = self.fork_restore_ms.get(&count);
+            rows.push(Row::new(
+                &format!("Restore sub-interval, netns to thaw (n={count})"),
+                "informational",
+                stat(restore, 1.0, 1, "ms"),
+                if restore.is_some_and(|s| !s.is_empty()) {
+                    "INFO"
+                } else {
+                    "NO DATA"
+                },
+            ));
+        }
+        for count in self.fork_counts() {
+            rows.push(Row::new(
+                &format!("Per-clone PSS after settling (n={count})"),
+                "< 256 MiB",
+                stat(self.per_clone_pss_kib.get(&count), 1024.0, 1, "MiB"),
+                &self.pss_count_verdict(count),
+            ));
+        }
+        rows
     }
 }
 
@@ -529,74 +701,54 @@ fn check_prerequisites() -> anyhow::Result<Prerequisites> {
     })
 }
 
-/// Prepares a safe private run directory inside `parent_dir`.
+/// Creates an exclusive run directory with mode 0700 inside `parent_dir`.
 ///
-/// Ensures the parent directory exists, is not a symlink, is a real directory,
-/// and creates an exclusive private run directory child within it.
-/// Never removes or modifies the parent directory or any existing contents.
-pub(crate) fn setup_private_bench_dir(parent_dir: &Path) -> anyhow::Result<PathBuf> {
-    if parent_dir.exists() {
-        let meta = fs::symlink_metadata(parent_dir).with_context(|| {
-            format!(
-                "cannot read metadata for parent directory {}",
-                parent_dir.display()
-            )
-        })?;
-        if meta.file_type().is_symlink() {
-            bail!(
-                "temporary parent directory '{}' is a symlink; refusing to proceed",
-                parent_dir.display()
-            );
-        }
-        if !meta.is_dir() {
-            bail!(
-                "temporary parent '{}' is not a directory",
-                parent_dir.display()
-            );
-        }
-    } else {
-        fs::create_dir_all(parent_dir)
-            .with_context(|| format!("cannot create parent directory {}", parent_dir.display()))?;
-        let meta = fs::symlink_metadata(parent_dir).with_context(|| {
-            format!(
-                "cannot read metadata for newly created parent directory {}",
-                parent_dir.display()
-            )
-        })?;
-        if meta.file_type().is_symlink() || !meta.is_dir() {
-            bail!("parent directory '{}' is invalid", parent_dir.display());
-        }
+/// `parent_dir` and all of its ancestors must be controlled by the operator running the
+/// benchmark: only the final component is checked for symlinks, so a hostile ancestor
+/// could still redirect the run. Never removes or modifies the parent or its contents.
+pub fn setup_private_bench_dir(parent_dir: &Path) -> anyhow::Result<PathBuf> {
+    fs::create_dir_all(parent_dir)
+        .with_context(|| format!("cannot create parent directory {}", parent_dir.display()))?;
+    let meta = fs::symlink_metadata(parent_dir).with_context(|| {
+        format!(
+            "cannot read metadata for parent directory {}",
+            parent_dir.display()
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        bail!(
+            "temporary parent directory '{}' is a symlink; refusing to proceed",
+            parent_dir.display()
+        );
+    }
+    if !meta.is_dir() {
+        bail!(
+            "temporary parent '{}' is not a directory",
+            parent_dir.display()
+        );
     }
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| (d.as_millis() % 1_000_000) as u64);
-    let run_name = format!("r{}-{}", std::process::id(), timestamp);
-    let run_dir = parent_dir.join(run_name);
+    // Kept short: the VM control socket paths below it must fit in sockaddr_un (108 bytes).
+    let run_dir = parent_dir.join(format!("r{}-{}", std::process::id(), timestamp));
 
-    fs::create_dir(&run_dir).with_context(|| {
-        format!(
-            "cannot create exclusive run directory {}",
-            run_dir.display()
-        )
-    })?;
-
-    let meta = fs::symlink_metadata(&run_dir).with_context(|| {
-        format!(
-            "cannot read metadata for run directory {}",
-            run_dir.display()
-        )
-    })?;
-    if meta.file_type().is_symlink() {
-        bail!("created run directory '{}' is a symlink", run_dir.display());
-    }
-
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&run_dir)
+        .with_context(|| {
+            format!(
+                "cannot create exclusive run directory {}",
+                run_dir.display()
+            )
+        })?;
     Ok(run_dir)
 }
 
-/// Safely removes an exclusive private run directory created by `setup_private_bench_dir`.
+/// Removes a run directory created by [`setup_private_bench_dir`].
 /// Refuses to remove symlinks and propagates any removal error.
-pub(crate) fn cleanup_private_bench_dir(bench_dir: &Path) -> anyhow::Result<()> {
+pub fn cleanup_private_bench_dir(bench_dir: &Path) -> anyhow::Result<()> {
     if bench_dir.exists() {
         let meta = fs::symlink_metadata(bench_dir).with_context(|| {
             format!(
@@ -616,28 +768,365 @@ pub(crate) fn cleanup_private_bench_dir(bench_dir: &Path) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Executes the full benchmark suite.
-pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResults> {
-    let prereqs = check_prerequisites()?;
-    let workspace = &prereqs.workspace;
+/// Result of the measurement phases.
+///
+/// The execution result and the teardown failures are kept apart: a measurement error says
+/// nothing about leftover host resources, and only a clean teardown makes it safe to
+/// delete the files backing them.
+pub struct PhaseOutcome<T> {
+    pub result: anyhow::Result<T>,
+    pub teardown_failures: Vec<anyhow::Error>,
+}
 
-    // Temporary bench storage directory (on reflink filesystem)
-    let parent_dir = options
-        .tmp_dir
-        .clone()
-        .unwrap_or_else(|| workspace.join("target/b"));
-
-    let parent_dir_setup = parent_dir.clone();
-    let bench_dir = tokio::task::spawn_blocking(move || setup_private_bench_dir(&parent_dir_setup))
+/// Runs `phases` inside a fresh private directory below `parent_dir`, then disposes of it.
+///
+/// - Clean teardown: the directory (snapshots, disks) is removed whether or not a
+///   measurement failed.
+/// - Any teardown failure: the directory is kept because VMs, mounts or namespaces may
+///   still use it, and every failure is reported.
+///
+/// Anything that fails inside `phases` (host detection, subdirectory creation, ...) is an
+/// execution error and goes through the same cleanup.
+pub async fn run_in_private_dir<T, F, Fut>(parent_dir: &Path, phases: F) -> anyhow::Result<T>
+where
+    F: FnOnce(PathBuf) -> Fut,
+    Fut: Future<Output = PhaseOutcome<T>>,
+{
+    let parent = parent_dir.to_owned();
+    let run_dir = tokio::task::spawn_blocking(move || setup_private_bench_dir(&parent))
         .await
         .context("directory setup task panicked")??;
 
-    let fc_bin = prereqs.fc_bin.clone();
-    let bench_dir_detect = bench_dir.clone();
-    let host = tokio::task::spawn_blocking(move || HostConfig::detect(&fc_bin, &bench_dir_detect))
-        .await
-        .context("host detection task panicked")??;
+    let PhaseOutcome {
+        result,
+        teardown_failures,
+    } = phases(run_dir.clone()).await;
 
+    if !teardown_failures.is_empty() {
+        let failures = teardown_failures
+            .iter()
+            .map(|e| format!("{e:#}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let run = result.err().map_or_else(
+            || String::from("measurements completed"),
+            |e| format!("{e:#}"),
+        );
+        bail!(
+            "{run}; teardown failed, host resources may remain and {} was preserved for recovery: {failures}",
+            run_dir.display()
+        );
+    }
+
+    let dir = run_dir.clone();
+    let cleanup = tokio::task::spawn_blocking(move || cleanup_private_bench_dir(&dir))
+        .await
+        .context("cleanup task panicked")?;
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(err), Ok(())) => Err(err),
+        (Err(err), Err(cleanup)) => {
+            Err(err.context(format!("run directory cleanup also failed: {cleanup:#}")))
+        }
+    }
+}
+
+/// Settling condition for a PSS reading: two consecutive reads `poll` apart differ by at most
+/// `max_delta_kib`. This observes stability of the reading, not guest quiescence.
+#[derive(Debug, Clone, Copy)]
+pub struct SettleParams {
+    pub poll: Duration,
+    pub max_delta_kib: u64,
+    pub timeout: Duration,
+}
+
+pub const PSS_SETTLE: SettleParams = SettleParams {
+    poll: Duration::from_millis(250),
+    max_delta_kib: 1024,
+    timeout: Duration::from_secs(10),
+};
+
+/// A PSS reading and whether it met the settling condition before the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PssReading {
+    pub kib: u64,
+    pub settled: bool,
+}
+
+/// Polls `read` until two consecutive values are within `params.max_delta_kib`, or until
+/// `params.timeout`, in which case the last value is returned with `settled == false`.
+pub async fn settle_pss<F, Fut>(mut read: F, params: SettleParams) -> anyhow::Result<PssReading>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<u64>>,
+{
+    let deadline = Instant::now() + params.timeout;
+    let mut previous = read().await?;
+    loop {
+        if Instant::now() >= deadline {
+            return Ok(PssReading {
+                kib: previous,
+                settled: false,
+            });
+        }
+        tokio::time::sleep(params.poll).await;
+        let current = read().await?;
+        if current.abs_diff(previous) <= params.max_delta_kib {
+            return Ok(PssReading {
+                kib: current,
+                settled: true,
+            });
+        }
+        previous = current;
+    }
+}
+
+struct CloneReading {
+    restore_ms: f64,
+    pss: PssReading,
+}
+
+async fn measure_clones(clones: &[Lab]) -> anyhow::Result<Vec<CloneReading>> {
+    join_all(clones.iter().map(|clone| async move {
+        let restore = clone
+            .restore_latency()
+            .with_context(|| format!("missing restore latency on clone {}", clone.id()))?;
+        let pss = settle_pss(
+            || async move { clone.total_pss_kib().await.map_err(anyhow::Error::from) },
+            PSS_SETTLE,
+        )
+        .await
+        .with_context(|| format!("failed to measure PSS for clone {}", clone.id()))?;
+        Ok::<_, anyhow::Error>(CloneReading {
+            restore_ms: restore.as_secs_f64() * 1000.0,
+            pss,
+        })
+    }))
+    .await
+    .into_iter()
+    .collect()
+}
+
+/// Tears every clone down and returns all failures, each tagged with its clone id.
+async fn teardown_clones(clones: &mut [Lab]) -> Vec<anyhow::Error> {
+    join_all(clones.iter_mut().map(|clone| async move {
+        let id = clone.id().to_owned();
+        clone
+            .teardown()
+            .await
+            .map_err(|e| anyhow::Error::from(e).context(format!("clone {id} teardown failed")))
+    }))
+    .await
+    .into_iter()
+    .filter_map(Result::err)
+    .collect()
+}
+
+#[derive(Default)]
+struct ForkMetrics {
+    wall: BTreeMap<usize, MetricSamples>,
+    amortized: BTreeMap<usize, MetricSamples>,
+    restore: BTreeMap<usize, MetricSamples>,
+    pss: BTreeMap<usize, MetricSamples>,
+    pss_unsettled: BTreeMap<usize, usize>,
+}
+
+struct SnapshotMetrics {
+    freeze: MetricSamples,
+    skew: MetricSamples,
+    total: MetricSamples,
+}
+
+struct Bench<'a> {
+    options: &'a BenchOptions,
+    prereqs: &'a Prerequisites,
+    lab_config: LabConfig,
+}
+
+impl Bench<'_> {
+    async fn cold_boot(&self, failures: &mut Vec<anyhow::Error>) -> anyhow::Result<MetricSamples> {
+        println!("--- [1/3] Benchmarking Cold Boot Time (5 VMs, 256 MiB each) ---");
+        let mut cold_boot_ms = MetricSamples::new();
+        for rep in 1..=self.options.repetitions {
+            let start = Instant::now();
+            let mut lab = Lab::up_with(
+                &self.lab_config,
+                &self.prereqs.spec,
+                &format!("b-boot-{rep}"),
+            )
+            .await
+            .with_context(|| format!("cold boot failed on repetition {rep}"))?;
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            cold_boot_ms.add(ms);
+            println!(
+                "  Repetition {rep:>2}/{}: cold boot ready in {ms:>7.1} ms",
+                self.options.repetitions
+            );
+            if let Err(e) = lab.teardown().await {
+                failures.push(
+                    anyhow::Error::from(e)
+                        .context(format!("cold boot repetition {rep} teardown failed")),
+                );
+                bail!("cold boot teardown failed on repetition {rep}");
+            }
+        }
+        println!(
+            "Cold boot summary: median = {:.1} ms, p95 = {:.1} ms\n",
+            cold_boot_ms.median(),
+            cold_boot_ms.p95()
+        );
+        Ok(cold_boot_ms)
+    }
+
+    /// Takes the snapshots; returns the metrics and the directory of the last snapshot.
+    async fn snapshots(&self, source: &mut Lab) -> anyhow::Result<(SnapshotMetrics, PathBuf)> {
+        println!(
+            "--- [2/3] Benchmarking Snapshot Timings (Freeze, Pause Skew, Total Duration) ---"
+        );
+        let mut metrics = SnapshotMetrics {
+            freeze: MetricSamples::new(),
+            skew: MetricSamples::new(),
+            total: MetricSamples::new(),
+        };
+        let mut last_snapshot_dir: Option<PathBuf> = None;
+        for rep in 1..=self.options.repetitions {
+            // Only the last snapshot is forked from; drop the previous one outside the
+            // measured interval so a full run does not exhaust the filesystem.
+            if let Some(prev_dir) = last_snapshot_dir.take() {
+                let prev = prev_dir.clone();
+                tokio::task::spawn_blocking(move || fs::remove_dir_all(&prev))
+                    .await
+                    .context("snapshot cleanup task panicked")?
+                    .with_context(|| {
+                        format!("cannot remove intermediate snapshot {}", prev_dir.display())
+                    })?;
+            }
+
+            let snap_id = format!("snap-{rep}");
+            let (_manifest, timings) = source
+                .snapshot_with_timings(&snap_id)
+                .await
+                .with_context(|| format!("snapshot failed on repetition {rep}"))?;
+            let freeze = timings.freeze_ms as f64;
+            let skew = timings.pause_skew_us as f64 / 1000.0;
+            let total = timings.total_ms as f64;
+            metrics.freeze.add(freeze);
+            metrics.skew.add(skew);
+            metrics.total.add(total);
+            println!(
+                "  Repetition {rep:>2}/{}: freeze = {freeze:>5.1} ms, pause skew = {skew:>5.3} ms, total snapshot = {total:>6.1} ms",
+                self.options.repetitions
+            );
+            last_snapshot_dir = Some(self.lab_config.store.snapshot_dir("b-src", &snap_id));
+        }
+        println!(
+            "Snapshot summary: freeze median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms), total median = {:.1} ms (p95: {:.1} ms)\n",
+            metrics.freeze.median(),
+            metrics.freeze.p95(),
+            metrics.skew.median(),
+            metrics.skew.p95(),
+            metrics.total.median(),
+            metrics.total.p95()
+        );
+        let dir = last_snapshot_dir.context("missing snapshot for fork benchmarks")?;
+        Ok((metrics, dir))
+    }
+
+    async fn forks(
+        &self,
+        snapshot_dir: &Path,
+        failures: &mut Vec<anyhow::Error>,
+    ) -> anyhow::Result<ForkMetrics> {
+        println!("--- [3/3] Benchmarking Parallel Fork Latency and PSS ---");
+        let mut metrics = ForkMetrics::default();
+        for &count in &self.options.fork_counts {
+            println!(
+                "  Benchmarking fork -n {count} (parallel restoration into {count} independent labs)..."
+            );
+            let mut wall = MetricSamples::new();
+            let mut amortized = MetricSamples::new();
+            let mut restore = MetricSamples::new();
+            let mut pss = MetricSamples::new();
+            let mut unsettled = 0;
+
+            for rep in 1..=self.options.repetitions {
+                let clone_ids = Lab::generate_clone_ids(&format!("f-n{count}-r{rep}"), count)
+                    .with_context(|| format!("could not generate {count} clone ids"))?;
+
+                let fork_start = Instant::now();
+                let mut clones = Lab::fork_with(&self.lab_config, snapshot_dir, &clone_ids)
+                    .await
+                    .with_context(|| format!("fork failed for n={count} on repetition {rep}"))?;
+                let wall_ms = fork_start.elapsed().as_secs_f64() * 1000.0;
+                wall.add(wall_ms);
+                amortized.add(wall_ms / count as f64);
+
+                let readings = measure_clones(&clones).await;
+                let teardown_failures = teardown_clones(&mut clones).await;
+                let torn_down = teardown_failures.is_empty();
+                failures.extend(teardown_failures);
+                let readings = readings?;
+                if !torn_down {
+                    bail!("clone teardown failed for n={count} on repetition {rep}");
+                }
+
+                for reading in readings {
+                    restore.add(reading.restore_ms);
+                    pss.add(reading.pss.kib as f64);
+                    unsettled += usize::from(!reading.pss.settled);
+                }
+                println!(
+                    "    n={count:>2} rep {rep:>2}/{}: end-to-end = {wall_ms:>6.1} ms ({:>5.1} ms/clone amortized), median clone restore (netns to thaw) = {:>5.1} ms",
+                    self.options.repetitions,
+                    wall_ms / count as f64,
+                    restore.median()
+                );
+            }
+
+            println!(
+                "  Fork -n {count} summary: end-to-end p95 = {:.1} ms, amortized p95 = {:.1} ms/clone, restore (netns to thaw) median = {:.1} ms (p95: {:.1} ms), PSS unsettled clones = {unsettled}",
+                wall.p95(),
+                amortized.p95(),
+                restore.median(),
+                restore.p95()
+            );
+            metrics.wall.insert(count, wall);
+            metrics.amortized.insert(count, amortized);
+            metrics.restore.insert(count, restore);
+            metrics.pss.insert(count, pss);
+            metrics.pss_unsettled.insert(count, unsettled);
+        }
+        Ok(metrics)
+    }
+
+    /// Runs the snapshot and fork phases against one source lab. The lab is always torn
+    /// down; a teardown failure is recorded in `failures` rather than the returned result.
+    async fn snapshot_and_forks(
+        &self,
+        failures: &mut Vec<anyhow::Error>,
+    ) -> anyhow::Result<(SnapshotMetrics, ForkMetrics)> {
+        let mut source = Lab::up_with(&self.lab_config, &self.prereqs.spec, "b-src")
+            .await
+            .context("failed to start source lab for snapshot benchmarking")?;
+        let result = async {
+            let (snapshot, snapshot_dir) = self.snapshots(&mut source).await?;
+            // Keep the source quiet so it does not consume CPU during fork measurements.
+            dylos_runtime::pause_all(&mut source)
+                .await
+                .context("could not pause source lab VMs")?;
+            let forks = self.forks(&snapshot_dir, failures).await?;
+            Ok((snapshot, forks))
+        }
+        .await;
+        if let Err(e) = source.teardown().await {
+            failures.push(anyhow::Error::from(e).context("source lab teardown failed"));
+        }
+        result
+    }
+}
+
+fn print_header(host: &HostConfig, options: &BenchOptions) {
     println!("================================================================================");
     println!("DYLOS TECHNICAL SPIKE BENCHMARK SUITE");
     println!("================================================================================");
@@ -659,25 +1148,48 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
     println!(
         "Mode:                  {} (repetitions: {}, fork counts: {:?})",
         if options.quick {
-            "QUICK (CI reduced)"
+            "QUICK (reduced, indicative)"
         } else {
-            "FULL (bare-metal reference)"
+            "FULL"
         },
         options.repetitions,
         options.fork_counts
     );
     println!("================================================================================\n");
+}
 
-    let jail_dir = bench_dir.join("j");
-    let store_dir = bench_dir.join("s");
-    let netns_dir = bench_dir.join("n");
-    let j_dir = jail_dir.clone();
-    let s_dir = store_dir.clone();
-    let n_dir = netns_dir.clone();
+async fn measure(
+    options: &BenchOptions,
+    prereqs: &Prerequisites,
+    run_dir: PathBuf,
+) -> PhaseOutcome<BenchResults> {
+    let mut teardown_failures = Vec::new();
+    let result = measure_into(options, prereqs, &run_dir, &mut teardown_failures).await;
+    PhaseOutcome {
+        result,
+        teardown_failures,
+    }
+}
+
+async fn measure_into(
+    options: &BenchOptions,
+    prereqs: &Prerequisites,
+    run_dir: &Path,
+    failures: &mut Vec<anyhow::Error>,
+) -> anyhow::Result<BenchResults> {
+    let fc_bin = prereqs.fc_bin.clone();
+    let detect_dir = run_dir.to_owned();
+    let host = tokio::task::spawn_blocking(move || HostConfig::detect(&fc_bin, &detect_dir))
+        .await
+        .context("host detection task panicked")??;
+    print_header(&host, options);
+
+    let [jail_dir, store_dir, netns_dir] = ["j", "s", "n"].map(|name| run_dir.join(name));
+    let dirs = [jail_dir.clone(), store_dir.clone(), netns_dir.clone()];
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        fs::create_dir_all(&j_dir)?;
-        fs::create_dir_all(&s_dir)?;
-        fs::create_dir_all(&n_dir)?;
+        for dir in dirs {
+            fs::create_dir_all(&dir).with_context(|| format!("cannot create {}", dir.display()))?;
+        }
         Ok(())
     })
     .await
@@ -686,307 +1198,70 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
     let mut jailer = JailerConfig::new(jail_dir, NOBODY_UID_GID, NOBODY_UID_GID);
     jailer.jailer = prereqs.jailer_bin.clone();
     jailer.firecracker = prereqs.fc_bin.clone();
-
     let lab_config = LabConfig {
         store: dylos_store::Store {
-            base: store_dir.clone(),
+            base: store_dir,
             image: prereqs.rootfs.clone(),
         },
         jailer,
         kernel: prereqs.kernel.clone(),
-        netns_dir: netns_dir.clone(),
+        netns_dir,
         boot_timeout: Duration::from_secs(45),
         ..LabConfig::default()
     };
+    let bench = Bench {
+        options,
+        prereqs,
+        lab_config,
+    };
 
-    // We run the benchmark phases inside an inner async block so that we can ensure
-    // all resources are torn down and backing directories handled correctly on any exit.
-    let run_phases = async {
-        // 1. Cold Boot Time
-        println!("--- [1/3] Benchmarking Cold Boot Time (5 VMs, 256 MiB each) ---");
-        let mut cold_boot_ms = MetricSamples::new();
-        for rep in 1..=options.repetitions {
-            let lab_id = format!("b-boot-{rep}");
-            let start = Instant::now();
-            let mut lab = Lab::up_with(&lab_config, &prereqs.spec, &lab_id)
-                .await
-                .with_context(|| format!("cold boot failed on repetition {rep}"))?;
-            let duration = start.elapsed();
-            let ms = duration.as_secs_f64() * 1000.0;
-            cold_boot_ms.add(ms);
-            println!(
-                "  Repetition {rep:>2}/{}: cold boot ready in {ms:>7.1} ms",
-                options.repetitions
-            );
-            lab.teardown().await.context("cold boot teardown failed")?;
-        }
-        println!(
-            "Cold boot summary: median = {:.1} ms, p95 = {:.1} ms\n",
-            cold_boot_ms.median(),
-            cold_boot_ms.p95()
-        );
+    let cold_boot_ms = bench.cold_boot(failures).await?;
+    let (snapshot, forks) = bench.snapshot_and_forks(failures).await?;
 
-        // 2. Snapshot Measurements (Freeze duration, Pause skew, Total snapshot duration)
-        println!("--- [2/3] Benchmarking Snapshot Timings (Freeze, Pause Skew, Total Duration) ---");
-        let source_lab_id = "b-src";
-        let mut source_lab = Lab::up_with(&lab_config, &prereqs.spec, source_lab_id)
-            .await
-            .context("failed to start source lab for snapshot benchmarking")?;
+    Ok(BenchResults {
+        host,
+        repetitions: options.repetitions,
+        is_quick: options.quick,
+        ci_runner: std::env::var_os("GITHUB_ACTIONS").is_some() || std::env::var_os("CI").is_some(),
+        cold_boot_ms,
+        freeze_duration_ms: snapshot.freeze,
+        pause_skew_ms: snapshot.skew,
+        snapshot_duration_ms: snapshot.total,
+        fork_wall_time_ms: forks.wall,
+        fork_amortized_ms: forks.amortized,
+        fork_restore_ms: forks.restore,
+        per_clone_pss_kib: forks.pss,
+        pss_unsettled: forks.pss_unsettled,
+    })
+}
 
-        let mut freeze_duration_ms = MetricSamples::new();
-        let mut pause_skew_ms = MetricSamples::new();
-        let mut snapshot_duration_ms = MetricSamples::new();
-        let mut last_snapshot_dir: Option<PathBuf> = None;
+/// Executes the full benchmark suite.
+pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResults> {
+    let prereqs = check_prerequisites()?;
+    let parent_dir = options
+        .tmp_dir
+        .clone()
+        .unwrap_or_else(|| prereqs.workspace.join("target/b"));
 
-        // Perform snapshot and fork measurements with guaranteed teardown of source_lab
-        let snapshot_and_fork_res = async {
-            for rep in 1..=options.repetitions {
-                // Remove previous snapshot outside the measurement interval to avoid disk bloat (mitigating 25 GiB usage)
-                if let Some(prev_dir) = last_snapshot_dir.take() {
-                    let prev_dir_clone = prev_dir.clone();
-                    tokio::task::spawn_blocking(move || {
-                        if prev_dir_clone.exists() {
-                            fs::remove_dir_all(&prev_dir_clone)?;
-                        }
-                        Ok::<(), std::io::Error>(())
-                    })
-                    .await
-                    .context("snapshot cleanup task panicked")?
-                    .with_context(|| {
-                        format!("cannot remove intermediate snapshot {}", prev_dir.display())
-                    })?;
-                }
+    let results =
+        run_in_private_dir(&parent_dir, |run_dir| measure(&options, &prereqs, run_dir)).await?;
 
-                let snap_id = format!("snap-{rep}");
-                let (manifest, timings) = source_lab
-                    .snapshot_with_timings(&snap_id)
-                    .await
-                    .with_context(|| format!("snapshot failed on repetition {rep}"))?;
-
-                let freeze = timings.freeze_ms as f64;
-                let skew = timings.pause_skew_us as f64 / 1000.0;
-                let total = timings.total_ms as f64;
-
-                freeze_duration_ms.add(freeze);
-                pause_skew_ms.add(skew);
-                snapshot_duration_ms.add(total);
-
-                println!(
-                    "  Repetition {rep:>2}/{}: freeze = {:>5.1} ms, pause skew = {:>5.3} ms, total snapshot = {:>6.1} ms",
-                    options.repetitions, freeze, skew, total
-                );
-
-                last_snapshot_dir = Some(lab_config.store.snapshot_dir(source_lab_id, &snap_id));
-                let _ = manifest;
+    print_results_table(&results);
+    if let Some(out_path) = options.output_path.clone() {
+        let markdown = render_markdown_report(&results);
+        let written = out_path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if let Some(parent) = written.parent() {
+                fs::create_dir_all(parent)?;
             }
-
-            println!(
-                "Snapshot summary: freeze median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms), total median = {:.1} ms (p95: {:.1} ms)\n",
-                freeze_duration_ms.median(),
-                freeze_duration_ms.p95(),
-                pause_skew_ms.median(),
-                pause_skew_ms.p95(),
-                snapshot_duration_ms.median(),
-                snapshot_duration_ms.p95()
-            );
-
-            // Pause source lab VMs to prevent any CPU consumption during fork measurements
-            dylos_runtime::pause_all(&mut source_lab)
-                .await
-                .context("could not pause source lab VMs")?;
-
-            let snapshot_dir = last_snapshot_dir.context("missing snapshot for fork benchmarks")?;
-
-            // 3. Parallel Clone Fork Latencies and Per-Clone PSS
-            println!("--- [3/3] Benchmarking Parallel Fork Latency and PSS at Rest ---");
-            let mut fork_wall_time_ms = BTreeMap::new();
-            let mut fork_amortized_ms = BTreeMap::new();
-            let mut fork_restore_ms = BTreeMap::new();
-            let mut per_clone_pss_kib = BTreeMap::new();
-
-            for &count in &options.fork_counts {
-                println!(
-                    "  Benchmarking fork -n {count} (parallel restoration into {count} independent labs)..."
-                );
-                let mut count_wall = MetricSamples::new();
-                let mut count_amortized = MetricSamples::new();
-                let mut count_restore = MetricSamples::new();
-                let mut count_pss = MetricSamples::new();
-
-                for rep in 1..=options.repetitions {
-                    let prefix = format!("f-n{count}-r{rep}");
-                    let clone_ids = Lab::generate_clone_ids(&prefix, count)
-                        .with_context(|| format!("could not generate {count} clone ids"))?;
-
-                    let fork_start = Instant::now();
-                    let mut clones = Lab::fork_with(&lab_config, &snapshot_dir, &clone_ids)
-                        .await
-                        .with_context(|| format!("fork failed for n={count} on repetition {rep}"))?;
-                    let fork_wall = fork_start.elapsed();
-                    let fork_wall_ms = fork_wall.as_secs_f64() * 1000.0;
-                    count_wall.add(fork_wall_ms);
-                    count_amortized.add(fork_wall_ms / count as f64);
-
-                    // Allow bounded stabilization window (50 ms) after network thaw so initial
-                    // guest initialization settles before measuring quiescent PSS at rest.
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-
-                    // Collect metrics from clones; ensure teardown happens even if collection fails!
-                    let measure_clones_result = async {
-                        for clone in &clones {
-                            let latency = clone.restore_latency().ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "missing restore latency on clone {}",
-                                    clone.id()
-                                )
-                            })?;
-                            count_restore.add(latency.as_secs_f64() * 1000.0);
-
-                            let pss_kib = clone.total_pss_kib().await.with_context(|| {
-                                format!("failed to measure PSS for clone {}", clone.id())
-                            })?;
-                            count_pss.add(pss_kib as f64);
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    }
-                    .await;
-
-                    // ALWAYS await clone teardowns
-                    let teardown_results = join_all(clones.iter_mut().map(Lab::teardown)).await;
-                    let mut teardown_err = None;
-                    for res in teardown_results {
-                        if let Err(e) = res
-                            && teardown_err.is_none()
-                        {
-                            teardown_err = Some(e);
-                        }
-                    }
-
-                    if let Err(err) = measure_clones_result {
-                        if let Some(te) = teardown_err {
-                            bail!(
-                                "clone measurement failed: {err:#}; clone teardown also failed: {te:#}"
-                            );
-                        }
-                        return Err(err);
-                    }
-                    if let Some(te) = teardown_err {
-                        return Err(anyhow::Error::from(te).context("clone teardown failed"));
-                    }
-
-                    println!(
-                        "    n={count:>2} rep {rep:>2}/{}: batch wall time = {:>6.1} ms ({:>5.1} ms/clone amortized), median clone restore (netns to thaw) = {:>5.1} ms",
-                        options.repetitions,
-                        fork_wall_ms,
-                        fork_wall_ms / count as f64,
-                        count_restore.median()
-                    );
-                }
-
-                println!(
-                    "  Fork -n {count} summary: wall time p95 = {:.1} ms, amortized p95 = {:.1} ms/clone, restore (netns to thaw) median = {:.1} ms (p95: {:.1} ms)",
-                    count_wall.p95(),
-                    count_amortized.p95(),
-                    count_restore.median(),
-                    count_restore.p95()
-                );
-                fork_wall_time_ms.insert(count, count_wall);
-                fork_amortized_ms.insert(count, count_amortized);
-                fork_restore_ms.insert(count, count_restore);
-                per_clone_pss_kib.insert(count, count_pss);
-            }
-
-            Ok((
-                freeze_duration_ms,
-                pause_skew_ms,
-                snapshot_duration_ms,
-                fork_wall_time_ms,
-                fork_amortized_ms,
-                fork_restore_ms,
-                per_clone_pss_kib,
-            ))
-        }
-        .await;
-
-        // ALWAYS await source_lab teardown
-        let source_teardown_res = source_lab
-            .teardown()
-            .await
-            .context("source lab teardown failed");
-
-        let (
-            freeze_duration_ms,
-            pause_skew_ms,
-            snapshot_duration_ms,
-            fork_wall_time_ms,
-            fork_amortized_ms,
-            fork_restore_ms,
-            per_clone_pss_kib,
-        ) = match (snapshot_and_fork_res, source_teardown_res) {
-            (Ok(metrics), Ok(())) => metrics,
-            (Err(err), Ok(())) => return Err(err),
-            (Ok(_), Err(te)) => return Err(te),
-            (Err(err), Err(te)) => {
-                bail!("benchmarks failed: {err:#}; source lab teardown also failed: {te:#}")
-            }
-        };
-
-        Ok(BenchResults {
-            host,
-            repetitions: options.repetitions,
-            is_quick: options.quick,
-            cold_boot_ms,
-            freeze_duration_ms,
-            pause_skew_ms,
-            snapshot_duration_ms,
-            fork_wall_time_ms,
-            fork_amortized_ms,
-            fork_restore_ms,
-            per_clone_pss_kib,
+            fs::write(&written, markdown)
+                .with_context(|| format!("cannot write report to {}", written.display()))
         })
+        .await
+        .context("report write task panicked")??;
+        println!("\nBenchmark report written to {}", out_path.display());
     }
-    .await;
-
-    // Do not delete resource backing directories until all teardown succeeds.
-    // If run_phases succeeded (meaning all labs cleanly tore down), remove bench_dir.
-    match run_phases {
-        Ok(results) => {
-            let bench_dir_clean = bench_dir.clone();
-            tokio::task::spawn_blocking(move || cleanup_private_bench_dir(&bench_dir_clean))
-                .await
-                .context("cleanup task panicked")??;
-
-            print_results_table(&results);
-
-            if let Some(out_path) = &options.output_path {
-                let markdown = render_markdown_report(&results);
-                let out_clone = out_path.clone();
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                    if let Some(parent) = out_clone.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::write(&out_clone, markdown).with_context(|| {
-                        format!("cannot write report to {}", out_clone.display())
-                    })?;
-                    Ok(())
-                })
-                .await
-                .context("report write task panicked")??;
-                println!("\nBenchmark report written to {}", out_path.display());
-            }
-
-            Ok(results)
-        }
-        Err(err) => {
-            // Teardown or execution failed. Leave directory for forensic inspection or manual recovery,
-            // never delete while processes or mounts might still be attached.
-            eprintln!(
-                "Benchmark run failed; preserving private directory for inspection: {}",
-                bench_dir.display()
-            );
-            Err(err)
-        }
-    }
+    Ok(results)
 }
 
 /// Prints formatted results table to stdout.
@@ -995,116 +1270,19 @@ pub fn print_results_table(results: &BenchResults) {
     println!("DYLOS SPIKE BENCHMARK RESULTS & GO / NO-GO CRITERIA COMPARISON");
     println!("================================================================================");
     println!(
-        "{:<36} {:>10} {:>10} {:>20} {:>10}",
+        "{:<52} {:>12} {:>12} {:>16} {:>10}",
         "Measurement", "Median", "p95", "Go Threshold", "Verdict"
     );
     println!(
-        "{:-<36} {:-<10} {:-<10} {:-<20} {:-<10}",
+        "{:-<52} {:-<12} {:-<12} {:-<16} {:-<10}",
         "", "", "", "", ""
     );
-
-    let boot_med = format!("{:.1} ms", results.cold_boot_ms.median());
-    let boot_p95 = format!("{:.1} ms", results.cold_boot_ms.p95());
-    println!(
-        "{:<36} {:>10} {:>10} {:>20} {:>10}",
-        "Cold boot (5 VMs)", boot_med, boot_p95, "N/A (base)", "INFO"
-    );
-
-    let freeze_med = format!("{:.1} ms", results.freeze_duration_ms.median());
-    let freeze_p95 = format!("{:.1} ms", results.freeze_duration_ms.p95());
-    println!(
-        "{:<36} {:>10} {:>10} {:>20} {:>10}",
-        "Freeze duration",
-        freeze_med,
-        freeze_p95,
-        "< 1000 ms",
-        results.freeze_verdict()
-    );
-
-    let skew_med = format!("{:.3} ms", results.pause_skew_ms.median());
-    let skew_p95 = format!("{:.3} ms", results.pause_skew_ms.p95());
-    println!(
-        "{:<36} {:>10} {:>10} {:>20} {:>10}",
-        "Pause skew",
-        skew_med,
-        skew_p95,
-        "< 100 ms",
-        results.skew_verdict()
-    );
-
-    let snap_med = format!("{:.1} ms", results.snapshot_duration_ms.median());
-    let snap_p95 = format!("{:.1} ms", results.snapshot_duration_ms.p95());
-    println!(
-        "{:<36} {:>10} {:>10} {:>20} {:>10}",
-        "Total snapshot (5 VMs)",
-        snap_med,
-        snap_p95,
-        "< 1000 ms",
-        results.snapshot_verdict()
-    );
-
-    for (&count, restore_samples) in &results.fork_restore_ms {
-        if let Some(wall) = results.fork_wall_time_ms.get(&count) {
-            let label = format!("Fork batch wall time (n={count})");
-            let med = format!("{:.1} ms", wall.median());
-            let p95 = format!("{:.1} ms", wall.p95());
-            let v = if !wall.is_empty() && wall.p95() < 500.0 {
-                "GO"
-            } else {
-                "NO-GO"
-            };
-            println!(
-                "{:<36} {:>10} {:>10} {:>20} {:>10}",
-                label, med, p95, "< 500 ms (batch)", v
-            );
-        }
-
-        if let Some(amortized) = results.fork_amortized_ms.get(&count) {
-            let label = format!("  Amortized wall (n={count})");
-            let med = format!("{:.1} ms", amortized.median());
-            let p95 = format!("{:.1} ms", amortized.p95());
-            let v = if !amortized.is_empty() && amortized.p95() < 500.0 {
-                "GO"
-            } else {
-                "NO-GO"
-            };
-            println!(
-                "{:<36} {:>10} {:>10} {:>20} {:>10}",
-                label, med, p95, "< 500 ms/clone", v
-            );
-        }
-
-        let label = format!("  Restore: netns-thaw (n={count})");
-        let med = format!("{:.1} ms", restore_samples.median());
-        let p95 = format!("{:.1} ms", restore_samples.p95());
-        let v = if !restore_samples.is_empty() && restore_samples.p95() < 500.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        };
+    for row in results.rows() {
         println!(
-            "{:<36} {:>10} {:>10} {:>20} {:>10}",
-            label, med, p95, "< 500 ms/clone", v
+            "{:<52} {:>12} {:>12} {:>16} {:>10}",
+            row.label, row.median, row.p95, row.threshold, row.verdict
         );
     }
-
-    for (&count, pss_samples) in &results.per_clone_pss_kib {
-        let label = format!("Per-clone PSS at rest (n={count})");
-        let pss_med_mib = pss_samples.median() / 1024.0;
-        let pss_p95_mib = pss_samples.p95() / 1024.0;
-        let med = format!("{pss_med_mib:.1} MiB");
-        let p95 = format!("{pss_p95_mib:.1} MiB");
-        let v = if !pss_samples.is_empty() && pss_p95_mib < 256.0 {
-            "PASS"
-        } else {
-            "FAIL"
-        };
-        println!(
-            "{:<36} {:>10} {:>10} {:>20} {:>10}",
-            label, med, p95, "< 256 MiB", v
-        );
-    }
-
     println!("================================================================================");
     println!(
         "Overall Technical Spike Verdict: {}",
@@ -1113,481 +1291,173 @@ pub fn print_results_table(results: &BenchResults) {
     println!("================================================================================\n");
 }
 
-/// Generates the complete Markdown report for docs/bench/spike.md.
-pub fn render_markdown_report(results: &BenchResults) -> String {
-    let is_ci = std::env::var_os("GITHUB_ACTIONS").is_some() || std::env::var_os("CI").is_some();
-    let mode_str = if results.is_quick {
-        "CI runner, indicative (quick run)"
-    } else if is_ci {
-        "CI runner (full run)"
+fn p95_text(samples: Option<&MetricSamples>, precision: usize, unit: &str) -> String {
+    stat(samples, 1.0, precision, unit).1
+}
+
+fn fork_summary(results: &BenchResults) -> String {
+    results
+        .fork_counts()
+        .into_iter()
+        .map(|count| {
+            format!(
+                "n={count}: end-to-end p95 {}, amortized p95 {}/clone, restore sub-interval p95 {}",
+                p95_text(results.fork_wall_time_ms.get(&count), 1, "ms"),
+                p95_text(results.fork_amortized_ms.get(&count), 1, "ms"),
+                p95_text(results.fork_restore_ms.get(&count), 1, "ms"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn pss_summary(results: &BenchResults) -> String {
+    results
+        .fork_counts()
+        .into_iter()
+        .map(|count| {
+            let unsettled = results.pss_unsettled.get(&count).copied().unwrap_or(0);
+            format!(
+                "n={count}: p95 {}, {unsettled} unsettled",
+                stat(results.per_clone_pss_kib.get(&count), 1024.0, 1, "MiB").1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn conclusion(results: &BenchResults) -> String {
+    let failing = results.failing_criteria();
+    let outcome = if failing.is_empty() {
+        String::from("Every measured criterion passed in this run.")
     } else {
-        "Bare-metal host (reference run)"
+        format!(
+            "Criteria not met or not measured in this run: {}.",
+            failing.join(", ")
+        )
     };
-
-    let ci_or_bare = if results.is_quick {
-        "CI runner, indicative"
-    } else if is_ci {
-        "CI runner (full run)"
+    let scope = if results.is_reference_run() {
+        "This is a full run outside CI."
     } else {
-        "Bare-metal run"
+        "This is not the 20-repetition reference run outside CI, so the figures are indicative."
     };
-
-    let overall_verdict = results.overall_verdict();
-    let snap_verdict = results.snapshot_verdict();
-    let fork_verdict = results.fork_verdict();
-    let freeze_verdict = results.freeze_verdict();
-    let skew_verdict = results.skew_verdict();
-
-    let n1_restore = results.fork_restore_ms.get(&1);
-    let n10_restore = results.fork_restore_ms.get(&10);
-    let n20_restore = results.fork_restore_ms.get(&20);
-
-    let n1_restore_med = n1_restore.map_or("-".into(), |s| format!("{:.1} ms", s.median()));
-    let n1_restore_p95 = n1_restore.map_or("-".into(), |s| format!("{:.1} ms", s.p95()));
-    let n1_restore_verdict = n1_restore.map_or("-", |s| {
-        if !s.is_empty() && s.p95() < 500.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
-    });
-
-    let n10_restore_med = n10_restore.map_or("-".into(), |s| format!("{:.1} ms", s.median()));
-    let n10_restore_p95 = n10_restore.map_or("-".into(), |s| format!("{:.1} ms", s.p95()));
-    let n10_restore_verdict = n10_restore.map_or("-", |s| {
-        if !s.is_empty() && s.p95() < 500.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
-    });
-
-    let n20_restore_med = n20_restore.map_or("-".into(), |s| format!("{:.1} ms", s.median()));
-    let n20_restore_p95 = n20_restore.map_or("-".into(), |s| format!("{:.1} ms", s.p95()));
-    let n20_restore_verdict = n20_restore.map_or("-", |s| {
-        if !s.is_empty() && s.p95() < 500.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
-    });
-
-    let n1_wall = results.fork_wall_time_ms.get(&1);
-    let n1_wall_med = n1_wall.map_or("-".into(), |s| format!("{:.1} ms", s.median()));
-    let n1_wall_p95 = n1_wall.map_or("-".into(), |s| format!("{:.1} ms", s.p95()));
-    let n1_wall_verdict = n1_wall.map_or("-", |s| {
-        if !s.is_empty() && s.p95() < 500.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
-    });
-
-    let n10_wall = results.fork_wall_time_ms.get(&10);
-    let n10_wall_med = n10_wall.map_or("-".into(), |s| format!("{:.1} ms", s.median()));
-    let n10_wall_p95 = n10_wall.map_or("-".into(), |s| format!("{:.1} ms", s.p95()));
-    let n10_wall_verdict = n10_wall.map_or("-", |s| {
-        if !s.is_empty() && s.p95() < 5000.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
-    });
-
-    let n20_wall = results.fork_wall_time_ms.get(&20);
-    let n20_wall_med = n20_wall.map_or("-".into(), |s| format!("{:.1} ms", s.median()));
-    let n20_wall_p95 = n20_wall.map_or("-".into(), |s| format!("{:.1} ms", s.p95()));
-    let n20_wall_verdict = n20_wall.map_or("-", |s| {
-        if !s.is_empty() && s.p95() < 10000.0 {
-            "GO"
-        } else {
-            "NO-GO"
-        }
-    });
-
-    let pss_n1 = results.per_clone_pss_kib.get(&1);
-    let pss_n1_med = pss_n1.map_or("-".into(), |s| format!("{:.1} MiB", s.median() / 1024.0));
-    let pss_n1_p95 = pss_n1.map_or("-".into(), |s| format!("{:.1} MiB", s.p95() / 1024.0));
-    let pss_n1_verdict = pss_n1.map_or("-", |s| {
-        if !s.is_empty() && s.p95() / 1024.0 < 256.0 {
-            "PASS"
-        } else {
-            "FAIL"
-        }
-    });
-
-    let pss_n10 = results.per_clone_pss_kib.get(&10);
-    let pss_n10_med = pss_n10.map_or("-".into(), |s| format!("{:.1} MiB", s.median() / 1024.0));
-    let pss_n10_p95 = pss_n10.map_or("-".into(), |s| format!("{:.1} MiB", s.p95() / 1024.0));
-    let pss_n10_verdict = pss_n10.map_or("-", |s| {
-        if !s.is_empty() && s.p95() / 1024.0 < 256.0 {
-            "PASS"
-        } else {
-            "FAIL"
-        }
-    });
-
-    let pss_n20 = results.per_clone_pss_kib.get(&20);
-    let pss_n20_med = pss_n20.map_or("-".into(), |s| format!("{:.1} MiB", s.median() / 1024.0));
-    let pss_n20_p95 = pss_n20.map_or("-".into(), |s| format!("{:.1} MiB", s.p95() / 1024.0));
-    let pss_n20_verdict = pss_n20.map_or("-", |s| {
-        if !s.is_empty() && s.p95() / 1024.0 < 256.0 {
-            "PASS"
-        } else {
-            "FAIL"
-        }
-    });
-
-    let conclusion = if overall_verdict == "GO" {
-        "All technical spike quantitative targets in [`README.md`](../../README.md) are met with substantial margin. The architecture is validated for phase completion."
-    } else {
-        "Technical spike quantitative evaluation is ongoing. While sub-interval clone restoration, pause skew, and memory efficiency meet their targets, total snapshot duration and batch wall times reflect virtualized CI storage overheads. The definitive hardware go/no-go verdict will be established by the bare-metal reference run on NVMe storage and the LYZ-27 endurance suite."
-    };
-
     format!(
-        r"# Technical Spike: Benchmark Report & Go / No-Go Decision
+        "{outcome} {scope} The LYZ-27 criteria (dual-stack TCP survivability across clones, 100 snapshot/fork/destroy cycles) are not covered by this report; no go decision is made until they are verified."
+    )
+}
+
+/// Generates the complete Markdown report for docs/bench/spike.md.
+///
+/// Every verdict and statement is derived from `results`; missing data renders as
+/// "no data" and counts as unmet.
+pub fn render_markdown_report(results: &BenchResults) -> String {
+    let host = &results.host;
+    let mut out = String::new();
+    let _ = write!(
+        out,
+        "# Technical Spike: Benchmark Report & Go / No-Go Decision
 
 Quantified benchmark results evaluating Dylos technical spike microVM network consistency, snapshot performance, and fork latencies against the criteria defined in [`README.md`](../../README.md).
 
 ## Executive Summary & Verdict
 
-- **Overall Spike Verdict:** **{overall_verdict}** ({mode_str}, {repetitions} repetitions per measurement)
+- **Overall Spike Verdict:** **{overall}** ({mode}, {reps} repetitions per measurement)
 - **Evaluation against Go Criteria:**
-  - **Snapshot 5 VMs (256 MiB each) in under 1 s:** **{snap_verdict}** (p95: {snap_p95:.1} ms vs target < 1000 ms)
-  - **Fork clone in under 500 ms (netns to thaw):** **{fork_verdict}** (p95: {n1_restore_p95} for n=1, {n10_restore_p95} for n=10, {n20_restore_p95} for n=20)
+  - **Snapshot 5 VMs (256 MiB each) in under 1 s:** **{snapshot}** (p95: {snap_p95} vs target < 1000 ms)
+  - **Fork of one clone in under 500 ms (complete fork operation, end-to-end and amortized per clone):** **{fork}** ({forks})
+  - **Fabric freeze in under 1 s:** **{freeze}** (p95: {freeze_p95})
+  - **Pause confirmation skew in under 100 ms:** **{skew}** (p95: {skew_p95})
+  - **Per-clone PSS under 256 MiB once the reading settled:** **{pss}** ({pss_text})
   - **Dual-stack TCP survivability in 100% clones:** **Pending verification in LYZ-27**
-  - **Zero address conflict across concurrent clones:** **GO** (verified via isolated network namespaces)
+  - **Zero address conflict across concurrent clones:** **Not evaluated by this benchmark** (clone isolation is exercised by the E2E test `fork_ten_simultaneous_clones_independent_and_isolated`, not by this report)
   - **100 snapshot/fork/destroy cycles without resource leak:** **Pending verification in LYZ-27**
 
-## Host Configurations
+## Host Configuration ({mode})
 
-### CI Runner ({ci_or_bare})
-- **CPU:** {cpu_model} ({vcpu_count} vCPUs)
+- **CPU:** {cpu} ({vcpus} vCPUs)
 - **RAM:** {ram_gib:.1} GiB ({ram_kib} KiB)
-- **Kernel:** {kernel_release}
-- **Filesystem:** {filesystem} (reflink supported: {reflink})
-- **Firecracker:** {firecracker_version}
-
-### Bare-Metal Reference Host (Human Run)
-- **CPU:** _(human run: e.g. AMD Ryzen 9 / Intel Xeon per docs/host.md)_
-- **RAM:** _(human run: e.g. 16 GB+)_
-- **Kernel:** _(human run: Linux 7.2.7-zen1-1-zen or pinned version)_
-- **Filesystem:** _(human run: Btrfs or XFS with reflink=1)_
-- **Firecracker:** _(human run: Firecracker v1.17.0)_
+- **Kernel:** {kernel}
+- **Filesystem:** {fs} (reflink supported: {reflink})
+- **Firecracker:** {fc}
+- **Reference run:** {reference}
 
 ## Performance Measurements & Go / No-Go Comparison
 
 The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-stack IPv6/IPv4 network):
 
-| Measurement | Go Criteria Threshold | CI Runner ({ci_or_bare}) Median | CI Runner ({ci_or_bare}) p95 | Bare-Metal Host (20 Reps) Median | Bare-Metal Host (20 Reps) p95 | Verdict |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Cold Boot (5 VMs)** | Baseline comparison | {boot_med:.1} ms | {boot_p95:.1} ms | _(human run)_ | _(human run)_ | Informational |
-| **Fabric Freeze Duration** | < 1000 ms (part of snapshot) | {freeze_med:.1} ms | {freeze_p95:.1} ms | _(human run)_ | _(human run)_ | {freeze_verdict} |
-| **Pause Confirmation Skew** | < 100 ms | {skew_med:.3} ms | {skew_p95:.3} ms | _(human run)_ | _(human run)_ | {skew_verdict} |
-| **Total Snapshot (5 VMs)** | **< 1.0 s (1000 ms)** | **{snap_med:.1} ms** | **{snap_p95:.1} ms** | _(human run)_ | _(human run)_ | **{snap_verdict}** |
-| **Fork Batch Wall Time (n = 1)** | < 500 ms (batch) | {n1_wall_med} | {n1_wall_p95} | _(human run)_ | _(human run)_ | {n1_wall_verdict} |
-| **  Clone Restore: netns to thaw (n = 1)** | **< 500 ms / clone** | **{n1_restore_med}** | **{n1_restore_p95}** | _(human run)_ | _(human run)_ | **{n1_restore_verdict}** |
-| **Fork Batch Wall Time (n = 10)** | < 5000 ms (batch) | {n10_wall_med} | {n10_wall_p95} | _(human run)_ | _(human run)_ | {n10_wall_verdict} |
-| **  Clone Restore: netns to thaw (n = 10)** | **< 500 ms / clone** | **{n10_restore_med}** | **{n10_restore_p95}** | _(human run)_ | _(human run)_ | **{n10_restore_verdict}** |
-| **Fork Batch Wall Time (n = 20)** | < 10000 ms (batch) | {n20_wall_med} | {n20_wall_p95} | _(human run)_ | _(human run)_ | {n20_wall_verdict} |
-| **  Clone Restore: netns to thaw (n = 20)** | **< 500 ms / clone** | **{n20_restore_med}** | **{n20_restore_p95}** | _(human run)_ | _(human run)_ | **{n20_restore_verdict}** |
-| **Per-Clone PSS at Rest (n = 1)** | < 256 MiB (memory efficiency) | {pss_n1_med} | {pss_n1_p95} | _(human run)_ | _(human run)_ | {pss_n1_verdict} |
-| **Per-Clone PSS at Rest (n = 10)** | < 256 MiB (memory efficiency) | {pss_n10_med} | {pss_n10_p95} | _(human run)_ | _(human run)_ | {pss_n10_verdict} |
-| **Per-Clone PSS at Rest (n = 20)** | < 256 MiB (memory efficiency) | {pss_n20_med} | {pss_n20_p95} | _(human run)_ | _(human run)_ | {pss_n20_verdict} |
+| Measurement | Go Criteria Threshold | Median | p95 | Verdict |
+| :--- | :--- | :--- | :--- | :--- |
+",
+        overall = results.overall_verdict(),
+        mode = results.mode_label(),
+        reps = results.repetitions,
+        snapshot = results.snapshot_verdict(),
+        snap_p95 = p95_text(Some(&results.snapshot_duration_ms), 1, "ms"),
+        fork = results.fork_verdict(),
+        forks = fork_summary(results),
+        freeze = results.freeze_verdict(),
+        freeze_p95 = p95_text(Some(&results.freeze_duration_ms), 1, "ms"),
+        skew = results.skew_verdict(),
+        skew_p95 = p95_text(Some(&results.pause_skew_ms), 3, "ms"),
+        pss = results.pss_verdict(),
+        pss_text = pss_summary(results),
+        cpu = host.cpu_model,
+        vcpus = host.vcpu_count,
+        ram_gib = host.ram_gib,
+        ram_kib = host.ram_kib,
+        kernel = host.kernel_release,
+        fs = host.filesystem,
+        reflink = host.reflink_supported,
+        fc = host.firecracker_version,
+        reference = if results.is_reference_run() {
+            "this run (full, outside CI)"
+        } else {
+            "outstanding (20 repetitions outside CI)"
+        },
+    );
+    for row in results.rows() {
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} | {} |",
+            row.label, row.threshold, row.median, row.p95, row.verdict
+        );
+    }
 
+    let cold_boot = stat(Some(&results.cold_boot_ms), 1.0, 1, "ms").0;
+    let fork_n1 = stat(results.fork_wall_time_ms.get(&1), 1.0, 1, "ms").0;
+    let _ = write!(
+        out,
+        "
 ## Measurement Intervals & Statistical Methodology
 
-- **Percentile Calculation:** Values are computed using sorted linear interpolation at rank $p \times (N - 1)$.
-- **Repetitions & Samples:** Cold boot and snapshot are evaluated across independent repetitions. Fork restore and PSS evaluate $N \times \text{{repetitions}}$ clone observations grouped by clone count. In quick mode (2 repetitions), tail statistics are indicative.
+- **Percentile Calculation:** Values are computed using sorted linear interpolation at rank $p \\times (N - 1)$.
+- **Repetitions & Samples:** Cold boot and snapshot are evaluated across independent repetitions. Fork and PSS evaluate $N \\times \\text{{repetitions}}$ clone observations grouped by clone count (clones of one batch are correlated). In quick mode (2 repetitions), p95 is an interpolation close to the maximum and is indicative only.
 - **Interval Definitions:**
-  - *Fabric Freeze Duration:* duration of the fabric-freeze call on the network fabric.
+  - *Fabric Freeze Duration:* duration of the fabric-freeze call on the network fabric. It does not measure guest-observed network downtime.
   - *Pause Confirmation Skew:* duration from the first successful VM pause API response to the last.
-  - *Total Snapshot Duration:* end-to-end operation including VM pause, disk sync, memory state serialization, SHA-256 integrity calculation, and manifest generation.
-  - *Fork Batch Wall Time:* end-to-end duration of `Lab::fork_with`, covering manifest verification, storage reflink cloning, parallel VM launch, resume, and socket binding.
-  - *Clone Restore (netns to thaw):* per-clone sub-interval from network namespace setup through Firecracker startup, snapshot memory loading, VM resume, and network unfreeze.
-  - *Per-Clone PSS at Rest:* sum of Proportional Set Size across all VM processes in a lab, sampled after a bounded stabilization period at rest.
+  - *Total Snapshot Duration:* end-to-end operation including VM pause, disk sync, memory state serialization, SHA-256 integrity calculation, final manifest and cleanup.
+  - *Fork End-to-End:* duration of `Lab::fork_with` for the whole batch, from entry through all clones restored and ready. It covers manifest verification, storage reflink cloning, parallel VM launch, resume and readiness. For n = 1 it is the README criterion directly.
+  - *Fork Amortized per Clone:* end-to-end duration divided by the clone count. Per-clone completion latency inside a batch is not measured; the end-to-end duration bounds it from above.
+  - *Restore Sub-Interval (netns to thaw):* per-clone interval from network namespace setup through Firecracker startup, snapshot memory loading, VM resume and network unfreeze. It excludes verification and storage preparation and is informational only: it never decides the fork verdict.
+  - *Per-Clone PSS:* sum of Proportional Set Size across all VM processes of a clone. After the batch is ready, the reading is repeated every 250 ms until two consecutive readings differ by at most 1 MiB, with a 10 s deadline. Clones that miss the deadline are counted as unsettled and fail the PSS criterion. Stable PSS is an observed condition, not proof that the guests are idle.
 
 ## Analysis & Findings
 
-1. **Snapshot Latency Breakdown:**
-   Fabric freeze completes in under 5 ms. VM pause confirmation skew across all 5 VMs is sub-millisecond, demonstrating tight synchronization across microVMs. Total snapshot on the virtualized CI runner is elevated due to loopback storage reflink overhead and unoptimized SHA-256 digest computation across 1.3 GiB of memory dumps and disk images in nested cloud virtualization; bare-metal direct NVMe reflink execution will settle the final go criterion.
-
-2. **Parallel Fork Latency Scalability:**
-   Per-clone restore sub-interval (netns to thaw) scales under 500 ms across tested clone counts (n = 1, 10, 20). Batch wall time includes storage-layer reflink cloning and manifest verification, which exhibit elevated duration on virtualized cloud storage.
-
-3. **Memory Behavior at Rest:**
-   Per-clone Proportional Set Size (PSS) at rest measures significantly lower than the provisioned 5 x 256 MiB guest memory, reflecting quiescent guest pages and shared read-only mappings. Note that low PSS alone does not prove copy-on-write page sharing (as lazy, largely untouched guest memory can also produce low PSS); definitive COW sharing validation requires a dedicated private-dirty / sharing measurement.
-
-4. **Comparison with Cold Boot:**
-   Cold booting 5 microVMs takes several seconds ({boot_med:.1} ms median), whereas clone restoration (netns to thaw) completes in tens of milliseconds per clone.
+1. **Snapshot:** freeze p95 {freeze_p95}, pause skew p95 {skew_p95}, total snapshot p95 {snap_p95} (limit 1000 ms). The run does not break the total down by stage, so the dominant stage is not identified.
+2. **Fork:** {forks}.
+3. **Memory:** per-clone PSS after settling: {pss_text}. PSS alone does not prove copy-on-write sharing: lazy, largely untouched guest memory also produces low PSS. A sharing / private-dirty measurement is required for that claim.
+4. **Cold boot comparison:** cold boot of 5 microVMs has a median of {cold_boot}; the fork end-to-end median for n = 1 is {fork_n1}.
 
 ## Conclusion & Next Steps
 
 {conclusion}
 ",
-        overall_verdict = overall_verdict,
-        mode_str = mode_str,
-        repetitions = results.repetitions,
-        snap_p95 = results.snapshot_duration_ms.p95(),
-        ci_or_bare = ci_or_bare,
-        cpu_model = results.host.cpu_model,
-        vcpu_count = results.host.vcpu_count,
-        ram_gib = results.host.ram_gib,
-        ram_kib = results.host.ram_kib,
-        kernel_release = results.host.kernel_release,
-        filesystem = results.host.filesystem,
-        reflink = results.host.reflink_supported,
-        firecracker_version = results.host.firecracker_version,
-        boot_med = results.cold_boot_ms.median(),
-        boot_p95 = results.cold_boot_ms.p95(),
-        freeze_med = results.freeze_duration_ms.median(),
-        freeze_p95 = results.freeze_duration_ms.p95(),
-        freeze_verdict = freeze_verdict,
-        skew_med = results.pause_skew_ms.median(),
-        skew_p95 = results.pause_skew_ms.p95(),
-        skew_verdict = skew_verdict,
-        snap_med = results.snapshot_duration_ms.median(),
-        snap_verdict = snap_verdict,
-        fork_verdict = fork_verdict,
-        n1_wall_med = n1_wall_med,
-        n1_wall_p95 = n1_wall_p95,
-        n1_wall_verdict = n1_wall_verdict,
-        n1_restore_med = n1_restore_med,
-        n1_restore_p95 = n1_restore_p95,
-        n1_restore_verdict = n1_restore_verdict,
-        n10_wall_med = n10_wall_med,
-        n10_wall_p95 = n10_wall_p95,
-        n10_wall_verdict = n10_wall_verdict,
-        n10_restore_med = n10_restore_med,
-        n10_restore_p95 = n10_restore_p95,
-        n10_restore_verdict = n10_restore_verdict,
-        n20_wall_med = n20_wall_med,
-        n20_wall_p95 = n20_wall_p95,
-        n20_wall_verdict = n20_wall_verdict,
-        n20_restore_med = n20_restore_med,
-        n20_restore_p95 = n20_restore_p95,
-        n20_restore_verdict = n20_restore_verdict,
-        pss_n1_med = pss_n1_med,
-        pss_n1_p95 = pss_n1_p95,
-        pss_n1_verdict = pss_n1_verdict,
-        pss_n10_med = pss_n10_med,
-        pss_n10_p95 = pss_n10_p95,
-        pss_n10_verdict = pss_n10_verdict,
-        pss_n20_med = pss_n20_med,
-        pss_n20_p95 = pss_n20_p95,
-        pss_n20_verdict = pss_n20_verdict,
-        conclusion = conclusion,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_percentile_single_value() {
-        let samples = [42.0];
-        assert_eq!(percentile(&samples, 0.5), 42.0);
-        assert_eq!(percentile(&samples, 0.95), 42.0);
-    }
-
-    #[test]
-    fn test_percentile_even_odd() {
-        let samples = [10.0, 20.0, 30.0, 40.0, 50.0];
-        assert_eq!(percentile(&samples, 0.5), 30.0);
-        assert_eq!(percentile(&samples, 0.0), 10.0);
-        assert_eq!(percentile(&samples, 1.0), 50.0);
-
-        let even = [10.0, 20.0, 30.0, 40.0];
-        assert_eq!(percentile(&even, 0.5), 25.0);
-    }
-
-    #[test]
-    fn test_metric_samples() {
-        let mut m = MetricSamples::new();
-        assert!(m.is_empty());
-        assert_eq!(m.count(), 0);
-        for v in [100.0, 200.0, 300.0, 400.0, 500.0] {
-            m.add(v);
-        }
-        assert!(!m.is_empty());
-        assert_eq!(m.count(), 5);
-        assert_eq!(m.min(), 100.0);
-        assert_eq!(m.max(), 500.0);
-        assert_eq!(m.mean(), 300.0);
-        assert_eq!(m.median(), 300.0);
-        assert!(m.p95() > 400.0);
-    }
-
-    #[test]
-    fn test_parse_bench_args_defaults() {
-        let args = Vec::<String>::new();
-        let opts = parse_bench_args(args.into_iter()).unwrap();
-        assert!(!opts.quick);
-        assert_eq!(opts.repetitions, DEFAULT_REPETITIONS_FULL);
-        assert_eq!(opts.fork_counts, vec![1, 10, 20]);
-    }
-
-    #[test]
-    fn test_parse_bench_args_quick() {
-        let args = vec!["--quick".to_string()];
-        let opts = parse_bench_args(args.into_iter()).unwrap();
-        assert!(opts.quick);
-        assert_eq!(opts.repetitions, DEFAULT_REPETITIONS_QUICK);
-    }
-
-    #[test]
-    fn test_parse_bench_args_custom() {
-        let args = vec![
-            "--quick".to_string(),
-            "--repetitions".to_string(),
-            "5".to_string(),
-            "--fork-counts".to_string(),
-            "1,5,10".to_string(),
-            "--output".to_string(),
-            "report.md".to_string(),
-        ];
-        let opts = parse_bench_args(args.into_iter()).unwrap();
-        assert!(opts.quick);
-        assert_eq!(opts.repetitions, 5);
-        assert_eq!(opts.fork_counts, vec![1, 5, 10]);
-        assert_eq!(opts.output_path, Some(PathBuf::from("report.md")));
-    }
-
-    fn dummy_host() -> HostConfig {
-        HostConfig {
-            cpu_model: "Test CPU".into(),
-            vcpu_count: 4,
-            ram_kib: 16 * 1024 * 1024,
-            ram_gib: 16.0,
-            kernel_release: "6.1.0".into(),
-            filesystem: "xfs".into(),
-            reflink_supported: true,
-            firecracker_version: "1.17.0".into(),
-        }
-    }
-
-    #[test]
-    fn test_verdicts_with_missing_and_failing_measurements() {
-        let results = BenchResults {
-            host: dummy_host(),
-            repetitions: 2,
-            is_quick: true,
-            cold_boot_ms: MetricSamples::new(),
-            freeze_duration_ms: MetricSamples::new(), // empty -> FAIL
-            pause_skew_ms: MetricSamples::new(),      // empty -> FAIL
-            snapshot_duration_ms: MetricSamples {
-                values: vec![20000.0, 25000.0], // > 1000 ms -> NO-GO
-            },
-            fork_wall_time_ms: BTreeMap::new(),
-            fork_amortized_ms: BTreeMap::new(),
-            fork_restore_ms: BTreeMap::new(),   // empty -> NO-GO
-            per_clone_pss_kib: BTreeMap::new(), // empty -> FAIL
-        };
-
-        assert_eq!(results.freeze_verdict(), "FAIL");
-        assert_eq!(results.skew_verdict(), "FAIL");
-        assert_eq!(results.snapshot_verdict(), "NO-GO");
-        assert_eq!(results.fork_verdict(), "NO-GO");
-        assert_eq!(results.pss_verdict(), "FAIL");
-        assert!(results.overall_verdict().contains("NO-GO"));
-
-        let report = render_markdown_report(&results);
-        assert!(!report.contains("Overall Spike Verdict:** **GO"));
-        assert!(report.contains("NO-GO"));
-        assert!(!report.contains(
-            "All technical spike quantitative targets in [`README.md`](../../README.md) are met"
-        ));
-    }
-
-    #[test]
-    fn test_verdicts_with_failing_fork_and_pss() {
-        let mut fork_restore_ms = BTreeMap::new();
-        let mut samples_n1 = MetricSamples::new();
-        samples_n1.add(550.0); // > 500 ms
-        fork_restore_ms.insert(1, samples_n1);
-
-        let mut per_clone_pss_kib = BTreeMap::new();
-        let mut pss_samples = MetricSamples::new();
-        pss_samples.add(300.0 * 1024.0); // > 256 MiB
-        per_clone_pss_kib.insert(1, pss_samples);
-
-        let results = BenchResults {
-            host: dummy_host(),
-            repetitions: 2,
-            is_quick: false,
-            cold_boot_ms: MetricSamples::new(),
-            freeze_duration_ms: MetricSamples { values: vec![2.0] },
-            pause_skew_ms: MetricSamples { values: vec![0.5] },
-            snapshot_duration_ms: MetricSamples {
-                values: vec![800.0],
-            },
-            fork_wall_time_ms: BTreeMap::new(),
-            fork_amortized_ms: BTreeMap::new(),
-            fork_restore_ms,
-            per_clone_pss_kib,
-        };
-
-        assert_eq!(results.freeze_verdict(), "PASS");
-        assert_eq!(results.skew_verdict(), "PASS");
-        assert_eq!(results.snapshot_verdict(), "GO");
-        assert_eq!(results.fork_verdict(), "NO-GO");
-        assert_eq!(results.pss_verdict(), "FAIL");
-        assert_eq!(results.overall_verdict(), "NO-GO");
-    }
-
-    #[test]
-    fn test_directory_safety_rejects_symlink_parent() {
-        let temp =
-            std::env::temp_dir().join(format!("dylos-test-bench-dir-{}", std::process::id()));
-        let _ = fs::create_dir_all(&temp);
-        let link =
-            std::env::temp_dir().join(format!("dylos-test-bench-link-{}", std::process::id()));
-        let _ = fs::remove_file(&link);
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(&temp, &link).unwrap();
-
-        let res = setup_private_bench_dir(&link);
-        assert!(res.is_err());
-        let err = res.unwrap_err().to_string();
-        assert!(err.contains("is a symlink"), "unexpected error: {err}");
-
-        let _ = fs::remove_file(&link);
-        let _ = fs::remove_dir_all(&temp);
-    }
-
-    #[test]
-    fn test_directory_safety_never_removes_parent() {
-        let parent =
-            std::env::temp_dir().join(format!("dylos-test-bench-parent-{}", std::process::id()));
-        let _ = fs::create_dir_all(&parent);
-        let sentinel = parent.join("do_not_delete.txt");
-        fs::write(&sentinel, b"precious data").unwrap();
-
-        let child = setup_private_bench_dir(&parent).unwrap();
-        assert!(child.exists());
-        assert!(child.starts_with(&parent));
-        assert_ne!(child, parent);
-
-        cleanup_private_bench_dir(&child).unwrap();
-        assert!(!child.exists());
-        assert!(parent.exists());
-        assert!(sentinel.exists());
-
-        let _ = fs::remove_dir_all(&parent);
-    }
-
-    #[test]
-    fn test_directory_path_length_fits_sun_len() {
-        let parent = std::env::temp_dir().join(format!("dylos-b-{}", std::process::id()));
-        let child = setup_private_bench_dir(&parent).unwrap();
-        let sock_path = child.join("s/b-boot-1/control.sock");
-        assert!(
-            sock_path.as_os_str().len() < 108,
-            "socket path exceeds SUN_LEN (108): {}",
-            sock_path.display()
-        );
-        cleanup_private_bench_dir(&child).unwrap();
-        let _ = fs::remove_dir_all(&parent);
-    }
+        freeze_p95 = p95_text(Some(&results.freeze_duration_ms), 1, "ms"),
+        skew_p95 = p95_text(Some(&results.pause_skew_ms), 3, "ms"),
+        snap_p95 = p95_text(Some(&results.snapshot_duration_ms), 1, "ms"),
+        forks = fork_summary(results),
+        pss_text = pss_summary(results),
+        conclusion = conclusion(results),
+    );
+    out
 }

@@ -10,6 +10,7 @@ use std::env;
 use std::path::Path;
 use std::process::Command;
 use std::time::Instant;
+use xtask::bench;
 
 const KERNEL_PATH: &str = "kernels/vmlinux.bin";
 const KERNEL_SHA256: &str = "0545ba1781fc06cfa1d7699069057f4538103fd1644100cf0da434899a1ed447";
@@ -23,8 +24,6 @@ fn main() {
         std::process::exit(1);
     }
 }
-
-mod bench;
 
 fn run() -> anyhow::Result<()> {
     let mut args = env::args().skip(1);
