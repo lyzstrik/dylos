@@ -71,7 +71,7 @@ async fn run_lab(terminal_sigint: bool) {
     if let Err(error) = &result {
         eprintln!("lab bring-up failed: {error}\n{error:#?}");
     }
-    let lab = result.expect("lab bring-up failed; see diagnostics above");
+    let mut lab = result.expect("lab bring-up failed; see diagnostics above");
     assert_eq!(lab.vms().len(), 3);
     join_all(lab.vms().iter().map(|vm| async move {
         let mut state = vm.state();
@@ -88,6 +88,7 @@ async fn run_lab(terminal_sigint: bool) {
         );
     }))
     .await;
+    measure_pause_cycles(&mut lab).await;
     let paths: Vec<_> = lab
         .vms()
         .iter()
@@ -183,4 +184,24 @@ fn lab_config(dir: &tempfile::TempDir) -> Option<LabConfig> {
         ..LabConfig::default()
     };
     Some(config)
+}
+
+async fn measure_pause_cycles(lab: &mut Lab) {
+    let mut total = Duration::ZERO;
+    let mut maximum = Duration::ZERO;
+    for _ in 0..50 {
+        let skew = lab.pause_all().await.expect("pause cycle failed");
+        total += skew;
+        maximum = maximum.max(skew);
+        lab.resume_all().await.expect("resume cycle failed");
+    }
+    assert!(
+        maximum < Duration::from_millis(100),
+        "pause skew: {maximum:?}"
+    );
+    eprintln!(
+        "abc pause/resume: cycles=50 mean_skew_us={} maximum_skew_us={}",
+        (total / 50).as_micros(),
+        maximum.as_micros()
+    );
 }
