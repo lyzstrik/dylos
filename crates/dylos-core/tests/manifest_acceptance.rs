@@ -11,7 +11,16 @@ use std::path::{Path, PathBuf};
 const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn sha_hex(data: &[u8]) -> String {
-    format!("{:02x}", Sha256::digest(data))
+    Sha256::digest(data)
+        .iter()
+        .flat_map(|byte| {
+            let hex = b"0123456789abcdef";
+            [
+                char::from(hex[usize::from(byte >> 4)]),
+                char::from(hex[usize::from(byte & 0xf)]),
+            ]
+        })
+        .collect::<String>()
 }
 
 fn lab_spec() -> LabSpec {

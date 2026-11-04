@@ -266,7 +266,17 @@ impl SnapshotManifest {
                     hasher.update(&buffer[..n]);
                 }
 
-                let actual_sha256 = format!("{:02x}", hasher.finalize());
+                let actual_sha256 = hasher
+                    .finalize()
+                    .iter()
+                    .flat_map(|byte| {
+                        let hex = b"0123456789abcdef";
+                        [
+                            char::from(hex[usize::from(byte >> 4)]),
+                            char::from(hex[usize::from(byte & 0xf)]),
+                        ]
+                    })
+                    .collect::<String>();
 
                 if actual_size != file.size || actual_sha256 != file.sha256 {
                     return Err(Error::IntegrityMismatch {

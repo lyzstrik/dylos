@@ -26,7 +26,17 @@ fn hex_sha256_strategy() -> impl Strategy<Value = String> {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
         hasher.update(&bytes);
-        format!("{:02x}", hasher.finalize())
+        hasher
+            .finalize()
+            .iter()
+            .flat_map(|byte| {
+                let hex = b"0123456789abcdef";
+                [
+                    char::from(hex[usize::from(byte >> 4)]),
+                    char::from(hex[usize::from(byte & 0xf)]),
+                ]
+            })
+            .collect::<String>()
     })
 }
 

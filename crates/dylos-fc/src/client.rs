@@ -217,7 +217,7 @@ impl FcClient {
             source: e,
         })?;
 
-        let io = TokioIo::new(stream);
+        let io = TokioIo::new(crate::transport::ResponseStream::new(stream));
         let (mut sender, conn) = http1::handshake(io).await.map_err(|e| Error::Handshake {
             path: self.socket_path.clone(),
             method: method.to_string(),
