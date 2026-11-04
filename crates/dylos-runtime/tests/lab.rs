@@ -729,3 +729,98 @@ async fn fleet_reports_the_recovery_error_with_the_operation_error() {
     kept.teardown().await.unwrap();
     assert_lab_removed(&sandbox, &config, &["f1"]);
 }
+
+/// Leftovers of a lab whose rollback failed are only removable once the blocker is gone.
+async fn recover(sandbox: &Sandbox, config: &LabConfig, ids: &[&str]) {
+    sandbox.release_busy_jails();
+    for id in ids {
+        // The failed lab may still hold its lock while its drop-time cleanup finishes.
+        support::wait_until_async("lab lock released", Duration::from_secs(5), || async {
+            Lab::teardown_by_name(config, id).await.is_ok()
+        })
+        .await;
+    }
+    for dir in ["jails/firecracker", "cgroup/firecracker"] {
+        let _ = fs::remove_dir_all(sandbox.dir.path().join(dir));
+    }
+    for id in ids {
+        assert!(!config.store.base.join(id).exists());
+    }
+}
+
+#[tokio::test]
+async fn failed_up_rollback_is_reported_as_unrecovered() {
+    if !sandboxed("failed_up_rollback_is_reported_as_unrecovered") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabPartialLaunch);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    sandbox.make_teardown_fail();
+
+    let error = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+
+    assert!(
+        matches!(error, LabError::Rollback { .. }) && error.leaves_resources(),
+        "{error:?}"
+    );
+    assert!(config.store.base.join("lab").exists());
+    recover(&sandbox, &config, &["lab"]).await;
+}
+
+/// Forks two clones; the first one cannot even be created, so its error is the first returned.
+async fn fork_with_blocked_first_clone(
+    sandbox: &Sandbox,
+    config: &LabConfig,
+    spec: &LabSpec,
+) -> (LabError, [String; 2]) {
+    let mut source = Lab::up_with(config, spec, "src").await.unwrap();
+    source.snapshot("saved").await.unwrap();
+    source.teardown().await.unwrap();
+    let snapshot = config.store.snapshot_dir("src", "saved");
+    let ids = ["x1".to_string(), "x2".to_string()];
+    fs::create_dir_all(config.store.base.join(&ids[0])).unwrap();
+    sandbox.make_teardown_fail();
+
+    let error = Lab::fork_with(config, &snapshot, &ids).await.err().unwrap();
+    (error, ids)
+}
+
+#[tokio::test]
+async fn fork_reports_a_later_clone_whose_rollback_failed() {
+    if !sandboxed("fork_reports_a_later_clone_whose_rollback_failed") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    fs::write(sandbox.dir.path().join("fail-restore"), "load").unwrap();
+
+    let (error, ids) = fork_with_blocked_first_clone(&sandbox, &config, &spec).await;
+
+    assert!(
+        matches!(&error, LabError::Rollback { operation, .. } if !operation.leaves_resources()),
+        "{error:?}"
+    );
+    fs::remove_dir_all(config.store.base.join(&ids[0])).unwrap();
+    recover(&sandbox, &config, &[&ids[1]]).await;
+}
+
+#[tokio::test]
+async fn fork_reports_a_successful_clone_that_could_not_be_torn_down() {
+    if !sandboxed("fork_reports_a_successful_clone_that_could_not_be_torn_down") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+
+    let (error, ids) = fork_with_blocked_first_clone(&sandbox, &config, &spec).await;
+
+    assert!(error.leaves_resources(), "{error:?}");
+    fs::remove_dir_all(config.store.base.join(&ids[0])).unwrap();
+    recover(&sandbox, &config, &[&ids[1]]).await;
+}

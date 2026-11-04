@@ -22,6 +22,8 @@ use crate::{LabError, Vm};
 pub struct SnapshotTimings {
     pub freeze_ms: u64,
     pub pause_ms: u64,
+    /// First-to-last successful pause acknowledgement interval, in microseconds.
+    pub pause_skew_us: u64,
     pub api_snapshot_ms: u64,
     pub storage_ms: u64,
     pub fsync_ms: u64,
@@ -288,12 +290,16 @@ async fn run_snapshot_steps(
     state.paused.store(true, Ordering::SeqCst);
 
     let pause_results = join_all(job.vms.iter().map(|vm| async {
-        let started = Instant::now();
         let res = vm.client.pause().await;
-        (vm.node.clone(), res, started)
+        (vm.node.clone(), res, Instant::now())
     }))
     .await;
 
+    let first_pause = pause_results.iter().map(|(_, _, at)| *at).min();
+    let last_pause = pause_results.iter().map(|(_, _, at)| *at).max();
+    let pause_skew_us = first_pause.zip(last_pause).map_or(0, |(first, last)| {
+        u64::try_from((last - first).as_micros()).unwrap_or(u64::MAX)
+    });
     let mut first_pause_err = None;
     for (node, res, _) in pause_results {
         if let Err(err) = res
@@ -607,6 +613,7 @@ async fn run_snapshot_steps(
     let timings = SnapshotTimings {
         freeze_ms,
         pause_ms,
+        pause_skew_us,
         api_snapshot_ms,
         storage_ms,
         fsync_ms: max_fsync_ms,
@@ -623,6 +630,7 @@ async fn run_snapshot_steps(
         snapshot = %job.snapshot_id,
         freeze_ms,
         pause_ms,
+        pause_skew_us,
         snapshot_ms,
         api_snapshot_ms,
         storage_ms,

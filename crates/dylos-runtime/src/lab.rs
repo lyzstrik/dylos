@@ -57,6 +57,15 @@ pub enum LabError {
     },
 }
 
+impl LabError {
+    /// Whether the operation may have left host resources behind: its own rollback failed, or
+    /// a task died with its state unknown. Callers must then keep the files backing the lab.
+    #[must_use]
+    pub fn leaves_resources(&self) -> bool {
+        matches!(self, Self::Rollback { .. } | Self::Task { .. })
+    }
+}
+
 type Result<T> = std::result::Result<T, LabError>;
 
 /// Paths must be operator-controlled and not writable by the jailer uid or other users.
@@ -309,53 +318,57 @@ impl Lab {
 
         let results = join_all(handles).await;
         let mut labs = Vec::with_capacity(clone_ids.len());
-        let mut first_error = None;
+        let mut errors = Vec::new();
         for (i, res) in results.into_iter().enumerate() {
             match res {
                 Ok(Ok(lab)) => labs.push(lab),
                 Ok(Err(err)) => {
                     tracing::error!(lab = %clone_ids[i], error = %err, "clone restore failed");
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
+                    errors.push(err);
                 }
                 Err(source) => {
                     tracing::error!(lab = %clone_ids[i], error = %source, "clone restore task panicked");
-                    if first_error.is_none() {
-                        first_error = Some(LabError::Task {
-                            lab: clone_ids[i].clone(),
-                            source,
-                        });
-                    }
+                    errors.push(LabError::Task {
+                        lab: clone_ids[i].clone(),
+                        source,
+                    });
                 }
             }
         }
 
-        if let Some(err) = first_error {
-            let mut cleanup_error = None;
-            let cleanup_results = join_all(labs.into_iter().map(|mut lab| async move {
-                let id = lab.id().to_string();
-                (id, lab.teardown().await)
-            }))
-            .await;
-            for (id, res) in cleanup_results {
-                if let Err(cleanup_err) = res {
-                    tracing::error!(lab = %id, error = %cleanup_err, "rollback teardown failed");
-                    if cleanup_error.is_none() {
-                        cleanup_error = Some(cleanup_err);
-                    }
-                }
-            }
-            if let Some(cleanup) = cleanup_error {
-                return Err(LabError::Rollback {
-                    operation: Box::new(err),
-                    cleanup: Box::new(cleanup),
-                });
-            }
-            return Err(err);
+        if errors.is_empty() {
+            return Ok(labs);
         }
-
-        Ok(labs)
+        let cleanup_results = join_all(labs.into_iter().map(|mut lab| async move {
+            let id = lab.id().to_string();
+            (id, lab.teardown().await)
+        }))
+        .await;
+        let mut cleanup_errors = Vec::new();
+        for (id, res) in cleanup_results {
+            if let Err(cleanup_err) = res {
+                tracing::error!(lab = %id, error = %cleanup_err, "rollback teardown failed");
+                cleanup_errors.push(cleanup_err);
+            }
+        }
+        // The caller only sees one error, so a clone whose own rollback failed must not be
+        // hidden behind an earlier plain failure of another clone.
+        let first = errors.remove(0);
+        if first.leaves_resources() {
+            return Err(first);
+        }
+        let unrecovered = errors
+            .iter()
+            .position(LabError::leaves_resources)
+            .map(|i| errors.remove(i))
+            .or_else(|| cleanup_errors.into_iter().next());
+        match unrecovered {
+            Some(cleanup) => Err(LabError::Rollback {
+                operation: Box::new(first),
+                cleanup: Box::new(cleanup),
+            }),
+            None => Err(first),
+        }
     }
 
     /// Restores a verified snapshot into N parallel independent clone labs with deterministic `<prefix>-c1..cN` IDs.
