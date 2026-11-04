@@ -618,7 +618,7 @@ async fn fleet_recovers_failed_and_panicked_labs_and_keeps_the_others() {
     fleet.spawn(failing);
     let panicking = Lab::up_with(&config, &spec, "f2").await.unwrap();
     let socket = panicking.control_socket();
-    fleet.spawn_with("f2".into(), socket, async move {
+    fleet.spawn_supervisor("f2".into(), socket, async move {
         let _owned = panicking;
         panic!("injected supervisor panic");
     });
@@ -675,7 +675,7 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
     // Holds the lab and its bound socket but never answers: the request times out.
     let stalled = Lab::up_with(&config, &spec, "f1").await.unwrap();
     let socket = stalled.control_socket();
-    fleet.spawn_with("f1".into(), socket, async move {
+    fleet.spawn_supervisor("f1".into(), socket, async move {
         let _owned = stalled;
         std::future::pending().await
     });
@@ -713,7 +713,7 @@ async fn fleet_reports_the_recovery_error_with_the_operation_error() {
     let mut fleet = Fleet::new(&config, Duration::from_millis(300));
     // The lab outlives its supervisor, so its lock is never released for recovery.
     let mut kept = Lab::up_with(&config, &spec, "f1").await.unwrap();
-    fleet.spawn_with("f1".into(), kept.control_socket(), std::future::pending());
+    fleet.spawn_supervisor("f1".into(), kept.control_socket(), std::future::pending());
 
     let failures = fleet.run(std::future::ready(())).await.unwrap_err().0;
     assert_eq!(failures.len(), 1, "{failures:?}");

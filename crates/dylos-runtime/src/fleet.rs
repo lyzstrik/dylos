@@ -77,19 +77,11 @@ impl Fleet {
         self.spawn_supervisor(id, socket, lab.supervise());
     }
 
-    /// Supervises `id` with an arbitrary future, to inject failing, stalled or panicking
-    /// supervisors in tests.
-    #[cfg(feature = "test-hooks")]
-    pub fn spawn_with(
-        &mut self,
-        id: String,
-        socket: PathBuf,
-        supervisor: impl Future<Output = Result<(), LabError>> + Send + 'static,
-    ) {
-        self.spawn_supervisor(id, socket, supervisor);
-    }
-
-    fn spawn_supervisor(
+    /// Supervises lab `id` with `supervisor`, a future that owns the lab and serves teardown
+    /// requests on `socket`, as [`Lab::supervise`] does. The fleet only relies on that
+    /// contract: if the future fails, panics or does not stop on request, `id` is recovered by
+    /// name once the future has been joined.
+    pub fn spawn_supervisor(
         &mut self,
         id: String,
         socket: PathBuf,
