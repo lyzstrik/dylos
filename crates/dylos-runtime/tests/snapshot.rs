@@ -1002,6 +1002,52 @@ async fn snapshot_caller_cancellation_releases_slot_for_subsequent_snapshot() {
 }
 
 #[tokio::test]
+async fn finishing_caller_keeps_slot_owned_by_a_newer_snapshot() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("lown").await;
+    let vm0_root = lab.vms[0].paths().root.clone();
+
+    // A's task runs to completion while its caller is not polled again.
+    let mut first = Box::pin(lab.snapshot("snap-a"));
+    tokio::select! {
+        biased;
+        _ = &mut first => panic!("caller A must wait for its task"),
+        () = wait_until("A admitted", Duration::from_secs(5), || lab.slot.is_active()) => {}
+    }
+    wait_until("A's task finished", Duration::from_secs(5), || {
+        !lab.slot.is_active()
+    })
+    .await;
+
+    // B is admitted before caller A resumes, and stays in its pause.
+    fs::write(vm0_root.join("stall-pause"), b"").unwrap();
+    let mut second = Box::pin(lab.snapshot("snap-b"));
+    tokio::select! {
+        _ = &mut second => panic!("B must stall in its pause"),
+        () = wait_until("B pause started", Duration::from_secs(5), || {
+            vm0_root.join("pause-started").exists()
+        }) => {}
+    }
+
+    first.await.unwrap();
+    assert!(
+        lab.slot.is_active(),
+        "completing A must not release B's slot"
+    );
+    let blocked = lab.snapshot("snap-c").await.unwrap_err();
+    assert!(
+        blocked.to_string().contains("already in progress"),
+        "C must not overlap B, got: {blocked}"
+    );
+
+    fs::remove_file(vm0_root.join("stall-pause")).unwrap();
+    second.await.unwrap();
+    assert!(!lab.slot.is_active());
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
 async fn teardown_cancellation_during_pending_snapshot_retains_ownership_for_retry() {
     if !sandboxed("teardown_cancellation_during_pending_snapshot_retains_ownership_for_retry") {
         return;

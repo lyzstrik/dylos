@@ -736,7 +736,7 @@ pub async fn snapshot_vms(
 
     let span = tracing::info_span!("snapshot_lab", lab = %lab_id, snapshot = %snapshot_id);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-    {
+    let task_id = {
         // Checking and filling the slot under one lock keeps two concurrent callers from
         // both starting a task.
         let mut lock = slot.0.lock().await;
@@ -746,21 +746,24 @@ pub async fn snapshot_vms(
                 message: "snapshot already in progress".into(),
             });
         }
-        *lock = Some(tokio::spawn(
+        let handle = tokio::spawn(
             async move {
                 let res = run_snapshot_job(job).await;
                 let _ = result_tx.send(res);
             }
             .instrument(span),
-        ));
-    }
+        );
+        let task_id = handle.id();
+        *lock = Some(handle);
+        task_id
+    };
 
     let result = if let Ok(res) = result_rx.await {
         res
     } else {
         // The task ended without sending: it panicked outside the guarded steps.
         let mut lock = slot.0.lock().await;
-        match lock.as_mut() {
+        match lock.take_if(|handle| handle.id() == task_id) {
             Some(handle) => match handle.await {
                 Ok(()) => Err(LabError::Invalid {
                     lab: lab_id,
@@ -781,7 +784,8 @@ pub async fn snapshot_vms(
             }),
         }
     };
-    *slot.0.lock().await = None;
+    // A later invocation may already own the slot once this task has finished.
+    slot.0.lock().await.take_if(|handle| handle.id() == task_id);
     result
 }
 
