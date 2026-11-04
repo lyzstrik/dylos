@@ -5,13 +5,19 @@ use dylos_core::{Error, LabSpec};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 const EMPTY_SHA: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 fn sha_hex(data: &[u8]) -> String {
-    format!("{:02x}", Sha256::digest(data))
+    Sha256::digest(data)
+        .iter()
+        .fold(String::new(), |mut text, byte| {
+            write!(text, "{byte:02x}").unwrap();
+            text
+        })
 }
 
 fn lab_spec() -> LabSpec {
@@ -588,4 +594,15 @@ fn verify_opens_the_manifest_paths_verbatim() {
     let mut expected: Vec<PathBuf> = s.keys().cloned().collect();
     expected.sort();
     assert_eq!(seen, expected, "every listed file opened exactly once");
+}
+
+#[test]
+fn verify_sha256_known_answer() {
+    let mut m = two_vm_manifest();
+    let mut files = store();
+    files.insert(PathBuf::from("a/state"), b"abc".to_vec());
+    let state = &mut m.vms.get_mut("a").unwrap().state_file;
+    state.size = 3;
+    state.sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string();
+    verify_with(&m, &files).unwrap();
 }

@@ -904,7 +904,7 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
         }
         hasher.update(&buffer[..n]);
     }
-    let sha256 = format!("{:02x}", hasher.finalize());
+    let sha256 = dylos_core::manifest::sha256_hex(&hasher.finalize().into());
     Ok((sha256, total_size))
 }
 

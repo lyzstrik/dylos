@@ -362,7 +362,7 @@ fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) 
             FileMeta {
                 path: PathBuf::from(format!("vms/{}/{name}", node.name)),
                 size: bytes.len() as u64,
-                sha256: format!("{:x}", Sha256::digest(bytes.as_bytes())),
+                sha256: dylos_core::manifest::sha256_hex(&Sha256::digest(bytes.as_bytes()).into()),
             }
         };
         vms.insert(

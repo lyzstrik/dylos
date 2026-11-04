@@ -211,6 +211,15 @@ impl FcClient {
         B: Serialize + ?Sized,
         R: for<'de> Deserialize<'de>,
     {
+        let body_bytes = match body {
+            Some(b) => serde_json::to_vec(b).map_err(|e| Error::Serialize {
+                path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
+                source: e,
+            })?,
+            None => vec![],
+        };
         let stream = self.connect().await.map_err(|e| Error::Connect {
             path: self.socket_path.clone(),
             method: method.to_string(),
@@ -218,7 +227,12 @@ impl FcClient {
             source: e,
         })?;
 
-        let io = TokioIo::new(stream);
+        let state = std::sync::Arc::new(crate::transport::RequestState::default());
+        let io = TokioIo::new(crate::transport::ResponseStream::new(
+            stream,
+            state.clone(),
+            body_bytes.len(),
+        ));
         let (mut sender, conn) = http1::handshake(io).await.map_err(|e| Error::Handshake {
             path: self.socket_path.clone(),
             method: method.to_string(),
@@ -232,15 +246,6 @@ impl FcClient {
             }
         });
 
-        let body_bytes = match body {
-            Some(b) => serde_json::to_vec(b).map_err(|e| Error::Serialize {
-                path: self.socket_path.clone(),
-                method: method.to_string(),
-                route: route.to_string(),
-                source: e,
-            })?,
-            None => vec![],
-        };
         let req_body = Full::new(Bytes::from(body_bytes));
 
         let req = Request::builder()
@@ -256,13 +261,33 @@ impl FcClient {
                 source: e,
             })?;
 
-        let res = sender.send_request(req).await.map_err(|e| Error::Request {
-            path: self.socket_path.clone(),
-            method: method.to_string(),
-            route: route.to_string(),
-            source: e,
+        let res = sender.send_request(req).await.map_err(|e| {
+            if let Some(source) = state.error.get() {
+                return Error::IncompleteRequest {
+                    path: self.socket_path.clone(),
+                    method: method.to_string(),
+                    route: route.to_string(),
+                    source: source.clone(),
+                };
+            }
+            Error::Request {
+                path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
+                source: e,
+            }
         })?;
 
+        self.finish_response(res, &method, route, &state).await
+    }
+
+    async fn finish_response<R: for<'de> Deserialize<'de>>(
+        &self,
+        res: hyper::Response<hyper::body::Incoming>,
+        method: &hyper::Method,
+        route: &str,
+        state: &crate::transport::RequestState,
+    ) -> Result<Option<R>> {
         let status = res.status();
         let limited_body = http_body_util::Limited::new(res.into_body(), RESPONSE_SIZE_LIMIT);
         let body_bytes = limited_body
@@ -284,11 +309,36 @@ impl FcClient {
                         method: method.to_string(),
                         route: route.to_string(),
                         status: status.as_u16(),
-                        source: e,
+                        source: if let Some(write_error) = state.error.get() {
+                            Box::new(std::io::Error::other(format!(
+                                "request not fully sent ({write_error}); response body failed: {e}"
+                            )))
+                        } else {
+                            e
+                        },
                     }
                 }
             })?
             .to_bytes();
+
+        if !status.is_client_error()
+            && !status.is_server_error()
+            && (state.error.get().is_some()
+                || !state.sent.load(std::sync::atomic::Ordering::Acquire))
+        {
+            let source = state.error.get().cloned().unwrap_or_else(|| {
+                std::sync::Arc::new(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "response arrived before the complete request was sent",
+                ))
+            });
+            return Err(Error::IncompleteRequest {
+                path: self.socket_path.clone(),
+                method: method.to_string(),
+                route: route.to_string(),
+                source,
+            });
+        }
 
         if !status.is_success() {
             let mut fault_message =
@@ -316,7 +366,7 @@ impl FcClient {
             });
         }
 
-        Self::parse_response(&self.socket_path, &method, route, status, &body_bytes)
+        Self::parse_response(&self.socket_path, method, route, status, &body_bytes)
     }
 
     fn parse_response<R: for<'de> Deserialize<'de>>(

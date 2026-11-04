@@ -22,12 +22,7 @@ fn path_buf_strategy() -> impl Strategy<Value = PathBuf> {
 }
 
 fn hex_sha256_strategy() -> impl Strategy<Value = String> {
-    prop::collection::vec(any::<u8>(), 32).prop_map(|bytes| {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(&bytes);
-        format!("{:02x}", hasher.finalize())
-    })
+    "[0-9a-f]{64}".prop_map(|s| s)
 }
 
 fn file_meta_strategy() -> impl Strategy<Value = FileMeta> {

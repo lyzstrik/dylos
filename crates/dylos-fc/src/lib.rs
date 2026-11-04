@@ -15,6 +15,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod snapshot;
+mod transport;
 
 pub use client::FcClient;
 pub use error::{Error, Result};
