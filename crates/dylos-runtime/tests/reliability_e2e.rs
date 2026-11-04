@@ -249,7 +249,16 @@ async fn snapshot_fork_down_endurance() {
             down(clone).await;
         }
         down(source).await;
-        empty_directory(&config.store.base);
+        // Snapshots are artifacts that outlive their source lab; delete this
+        // cycle's explicitly so every other store entry must be gone.
+        config.store.remove_snapshot("endurance", "cycle").unwrap();
+        empty_directory(&config.store.base.join("snapshots/endurance"));
+        let leftovers: Vec<_> = std::fs::read_dir(&config.store.base)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name != "snapshots")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
         empty_directory(&config.netns_dir);
         eprintln!(
             "LYZ-27 endurance: cycle {}/{cycles}, netns/TAPs/bridges/processes/files remaining=0",

@@ -16,7 +16,8 @@ Each ABC lab uses three single-vCPU guests with 128 MiB RAM each.
   paths, lab files and namespace mounts must be absent. A retained namespace
   descriptor allows direct inspection after unmount: no links except loopback
   may remain, including TAPs and bridges. The descriptor is then closed.
-  Each cycle also requires empty store and namespace directories.
+  Each cycle deletes its snapshot, then requires an empty store (apart from
+  the empty `snapshots/` parent) and an empty namespace directory.
 
 ## Results for LYZ-28
 
