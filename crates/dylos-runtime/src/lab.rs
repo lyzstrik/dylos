@@ -185,8 +185,8 @@ impl Lab {
         let span = tracing::info_span!("lab_restore", lab = lab_id);
         let mut lab = Self {
             id: lab_id.into(),
-            store: Some(config.store.clone()),
-            spec: Some(spec.clone()),
+            store: config.store.clone(),
+            spec: spec.clone(),
             storage: Some(storage),
             network: None,
             vms: Vec::new(),
@@ -194,7 +194,7 @@ impl Lab {
             lock: None,
             span: span.clone(),
             cleanup_on_drop: true,
-            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+            snapshots: SnapshotSlot::default(),
         };
         let started = Instant::now();
         if let Err(operation) = lab
@@ -280,7 +280,7 @@ impl Lab {
         );
         if restoring {
             self.load_restored().await?;
-            crate::resume_all(self).await?;
+            crate::resume_all(&self.id, &self.vms).await?;
             if let Some(network) = self.network.as_mut() {
                 network.thaw().await?;
             }
