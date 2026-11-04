@@ -26,6 +26,7 @@ tokio = { workspace = true, features = ["fs", "process", "sync", "time"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+nix = { workspace = true, features = ["mount"] }
 dylos-runtime = { path = ".", features = ["test-hooks", "test-support"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }

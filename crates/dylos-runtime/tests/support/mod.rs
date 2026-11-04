@@ -100,6 +100,22 @@ impl Sandbox {
         assert_eq!(left, Vec::<PathBuf>::new(), "cgroups left behind");
     }
 
+    /// Makes every jail started from now on hold a mount that blocks its removal.
+    pub fn make_teardown_fail(&self) {
+        std::fs::write(self.dir.path().join("busy-jail"), b"").unwrap();
+    }
+
+    /// Releases the mounts of `make_teardown_fail` so the leftovers can be cleaned up.
+    pub fn release_busy_jails(&self) {
+        let base = self.dir.path().join("jails/firecracker");
+        for entry in std::fs::read_dir(base).into_iter().flatten() {
+            let busy = entry.unwrap().path().join("root/busy");
+            if busy.exists() {
+                nix::mount::umount2(&busy, nix::mount::MntFlags::MNT_DETACH).unwrap();
+            }
+        }
+    }
+
     pub async fn release_output_holder(&self) {
         let socket = self.dir.path().join("output-holder.sock");
         let stream = UnixStream::connect(socket).await.unwrap();
@@ -120,6 +136,21 @@ impl Sandbox {
 pub async fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
     let res = tokio::time::timeout(timeout, async {
         while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(res.is_ok(), "timed out waiting until {what}");
+}
+
+/// Like `wait_until`, for a condition that has to await.
+pub async fn wait_until_async<F: Future<Output = bool>>(
+    what: &str,
+    timeout: Duration,
+    mut condition: impl FnMut() -> F,
+) {
+    let res = tokio::time::timeout(timeout, async {
+        while !condition().await {
             tokio::task::yield_now().await;
         }
     })
@@ -156,6 +187,24 @@ pub fn run_fake_jailer_if_requested() {
         std::fs::create_dir_all(cgroup.join(parent).join(&id)).unwrap();
     }
     let mode = std::fs::read_to_string(&exec).unwrap();
+    // A mount point inside the jail makes the lab's teardown fail with EBUSY.
+    if Path::new(&base)
+        .parent()
+        .unwrap()
+        .join("busy-jail")
+        .exists()
+    {
+        let busy = root.join("busy");
+        std::fs::create_dir_all(&busy).unwrap();
+        nix::mount::mount(
+            Some("tmpfs"),
+            &busy,
+            Some("tmpfs"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+    }
     if mode == "LabPartialLaunch" && id.ends_with("-B") {
         std::process::exit(3);
     }

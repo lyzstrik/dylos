@@ -7,6 +7,11 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+dylos-core = { path = "../crates/dylos-core" }
+dylos-runtime = { path = "../crates/dylos-runtime" }
+dylos-store = { path = "../crates/dylos-store" }
+futures-util = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "time"] }
 
 [lints]
 workspace = true
