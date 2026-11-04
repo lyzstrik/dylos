@@ -266,17 +266,7 @@ impl SnapshotManifest {
                     hasher.update(&buffer[..n]);
                 }
 
-                let actual_sha256 = hasher
-                    .finalize()
-                    .iter()
-                    .flat_map(|byte| {
-                        let hex = b"0123456789abcdef";
-                        [
-                            char::from(hex[usize::from(byte >> 4)]),
-                            char::from(hex[usize::from(byte & 0xf)]),
-                        ]
-                    })
-                    .collect::<String>();
+                let actual_sha256 = encode_hex(&hasher.finalize());
 
                 if actual_size != file.size || actual_sha256 != file.sha256 {
                     return Err(Error::IntegrityMismatch {
@@ -292,4 +282,17 @@ impl SnapshotManifest {
         }
         Ok(())
     }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| {
+            [
+                char::from(HEX[usize::from(byte >> 4)]),
+                char::from(HEX[usize::from(byte & 0xf)]),
+            ]
+        })
+        .collect()
 }

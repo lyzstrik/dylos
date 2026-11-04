@@ -37,3 +37,8 @@ fn different_seeds_differ() {
     assert_ne!(mac1, mac2);
     assert_ne!(mac1.to_string(), mac2.to_string());
 }
+
+#[test]
+fn known_answer() {
+    assert_eq!(MacAddr::from_seed(b"test").to_string(), "02:9f:86:d0:81:88");
+}

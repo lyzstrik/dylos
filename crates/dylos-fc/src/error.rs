@@ -2,6 +2,14 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("request not fully sent for {method} {route} on {path:?}: peer closed request reader")]
+    IncompleteRequest {
+        path: PathBuf,
+        method: String,
+        route: String,
+        #[source]
+        source: std::sync::Arc<std::io::Error>,
+    },
     #[error("response too large for {method} {route} on {path:?}: exceeded limit of {limit} bytes")]
     ResponseTooLarge {
         path: PathBuf,
