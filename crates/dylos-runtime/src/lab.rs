@@ -451,20 +451,7 @@ impl Lab {
             "all VM APIs ready"
         );
         if restoring {
-            self.load_restored().await?;
-            crate::resume_all(&self.id, &self.vms).await?;
-            if let Some(network) = self.network.as_mut() {
-                network.thaw().await?;
-            }
-            let latency = netns_started.elapsed();
-            self.restore_latency = Some(latency);
-            tracing::info!(
-                lab = %self.id,
-                latency_ms = latency.as_millis(),
-                target_ms = 500,
-                "clone restored and thawed (netns to thaw)"
-            );
-            self.bind_control_socket().await?;
+            self.resume_restored(config, netns_started).await?;
             return Ok(());
         }
         let started = Instant::now();
@@ -502,6 +489,29 @@ impl Lab {
         )?;
         self.verify_readiness(spec).await?;
         self.bind_control_socket().await
+    }
+
+    async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
+        let listeners =
+            crate::agent::listeners(&self.vms, &config.jailer).map_err(|e| io(&self.id, e))?;
+        self.load_restored().await?;
+        crate::resume_all(&self.id, &self.vms).await?;
+        crate::agent::resync_all(&self.vms, &listeners)
+            .await
+            .map_err(|e| invalid(&self.id, &e.to_string()))?;
+        if let Some(network) = self.network.as_mut() {
+            network.thaw().await?;
+        }
+        let latency = netns_started.elapsed();
+        self.restore_latency = Some(latency);
+        tracing::info!(
+            lab = %self.id,
+            latency_ms = latency.as_millis(),
+            target_ms = 500,
+            "clone restored and thawed (netns to thaw)"
+        );
+        self.bind_control_socket().await?;
+        Ok(())
     }
 
     async fn load_restored(&self) -> Result<()> {
@@ -1301,6 +1311,14 @@ async fn configure_vm(
             drive.path_on_host = Some("/rootfs.ext4".into());
             drive.is_read_only = Some(false);
             api.put_drive(&drive).await?;
+            let _: Option<serde_json::Value> = api
+                .put(
+                    "/vsock",
+                    &serde_json::json!({
+                        "guest_cid": 3, "uds_path": "/vsock.sock"
+                    }),
+                )
+                .await?;
             for interface in &node.interfaces {
                 let mut net = NetworkInterface::new(
                     &interface.name,
