@@ -21,7 +21,8 @@ RUN apk add --no-cache e2fsprogs \
         alpine-base iperf3 socat iproute2 \
     && mkdir -p /rootfs/proc /rootfs/sys /rootfs/dev /rootfs/sbin \
     && rm -f /rootfs/sbin/init \
-    && : > /rootfs/var/log/apk.log
+    && : > /rootfs/var/log/apk.log \
+    && dd if=/dev/zero of=/rootfs/var/log/churn.dat bs=1M count=4
 
 COPY init /rootfs/sbin/init
 COPY net-setup /rootfs/sbin/net-setup
@@ -31,9 +32,11 @@ COPY --from=agent /src/target/x86_64-unknown-linux-musl/release/dylos-agent /roo
 
 RUN chmod 0755 /rootfs/sbin/init /rootfs/sbin/net-setup /rootfs/sbin/net-setup-guard \
         /rootfs/sbin/report-readiness /rootfs/usr/sbin/dylos-agent \
+    && chmod 0644 /rootfs/var/log/churn.dat \
     && find /rootfs -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
     && mkdir -p /out \
     && E2FSPROGS_FAKE_TIME="${SOURCE_DATE_EPOCH}" mkfs.ext4 -F -q -d /rootfs \
+        -O ^orphan_file \
         -U 01234567-89ab-cdef-0123-456789abcdef \
         -E hash_seed=01234567-89ab-cdef-0123-456789abcdef,lazy_itable_init=0,lazy_journal_init=0 \
         /out/rootfs.ext4 "${ROOTFS_SIZE}"
