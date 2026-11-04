@@ -89,35 +89,42 @@ async fn capture(config: &LabConfig, lab: &Lab, label: &str) -> String {
     out
 }
 
-/// Waits until no guest neighbor entry is in DELAY, PROBE or INCOMPLETE.
+/// Waits until no guest neighbor entry is in DELAY, PROBE or INCOMPLETE, within `timeout`
+/// overall (every guest command included).
 ///
 /// A snapshot captures the guests' neighbor state machines mid-flight: B only forwards between A
 /// and C, which never confirms its IPv4 or IPv6 entries, so they are restored in DELAY with a
-/// pending probe. The only first echo lost in CI coincided with those restored transitions
-/// completing (see the PR); once they have completed, single probes must succeed.
+/// pending probe. Hypothesis, not established: the only first echo lost in CI coincided with
+/// those restored transitions completing (see the PR), so this wait is a stabilization
+/// experiment for the single-probe checks, not proof of the cause or of readiness right after
+/// thaw.
 async fn neighbors_settled(config: &LabConfig, lab: &Lab, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
     let command = "ip neigh show nud delay; ip neigh show nud probe; ip neigh show nud incomplete";
-    loop {
-        let mut pending = String::new();
-        for node in ["A", "B", "C"] {
-            // An exec failure is not a pending transition: fail at once.
-            let out = guest(lab, node, command).await;
-            if !out.trim().is_empty() {
-                writeln!(pending, "{node}: {}", out.trim()).unwrap();
+    let mut pending = String::new();
+    let settled = tokio::time::timeout(timeout, async {
+        loop {
+            let mut round = String::new();
+            for node in ["A", "B", "C"] {
+                // An exec failure is not a pending transition: fail at once.
+                let out = guest(lab, node, command).await;
+                if !out.trim().is_empty() {
+                    writeln!(round, "{node}: {}", out.trim()).unwrap();
+                }
             }
+            if round.is_empty() {
+                return;
+            }
+            pending = round;
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
-        if pending.is_empty() {
-            return;
-        }
-        if Instant::now() >= deadline {
-            let state = capture(config, lab, "neighbors not settled").await;
-            panic!(
-                "{}: neighbor transitions pending after {timeout:?}:\n{pending}{state}",
-                lab.id()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    })
+    .await;
+    if settled.is_err() {
+        let state = capture(config, lab, "neighbors not settled").await;
+        panic!(
+            "{}: neighbor transitions pending after {timeout:?}, last complete poll:\n{pending}{state}",
+            lab.id()
+        );
     }
 }
 
