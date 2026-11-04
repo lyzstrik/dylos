@@ -115,7 +115,7 @@ async fn progress(lab: &Lab, family: &str, previous: u64) -> u64 {
 
 async fn down(mut lab: Lab) {
     let root = lab.root().to_owned();
-    let namespace = lab.network().unwrap().netns_path().to_owned();
+    let namespace = lab.network_mut().unwrap().netns_path().to_owned();
     let namespace_handle = std::fs::File::open(&namespace).unwrap();
     let paths: Vec<_> = lab
         .vms()
@@ -185,8 +185,8 @@ async fn tcp_survives_in_all_ten_clones() {
         clones = Lab::fork_with(&config, &config.store.snapshot_dir("survival", "tcp"), &ids).await.unwrap();
         assert_eq!(clones.len(), 10);
         source.teardown().await.unwrap();
-        let namespaces: std::collections::HashSet<_> = clones.iter()
-            .map(|lab| lab.network().unwrap().netns_path()).collect();
+        let namespaces: std::collections::HashSet<_> = clones.iter_mut()
+            .map(|lab| lab.network_mut().unwrap().netns_path().to_owned()).collect();
         assert_eq!(namespaces.len(), 10);
         for clone in &clones {
             for family in ["-6", "-4"] {

@@ -86,6 +86,7 @@ impl JailerConfig {
 pub struct ChrootFile {
     pub source: PathBuf,
     pub name: String,
+    pub read_only: bool,
 }
 
 impl ChrootFile {
@@ -93,6 +94,16 @@ impl ChrootFile {
         Self {
             source: source.into(),
             name: name.into(),
+            read_only: false,
+        }
+    }
+
+    #[must_use]
+    pub fn read_only(source: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            name: name.into(),
+            read_only: true,
         }
     }
 
@@ -444,7 +455,16 @@ fn populate(
             #[cfg(feature = "test-hooks")]
             source_barrier,
         )?;
-        own(&placed, &paths.host_path(&file.jailed_path()))?;
+        let placed_path = paths.host_path(&file.jailed_path());
+        if file.read_only {
+            // Never chmod or chown here: a hard link shares the inode with every other clone.
+            let meta = placed
+                .metadata()
+                .map_err(io("stat placed file", &placed_path))?;
+            trusted_read_only(&meta).map_err(io("validate read-only file", &placed_path))?;
+        } else {
+            own(&placed, &placed_path)?;
+        }
     }
     let metrics_path = paths.host_path(METRICS_FILE);
     let metrics = openat(
@@ -505,6 +525,9 @@ fn place_file(
             ErrorKind::InvalidInput.into(),
         ));
     }
+    if file.read_only {
+        trusted_read_only(&pinned).map_err(io("validate read-only source", &file.source))?;
+    }
     #[cfg(feature = "test-hooks")]
     if let Some(barrier) = source_barrier {
         barrier.wait();
@@ -556,6 +579,10 @@ fn place_file(
         }
     };
     Ok(placed)
+}
+
+fn trusted_read_only(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    dylos_store::ensure_trusted_read_only(meta.uid(), meta.mode(), Uid::effective().as_raw())
 }
 
 fn ignore_missing(res: std::io::Result<()>) -> std::io::Result<()> {
