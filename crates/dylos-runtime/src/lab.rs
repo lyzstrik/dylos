@@ -2,9 +2,9 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dylos_core::manifest::SnapshotManifest;
 use dylos_core::{LabSpec, guest_net};
 use dylos_fc::config::{BootSource, Drive, MachineConfiguration, NetworkInterface};
 use dylos_net::{FabricPlan, LabNetwork};
@@ -16,11 +16,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::Instrument;
 
 use crate::jailer::{ChrootFile, JailPaths, JailerConfig};
+use crate::snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings};
 use crate::{ProcessState, Timeouts, Vm, VmSpec};
-
-#[cfg(feature = "test-hooks")]
-static EXPECTED_UID_OVERRIDE: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
 
 #[derive(Debug, thiserror::Error)]
 pub enum LabError {
@@ -92,8 +89,8 @@ impl Default for LabConfig {
 #[must_use]
 pub struct Lab {
     id: String,
-    store: Option<dylos_store::Store>,
-    spec: Option<LabSpec>,
+    store: dylos_store::Store,
+    spec: LabSpec,
     storage: Option<dylos_store::Lab>,
     network: Option<LabNetwork>,
     vms: Vec<Vm>,
@@ -101,7 +98,7 @@ pub struct Lab {
     lock: Option<Flock<File>>,
     span: tracing::Span,
     cleanup_on_drop: bool,
-    active_snapshot: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    snapshots: SnapshotSlot,
     restore_latency: Option<Duration>,
 }
 
@@ -111,53 +108,19 @@ impl Lab {
         &self.id
     }
 
-    /// Constructs a VM-only lab for unprivileged API tests.
-    #[cfg(feature = "test-hooks")]
-    pub fn from_test_vms(id: &str, vms: Vec<Vm>) -> Self {
-        Self {
-            id: id.into(),
-            store: None,
-            spec: None,
-            storage: None,
-            network: None,
-            vms,
-            listener: None,
-            lock: None,
-            span: tracing::info_span!("lab", lab = id),
-            cleanup_on_drop: false,
-            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
-            restore_latency: None,
-        }
+    /// Pauses every VM concurrently and returns the confirmation skew.
+    /// Freeze the fabric first for a consistent snapshot; run this future to completion.
+    /// # Errors
+    /// Resumes every VM after a pause failure, preserving rollback errors.
+    pub async fn pause_all(&mut self) -> Result<Duration> {
+        crate::pause_all(&self.id, &self.vms).await
     }
 
-    /// Constructs a VM lab with store, spec and storage for unprivileged snapshot tests.
-    #[cfg(feature = "test-hooks")]
-    pub fn from_test_vms_with_store(
-        id: &str,
-        vms: Vec<Vm>,
-        store: dylos_store::Store,
-        spec: LabSpec,
-        storage: Option<dylos_store::Lab>,
-    ) -> Self {
-        Self {
-            id: id.into(),
-            store: Some(store),
-            spec: Some(spec),
-            storage,
-            network: None,
-            vms,
-            listener: None,
-            lock: None,
-            span: tracing::info_span!("lab", lab = id),
-            cleanup_on_drop: false,
-            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
-            restore_latency: None,
-        }
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub fn set_control_uid_override(uid: Option<u32>) {
-        EXPECTED_UID_OVERRIDE.store(uid.unwrap_or(u32::MAX), std::sync::atomic::Ordering::SeqCst);
+    /// Resumes every VM concurrently and waits for all responses.
+    /// # Errors
+    /// Returns the first failure and logs every failed response.
+    pub async fn resume_all(&mut self) -> Result<()> {
+        crate::resume_all(&self.id, &self.vms).await
     }
 
     /// # Errors
@@ -178,8 +141,8 @@ impl Lab {
             let storage = blocking(lab_id, move || Ok(store.create(&id, &spec_copy)?)).await?;
             let mut lab = Self {
                 id: lab_id.into(),
-                store: Some(config.store.clone()),
-                spec: Some(spec.clone()),
+                store: config.store.clone(),
+                spec: spec.clone(),
                 storage: Some(storage),
                 network: None,
                 vms: Vec::new(),
@@ -187,7 +150,7 @@ impl Lab {
                 lock: None,
                 span: span.clone(),
                 cleanup_on_drop: true,
-                active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+                snapshots: SnapshotSlot::default(),
                 restore_latency: None,
             };
             let result = lab.bring_up(config, spec, plan, false).await;
@@ -229,8 +192,8 @@ impl Lab {
         let span = tracing::info_span!("lab_restore", lab = lab_id);
         let mut lab = Self {
             id: lab_id.into(),
-            store: Some(config.store.clone()),
-            spec: Some(spec.clone()),
+            store: config.store.clone(),
+            spec: spec.clone(),
             storage: Some(storage),
             network: None,
             vms: Vec::new(),
@@ -238,7 +201,7 @@ impl Lab {
             lock: None,
             span: span.clone(),
             cleanup_on_drop: true,
-            active_snapshot: Arc::new(tokio::sync::Mutex::new(None)),
+            snapshots: SnapshotSlot::default(),
             restore_latency: None,
         };
         let started = Instant::now();
@@ -263,15 +226,38 @@ impl Lab {
         Ok(lab)
     }
 
+    /// Maximum number of clones allowed in a single fork operation.
+    pub const MAX_CLONES: usize = 1024;
+
     /// Generates `count` deterministic clone identifiers formatted as `<prefix>-c1..cN`.
     ///
     /// # Errors
-    /// Returns an error if `count` is 0 or if any generated identifier exceeds maximum length or is invalid.
+    /// Returns an error if `count` is 0 or exceeds [`Self::MAX_CLONES`], or if any generated identifier exceeds maximum length or is invalid.
     pub fn generate_clone_ids(prefix: &str, count: usize) -> Result<Vec<String>> {
         if count == 0 {
             return Err(invalid(prefix, "clone count must be at least 1"));
         }
-        let mut ids = Vec::with_capacity(count);
+        if count > Self::MAX_CLONES {
+            return Err(invalid(
+                prefix,
+                &format!(
+                    "clone count {count} exceeds maximum allowed limit of {}",
+                    Self::MAX_CLONES
+                ),
+            ));
+        }
+        // Validate longest generated identifier first before allocating memory
+        let longest_id = format!("{prefix}-c{count}");
+        dylos_core::validate_name(&longest_id, 32)
+            .map_err(|reason| invalid(&longest_id, &format!("invalid clone id: {reason}")))?;
+
+        let mut ids = Vec::new();
+        ids.try_reserve(count).map_err(|e| {
+            invalid(
+                prefix,
+                &format!("failed to allocate memory for clone ids: {e}"),
+            )
+        })?;
         for i in 1..=count {
             let id = format!("{prefix}-c{i}");
             dylos_core::validate_name(&id, 32)
@@ -286,14 +272,21 @@ impl Lab {
     /// If any clone restore fails, all successfully started clones are rolled back and torn down.
     ///
     /// # Errors
-    /// Rejects empty clone lists, invalid or duplicate clone IDs, and propagates any restore error.
+    /// Rejects empty or oversized (over [`Self::MAX_CLONES`]) clone lists, invalid or duplicate
+    /// clone IDs, and propagates any restore error.
     pub async fn fork_with(
         config: &LabConfig,
         snapshot: &Path,
         clone_ids: &[String],
     ) -> Result<Vec<Self>> {
-        if clone_ids.is_empty() {
-            return Err(invalid("fork", "at least one clone identifier required"));
+        if clone_ids.is_empty() || clone_ids.len() > Self::MAX_CLONES {
+            return Err(invalid(
+                "fork",
+                &format!(
+                    "between 1 and {} clone identifiers required",
+                    Self::MAX_CLONES
+                ),
+            ));
         }
         let mut seen = std::collections::HashSet::new();
         for id in clone_ids {
@@ -339,12 +332,26 @@ impl Lab {
         }
 
         if let Some(err) = first_error {
-            join_all(labs.into_iter().map(|mut lab| async move {
-                if let Err(cleanup_err) = lab.teardown().await {
-                    tracing::error!(lab = %lab.id(), error = %cleanup_err, "rollback teardown failed");
-                }
+            let mut cleanup_error = None;
+            let cleanup_results = join_all(labs.into_iter().map(|mut lab| async move {
+                let id = lab.id().to_string();
+                (id, lab.teardown().await)
             }))
             .await;
+            for (id, res) in cleanup_results {
+                if let Err(cleanup_err) = res {
+                    tracing::error!(lab = %id, error = %cleanup_err, "rollback teardown failed");
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(cleanup_err);
+                    }
+                }
+            }
+            if let Some(cleanup) = cleanup_error {
+                return Err(LabError::Rollback {
+                    operation: Box::new(err),
+                    cleanup: Box::new(cleanup),
+                });
+            }
             return Err(err);
         }
 
@@ -388,10 +395,13 @@ impl Lab {
                 )];
                 if restoring {
                     for name in ["vm.state", "vm.mem"] {
-                        files.push(ChrootFile::new(
-                            self.root().join("vms").join(&node.name).join(name),
-                            name,
-                        ));
+                        let path = self.root().join("vms").join(&node.name).join(name);
+                        let read_only = name == "vm.mem";
+                        files.push(if read_only {
+                            ChrootFile::read_only(path, name)
+                        } else {
+                            ChrootFile::new(path, name)
+                        });
                     }
                 } else {
                     files.push(ChrootFile::new(&config.kernel, "vmlinux.bin"));
@@ -468,15 +478,15 @@ impl Lab {
             }))
             .await,
         )?;
-        self.bind_control_socket().await?;
-        Ok(())
+        self.verify_readiness(spec).await?;
+        self.bind_control_socket().await
     }
 
     async fn resume_restored(&mut self, config: &LabConfig) -> Result<()> {
         let listeners =
             crate::agent::listeners(&self.vms, &config.jailer).map_err(|e| io(&self.id, e))?;
         self.load_restored().await?;
-        crate::resume_all(self).await?;
+        crate::resume_all(&self.id, &self.vms).await?;
         crate::agent::resync_all(&self.vms, &listeners)
             .await
             .map_err(|e| invalid(&self.id, &e.to_string()))?;
@@ -509,22 +519,13 @@ impl Lab {
         Ok(())
     }
 
-    /// Binds the control socket listener.
-    ///
-    /// # Errors
-    /// Returns [`LabError::Io`] if socket binding fails.
-    pub async fn bind_control_socket(&mut self) -> Result<PathBuf> {
+    async fn bind_control_socket(&mut self) -> Result<()> {
         let socket = self.control_socket();
-        if let Some(parent) = socket.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| io(&self.id, e))?;
-        }
         self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(|e| io(&self.id, e))?;
-        Ok(socket)
+        Ok(())
     }
 
     #[must_use]
@@ -544,6 +545,52 @@ impl Lab {
         &self.vms
     }
 
+    /// Runs the consistent snapshot sequence of ADR-0001 on every VM of the lab.
+    ///
+    /// # Errors
+    /// Returns [`LabError`] on failure at any step or rollback.
+    pub async fn snapshot(&mut self, snapshot_id: &str) -> Result<SnapshotManifest> {
+        self.snapshot_with_timings(snapshot_id)
+            .await
+            .map(|(manifest, _)| manifest)
+    }
+
+    /// As [`Lab::snapshot`], also returning step durations.
+    ///
+    /// # Errors
+    /// Returns [`LabError`] on failure at any step or rollback.
+    pub async fn snapshot_with_timings(
+        &mut self,
+        snapshot_id: &str,
+    ) -> Result<(SnapshotManifest, SnapshotTimings)> {
+        let request = SnapshotRequest {
+            lab_id: &self.id,
+            snapshot_id,
+            spec: &self.spec,
+            store: &self.store,
+            storage: self.storage.as_ref(),
+            vms: &self.vms,
+            network: self.network.as_ref(),
+        };
+        crate::snapshot_vms(request, &self.snapshots).await
+    }
+
+    #[must_use]
+    pub fn has_active_snapshot(&self) -> bool {
+        self.snapshots.is_active()
+    }
+
+    /// Waits until the in-flight snapshot task, if any, has finished its recovery.
+    pub async fn wait_for_active_snapshot(&self) {
+        self.snapshots.wait().await;
+    }
+
+    /// Gives integration tests access to the live fabric, until teardown removes it.
+    #[cfg(feature = "test-support")]
+    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
+        self.network.as_mut()
+    }
+
     /// Returns a reference to the VM with the given node name, if present.
     #[must_use]
     pub fn vm(&self, node: &str) -> Option<&Vm> {
@@ -554,7 +601,6 @@ impl Lab {
     ///
     /// # Errors
     /// Returns [`LabError::Invalid`] if the node is not found, or any error from `Vm::exec`.
-    #[cfg(feature = "test-support")]
     pub async fn exec(
         &self,
         node: &str,
@@ -568,87 +614,102 @@ impl Lab {
         vm.exec(cmd, timeout).await.map_err(LabError::from)
     }
 
-    #[must_use]
-    pub fn store(&self) -> Option<&dylos_store::Store> {
-        self.store.as_ref()
-    }
+    async fn verify_readiness(&self, spec: &LabSpec) -> Result<()> {
+        let mut v6_probes = Vec::new();
+        let mut v4_probes = Vec::new();
 
-    #[must_use]
-    pub fn spec(&self) -> Option<&LabSpec> {
-        self.spec.as_ref()
-    }
-
-    #[must_use]
-    pub fn storage(&self) -> Option<&dylos_store::Lab> {
-        self.storage.as_ref()
-    }
-
-    #[must_use]
-    pub fn network(&self) -> Option<&LabNetwork> {
-        self.network.as_ref()
-    }
-
-    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
-        self.network.as_mut()
-    }
-
-    #[cfg(feature = "test-hooks")]
-    pub fn set_network(&mut self, net: LabNetwork) {
-        self.network = Some(net);
-    }
-
-    /// Runs the consistent snapshot sequence per ADR-0001:
-    /// fabric freeze -> pause all VMs -> snapshot & clone disks -> write manifest -> resume all VMs -> thaw fabric.
-    ///
-    /// # Errors
-    /// Returns [`LabError`] on failure at any step or rollback.
-    pub async fn snapshot(
-        &mut self,
-        snapshot_id: &str,
-    ) -> Result<dylos_core::manifest::SnapshotManifest> {
-        crate::snapshot::snapshot_lab(self, snapshot_id).await
-    }
-
-    /// Runs the consistent snapshot sequence and returns the manifest together with step durations.
-    ///
-    /// # Errors
-    /// Returns [`LabError`] on failure at any step or rollback.
-    pub async fn snapshot_with_timings(
-        &mut self,
-        snapshot_id: &str,
-    ) -> Result<(
-        dylos_core::manifest::SnapshotManifest,
-        crate::snapshot::SnapshotTimings,
-    )> {
-        crate::snapshot::snapshot_lab_with_timings(self, snapshot_id).await
-    }
-
-    /// Checks if a snapshot task is currently running on this lab.
-    #[must_use]
-    pub fn has_active_snapshot(&self) -> bool {
-        match self.active_snapshot.try_lock() {
-            Ok(guard) => guard.is_some(),
-            Err(_) => true,
+        for node in &spec.nodes {
+            for route in &node.static_routes {
+                for peer in &spec.nodes {
+                    if peer.name == node.name {
+                        continue;
+                    }
+                    for iface in &peer.interfaces {
+                        let ip_v6 = std::net::IpAddr::V6(iface.ipv6.addr());
+                        if route.destination.contains(&ip_v6) {
+                            v6_probes.push((
+                                node.name.clone(),
+                                "-6",
+                                iface.ipv6.addr().to_string(),
+                            ));
+                        }
+                        if let Some(ipv4) = iface.ipv4 {
+                            let ip_v4 = std::net::IpAddr::V4(ipv4.addr());
+                            if route.destination.contains(&ip_v4) {
+                                v4_probes.push((node.name.clone(), "-4", ipv4.addr().to_string()));
+                            }
+                        }
+                    }
+                }
+            }
         }
-    }
 
-    /// Returns a reference to the active snapshot tracker.
-    #[must_use]
-    pub fn active_snapshot_tracker(
-        &self,
-    ) -> Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> {
-        Arc::clone(&self.active_snapshot)
-    }
-
-    /// Waits for any in-flight snapshot task to complete and cleans the tracker.
-    pub async fn wait_for_active_snapshot(&mut self) {
-        let handle = {
-            let mut lock = self.active_snapshot.lock().await;
-            lock.take()
-        };
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        if v6_probes.is_empty() && v4_probes.is_empty() {
+            for node in &spec.nodes {
+                for iface in &node.interfaces {
+                    for peer in &spec.nodes {
+                        if peer.name == node.name {
+                            continue;
+                        }
+                        for peer_iface in &peer.interfaces {
+                            if peer_iface.segment == iface.segment {
+                                v6_probes.push((
+                                    node.name.clone(),
+                                    "-6",
+                                    peer_iface.ipv6.addr().to_string(),
+                                ));
+                                if let Some(peer_ipv4) = peer_iface.ipv4 {
+                                    v4_probes.push((
+                                        node.name.clone(),
+                                        "-4",
+                                        peer_ipv4.addr().to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
+
+        v6_probes.dedup();
+        v4_probes.dedup();
+
+        // IPv6-first (ADR-0002)
+        for (node, family, target) in &v6_probes {
+            self.probe_peer(node, family, target).await?;
+        }
+
+        // Then IPv4
+        for (node, family, target) in &v4_probes {
+            self.probe_peer(node, family, target).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn probe_peer(&self, node: &str, family: &str, target: &str) -> Result<()> {
+        let cmd = format!("ping {family} -c 1 -W 1 {target}");
+        let mut last_err = String::new();
+        for _ in 0..3 {
+            match self.exec(node, &cmd, Duration::from_secs(2)).await {
+                Ok(out) if out.success() => return Ok(()),
+                Ok(out) => {
+                    last_err = out.stdout;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
+        Err(LabError::Vm(crate::Error::ReadinessFailed {
+            id: node.to_string(),
+            line: format!(
+                "across-lab connectivity probe failed: {node} cannot ping {target} ({family}): {last_err}"
+            ),
+        }))
     }
 
     /// Returns the latency from network namespace creation to fabric thaw if this lab was restored or forked.
@@ -724,22 +785,7 @@ impl Lab {
                     accepted = listener.accept() => {
                         let (mut stream, _) = accepted.map_err(|e| io(&self.id, e))?;
                         let credentials = stream.peer_cred().map_err(|e| io(&self.id, e))?;
-                        let expected_uid = {
-                            #[cfg(feature = "test-hooks")]
-                            {
-                                let overridden = EXPECTED_UID_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst);
-                                if overridden == u32::MAX {
-                                    nix::unistd::geteuid().as_raw()
-                                } else {
-                                    overridden
-                                }
-                            }
-                            #[cfg(not(feature = "test-hooks"))]
-                            {
-                                nix::unistd::geteuid().as_raw()
-                            }
-                        };
-                        if credentials.uid() != expected_uid { continue; }
+                        if credentials.uid() != nix::unistd::geteuid().as_raw() { continue; }
                         let mut buf = Vec::new();
                         let mut byte = [0u8; 1];
                         let read_res = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1074,6 +1120,26 @@ impl Lab {
         .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
     }
 
+    /// [`Self::teardown_by_name`] once the previous owner has released the lab lock: a joined
+    /// supervisor can still own the lab through the teardown its drop spawned.
+    /// # Errors
+    /// As [`Self::teardown_by_name`]; the lock error if it is still held after `timeout`.
+    pub async fn recover_by_name(config: &LabConfig, id: &str, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match Self::teardown_by_name(config, id).await {
+                Err(LabError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    // flock has no async wait; poll the lock rather than block a worker thread.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Cleans a crashed supervisor's lab by name, using its persisted spec, never a saved PID.
     /// A live supervisor holds an exclusive directory lock and cannot be bypassed.
     /// # Errors
@@ -1259,14 +1325,16 @@ async fn configure_vm(
 
 impl Drop for Lab {
     fn drop(&mut self) {
-        if !self.cleanup_on_drop || self.storage.is_none() {
+        if !self.cleanup_on_drop
+            || (self.storage.is_none() && self.vms.is_empty() && !self.has_active_snapshot())
+        {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             let mut owned = Self {
                 id: self.id.clone(),
-                store: self.store.take(),
-                spec: self.spec.take(),
+                store: self.store.clone(),
+                spec: self.spec.clone(),
                 storage: self.storage.take(),
                 network: self.network.take(),
                 vms: std::mem::take(&mut self.vms),
@@ -1274,7 +1342,7 @@ impl Drop for Lab {
                 lock: self.lock.take(),
                 span: self.span.clone(),
                 cleanup_on_drop: false,
-                active_snapshot: Arc::clone(&self.active_snapshot),
+                snapshots: self.snapshots.clone(),
                 restore_latency: self.restore_latency,
             };
             runtime.spawn(async move {

@@ -47,6 +47,10 @@ Resource hygiene is critical: everything created must be destroyed.
 Dylos lab networks are **IPv6-first and dual-stack** by default, as outlined in [ADR-0002: IPv6-first Dual-stack Networking](adr/0002-ipv6-first-dual-stack.md).
 Every segment is assigned an IPv6 prefix and optionally an IPv4 prefix. Addresses are static and explicitly declared in the LabSpec.
 
+### Clone Identity and Hygiene
+
+[ADR-0003: Clone identity and state hygiene](adr/0003-clone-identity.md) defines what state is shared between clones of a snapshot (MAC, IP, SSH host keys, TLS session state, RNG state, machine-id, TCP connections) and why this is acceptable for isolated, closed network namespaces. It establishes the VMGenID entropy mitigation and strict prohibitions for exposed usage.
+
 ### Privilege and Security Model
 
 - **Privileges**: See [ADR-0004: Privilege Model](adr/0004-privilege-model.md) for details on privileged operations.

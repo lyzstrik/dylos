@@ -375,6 +375,11 @@ fn fork_command_requires_snapshot_and_count_and_rejects_invalid_id() {
         "too long",
     );
     assert_status(
+        &run(dir.path(), &["lab", "fork", "missing", "-n", "1025"]),
+        false,
+        "clone count 1025 exceeds maximum allowed limit of 1024",
+    );
+    assert_status(
         &run(dir.path(), &["lab", "fork", "--help"]),
         true,
         "--count",

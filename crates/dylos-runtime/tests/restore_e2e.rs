@@ -144,13 +144,13 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         // Deliberate experimental downtime, rather than a readiness wait.
         tokio::time::sleep_until(tokio::time::Instant::now() + Duration::from_secs(30)).await;
         let snapshot = config.store.snapshot_dir("src", "tcp");
-        let clone = Lab::restore_with(&config, &snapshot, "dst").await.unwrap();
-        restored = Some(clone);
-        let clone = restored.as_ref().unwrap();
+        let clone = restored.insert(Lab::restore_with(&config, &snapshot, "dst").await.unwrap());
+        let (source, target) = (original.network_mut().unwrap(), clone.network_mut().unwrap());
+        assert_eq!(source.plan().taps(), target.plan().taps());
+        assert_eq!(source.plan().bridges(), target.plan().bridges());
+        assert_ne!(source.netns_path(), target.netns_path());
+        let clone = &*clone;
         measure_clocks(clone, clock_command, &before_clocks, &before_timers).await;
-        assert_eq!(original.network().unwrap().plan().taps(), clone.network().unwrap().plan().taps());
-        assert_eq!(original.network().unwrap().plan().bridges(), clone.network().unwrap().plan().bridges());
-        assert_ne!(original.network().unwrap().netns_path(), clone.network().unwrap().netns_path());
         // Queue lengths vary; compare endpoints while requiring both pre-existing data connections.
         let endpoints = |text: &str| { let mut rows = text.lines().map(|line| line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(); rows.sort(); rows };
         assert_eq!(endpoints(&sockets), endpoints(&exec(clone, "A", "ss -Htn state established | sort").await));
