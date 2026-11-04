@@ -26,6 +26,7 @@ use nix::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     os::{
@@ -190,13 +191,62 @@ pub struct DiskCloneTimings {
     pub hash_ms: u64,
 }
 
-/// Test hooks for `save_vm_file_with_hooks`.
-#[doc(hidden)]
-#[derive(Default)]
-pub struct SaveVmHooks {
-    pub after_open: Option<Box<dyn FnOnce()>>,
-    pub before_cleanup: Option<Box<dyn FnOnce()>>,
-    pub force_copy: bool,
+/// A VM state or memory file, opened once without following symlinks. Saving it reads and
+/// moves this descriptor only: a later replacement of the path is neither read nor unlinked.
+#[derive(Debug)]
+pub struct VmFileSource {
+    path: PathBuf,
+    dir: File,
+    name: std::ffi::OsString,
+    file: File,
+    meta: std::fs::Metadata,
+    max_bytes: u64,
+}
+
+impl VmFileSource {
+    /// # Errors
+    /// Rejects symlinks in any component, non-regular files and files over `max_bytes`.
+    pub fn open(path: &Path, max_bytes: u64) -> Result<Self, Error> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let dir = directory(parent, false).map_err(|e| contextual(path, e))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| contextual(path, io::ErrorKind::InvalidInput.into()))?
+            .to_owned();
+        // O_NONBLOCK: opening a FIFO must fail the regular-file check, not hang.
+        let file = open(&dir, &name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
+            .map_err(|e| contextual(path, e))?;
+        let meta = file.metadata().map_err(|e| contextual(path, e))?;
+        if !meta.is_file() {
+            return Err(contextual(
+                path,
+                io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file"),
+            ));
+        }
+        if meta.len() > max_bytes {
+            return Err(contextual(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "source file size {} exceeds maximum allowed bound of {max_bytes} bytes",
+                        meta.len()
+                    ),
+                ),
+            ));
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            dir,
+            name,
+            file,
+            meta,
+            max_bytes,
+        })
+    }
 }
 
 impl Snapshot {
@@ -347,13 +397,7 @@ impl Snapshot {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<(FileMeta, u64), Error> {
-        self.save_vm_file_impl(
-            source_path,
-            node,
-            file_name,
-            max_bytes,
-            SaveVmHooks::default(),
-        )
+        self.save_vm_source(VmFileSource::open(source_path, max_bytes)?, node, file_name)
     }
 
     /// Moves or reflinks a VM state or memory file into the snapshot directory.
@@ -367,114 +411,35 @@ impl Snapshot {
         file_name: &str,
         max_bytes: u64,
     ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(
-            source_path,
-            node,
-            file_name,
-            max_bytes,
-            SaveVmHooks::default(),
-        )
-        .map(|(meta, _)| meta)
-    }
-
-    /// Moves or reflinks a VM file with an optional test hook called immediately after opening source.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn save_vm_file_with_hook(
-        &self,
-        source_path: &Path,
-        node: &str,
-        file_name: &str,
-        max_bytes: u64,
-        after_open: impl FnOnce() + 'static,
-    ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(
-            source_path,
-            node,
-            file_name,
-            max_bytes,
-            SaveVmHooks {
-                after_open: Some(Box::new(after_open)),
-                ..Default::default()
-            },
-        )
-        .map(|(meta, _)| meta)
-    }
-
-    /// Moves or reflinks a VM file with test hooks for error injection and copy fallback.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn save_vm_file_with_hooks(
-        &self,
-        source_path: &Path,
-        node: &str,
-        file_name: &str,
-        max_bytes: u64,
-        hooks: SaveVmHooks,
-    ) -> Result<FileMeta, Error> {
-        self.save_vm_file_impl(source_path, node, file_name, max_bytes, hooks)
+        self.save_vm_file_with_timings(source_path, node, file_name, max_bytes)
             .map(|(meta, _)| meta)
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn save_vm_file_impl(
+    /// Moves an opened VM file into the snapshot directory: reflink, or a bounded copy when the
+    /// filesystem has no reflink, then the source is unlinked only after the bounded hash
+    /// succeeded and only if its path still names the opened inode.
+    ///
+    /// # Errors
+    /// Fails closed on a cross-device destination and on growth past the source bound; the
+    /// partial destination is removed and the source kept.
+    pub fn save_vm_source(
         &self,
-        source_path: &Path,
+        source: VmFileSource,
         node: &str,
         file_name: &str,
-        max_bytes: u64,
-        mut hooks: SaveVmHooks,
     ) -> Result<(FileMeta, u64), Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
+        let VmFileSource {
+            path: source_path,
+            dir: source_dir,
+            name: source_name,
+            file: source_file,
+            meta: source_meta,
+            max_bytes,
+        } = source;
+        let source_path = source_path.as_path();
 
-        // 1. Pin every ancestor of source_path
-        let source_parent = source_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let source_dir = directory(source_parent, false).map_err(|e| contextual(source_path, e))?;
-        let source_name = source_path
-            .file_name()
-            .ok_or_else(|| contextual(source_path, io::ErrorKind::InvalidInput.into()))?;
-
-        // 2. Open source no-follow and nonblocking
-        let source_file = open(
-            &source_dir,
-            source_name,
-            OFlag::O_RDONLY | OFlag::O_NONBLOCK,
-        )
-        .map_err(|e| contextual(source_path, e))?;
-
-        // 3. Verify it is a regular file via descriptor and within bounded size
-        let source_meta = source_file
-            .metadata()
-            .map_err(|e| contextual(source_path, e))?;
-        if !source_meta.is_file() {
-            return Err(contextual(
-                source_path,
-                io::Error::new(io::ErrorKind::InvalidInput, "source is not a regular file"),
-            ));
-        }
-        if source_meta.len() > max_bytes {
-            return Err(contextual(
-                source_path,
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "source file size {} exceeds maximum allowed bound of {} bytes",
-                        source_meta.len(),
-                        max_bytes
-                    ),
-                ),
-            ));
-        }
-
-        if let Some(hook) = hooks.after_open.take() {
-            hook();
-        }
-
-        // 4. Open/create destination vm directory
         let vms = open(&self.directory, "vms".as_ref(), dirs())
             .map_err(|e| contextual(&self.root.join("vms"), e))?;
         let vm_dir = match open(&vms, node.as_ref(), dirs()) {
@@ -484,7 +449,6 @@ impl Snapshot {
             Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
         };
 
-        // 5. Exclusively create destination file
         let dest_path = self.root.join("vms").join(node).join(file_name);
         let mut dest_file = open(
             &vm_dir,
@@ -492,46 +456,21 @@ impl Snapshot {
             OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
         )
         .map_err(|e| contextual(&dest_path, e))?;
-
         let dest_meta = dest_file
             .metadata()
             .map_err(|e| contextual(&dest_path, e))?;
+        let fail = |err: io::Error| with_cleanup(err, cleanup_dest(&vm_dir, file_name, &dest_path));
 
-        // 6. Check for cross-device: fail closed on EXDEV, NEVER copy!
+        // A cross-device source is never copied: snapshot files must stay on the lab filesystem.
         if source_meta.dev() != dest_meta.dev() {
-            let cleanup_err = {
-                if let Some(hook) = hooks.before_cleanup.take() {
-                    hook();
-                }
-                cleanup_dest(&vm_dir, file_name, &dest_path)
-            };
-            let mut err = io::Error::from_raw_os_error(libc::EXDEV);
-            if let Err(c_err) = cleanup_err {
-                err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
-            }
-            return Err(contextual(source_path, err));
+            return Err(contextual(
+                source_path,
+                fail(io::Error::from_raw_os_error(libc::EXDEV)),
+            ));
         }
 
-        // 7. Reflink source into dest_file; if reflink is unsupported on the same device,
-        // copy from the already verified descriptor into the new exclusively created destination.
-        let skip_reflink = hooks.force_copy;
-
-        let reflink_res = if skip_reflink {
-            Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
-        } else {
-            reflink(&source_file, &dest_file)
-        };
-
-        let verified_dest_file = match reflink_res {
-            Ok(()) => {
-                safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
-                    Error::Io {
-                        path: source_path.into(),
-                        source: e,
-                    }
-                })?;
-                dest_file
-            }
+        match reflink(&source_file, &dest_file) {
+            Ok(()) => {}
             Err(err)
                 if matches!(
                     err.raw_os_error(),
@@ -539,57 +478,36 @@ impl Snapshot {
                 ) =>
             {
                 if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
-                    let cleanup_err = {
-                        if let Some(hook) = hooks.before_cleanup.take() {
-                            hook();
-                        }
-                        cleanup_dest(&vm_dir, file_name, &dest_path)
-                    };
-                    let mut err = copy_err;
-                    if let Err(c_err) = cleanup_err {
-                        err = io::Error::new(err.kind(), format!("{err}; additionally {c_err}"));
-                    }
-                    return Err(contextual(&dest_path, err));
+                    return Err(contextual(&dest_path, fail(copy_err)));
                 }
-                safe_unlink_source(&source_dir, source_name, &source_meta).map_err(|e| {
-                    Error::Io {
-                        path: source_path.into(),
-                        source: e,
-                    }
-                })?;
-                dest_file
             }
             Err(err) => {
-                let cleanup_err = {
-                    if let Some(hook) = hooks.before_cleanup.take() {
-                        hook();
-                    }
-                    cleanup_dest(&vm_dir, file_name, &dest_path)
-                };
-                if let Err(c_err) = cleanup_err {
-                    return Err(contextual(
-                        &dest_path,
-                        io::Error::other(format!("reflink failed ({err}); additionally {c_err}")),
-                    ));
+                if let Err(cleanup_err) = cleanup_dest(&vm_dir, file_name, &dest_path) {
+                    return Err(contextual(&dest_path, with_cleanup(err, Err(cleanup_err))));
                 }
                 return Err(Error::Reflink {
                     path: dest_path.clone(),
                     source: err,
                 });
             }
-        };
+        }
 
-        // 8. Compute sha256 and size from the verified destination descriptor with bounded read
+        // A reflink clones the current length, so the bound is enforced here as well.
         let t_hash = Instant::now();
-        let (sha256, size) = compute_file_sha256_and_size(&verified_dest_file, max_bytes)
-            .map_err(|e| contextual(&dest_path, e))?;
+        let (sha256, size) = compute_file_sha256_and_size(&dest_file, max_bytes)
+            .map_err(|e| contextual(&dest_path, fail(e)))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
 
         if file_name == "vm.mem" {
-            verified_dest_file
+            dest_file
                 .set_permissions(std::fs::Permissions::from_mode(0o444))
-                .map_err(|e| contextual(&dest_path, e))?;
+                .map_err(|e| contextual(&dest_path, fail(e)))?;
         }
+
+        safe_unlink_source(&source_dir, &source_name, &source_meta).map_err(|e| Error::Io {
+            path: source_path.into(),
+            source: e,
+        })?;
 
         Ok((
             FileMeta {
@@ -699,8 +617,29 @@ impl Store {
         {
             return Err(contextual(path, io::ErrorKind::InvalidData.into()));
         }
-        manifest.verify(opener.verify_opener())?;
-        let lab = self.create_from(id, &manifest.lab_spec, Some((&opener, &manifest)))?;
+        // Pin each shared memory file before hashing it: the inode that is verified is the one
+        // that gets linked into the clone, so a swap after verification cannot go unnoticed.
+        let mut backings = BTreeMap::new();
+        for (node, vm) in &manifest.vms {
+            let pinned = SharedBacking::pin(&opener, &vm.memory_file)
+                .map_err(|e| contextual(&path.join(&vm.memory_file.path), e))?;
+            backings.insert(node.clone(), pinned);
+        }
+        manifest.verify(
+            |file: &Path| match backings.values().find(|b| b.path == file) {
+                Some(backing) => backing.reader(),
+                None => opener.open(file),
+            },
+        )?;
+        let lab = self.create_from(
+            id,
+            &manifest.lab_spec,
+            Some(Restored {
+                opener: &opener,
+                manifest: &manifest,
+                backings: &backings,
+            }),
+        )?;
         Ok((lab, manifest))
     }
 
@@ -709,7 +648,7 @@ impl Store {
         &self,
         id: &str,
         spec: &LabSpec,
-        snapshot: Option<(&SnapshotOpener, &SnapshotManifest)>,
+        snapshot: Option<Restored<'_>>,
     ) -> Result<Lab, Error> {
         valid_id(id)?;
         spec.validate()?;
@@ -734,100 +673,107 @@ impl Store {
             id: id.into(),
             owned: true,
         };
-        let result = (|| {
-            let image = if snapshot.is_none() {
-                let source_parent = self
-                    .image
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let source_dir =
-                    directory(source_parent, false).map_err(|e| contextual(&self.image, e))?;
-                let name = self
-                    .image
-                    .file_name()
-                    .ok_or_else(|| contextual(&self.image, io::ErrorKind::InvalidInput.into()))?;
-                let source = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
-                    .map_err(|e| contextual(&self.image, e))?;
-                if !source
-                    .metadata()
-                    .map_err(|e| contextual(&self.image, e))?
-                    .is_file()
-                {
-                    return Err(contextual(&self.image, io::ErrorKind::InvalidInput.into()));
-                }
-                Some(source)
-            } else {
-                None
-            };
-            let vms =
-                make_directory(&lab.directory, "vms").map_err(|e| contextual(&lab.root, e))?;
-            for node in &spec.nodes {
-                let _vm = tracing::info_span!("store_vm", vm = %node.name).entered();
-                let vm_started = Instant::now();
-                let paths = lab.vm_paths(&node.name)?;
-                let vm = make_directory(&vms, &node.name)
-                    .map_err(|e| contextual(&paths.directory, e))?;
-                let destination = open(
-                    &vm,
-                    "rootfs.ext4".as_ref(),
-                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
-                )
-                .map_err(|e| contextual(&paths.rootfs, e))?;
-                let restored_source = snapshot
-                    .map(|(opener, manifest)| opener.open(&manifest.vms[&node.name].disks[0].path))
-                    .transpose()
-                    .map_err(|e| contextual(&paths.rootfs, e))?;
-                let source = restored_source
-                    .as_ref()
-                    .or(image.as_ref())
-                    .ok_or_else(|| contextual(&paths.rootfs, io::ErrorKind::InvalidData.into()))?;
-                reflink(source, &destination).map_err(|source| Error::Reflink {
-                    path: paths.rootfs,
-                    source,
-                })?;
-                if let Some((opener, manifest)) = snapshot {
-                    let saved = &manifest.vms[&node.name];
-                    // 1. Reflink vm.state so each clone gets its own independent state file
-                    let state_source = opener
-                        .open(&saved.state_file.path)
-                        .map_err(|e| contextual(&saved.state_file.path, e))?;
-                    let state_destination = open(
+        let result =
+            (|| {
+                let image = if snapshot.is_none() {
+                    let source_parent = self
+                        .image
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or_else(|| Path::new("."));
+                    let source_dir =
+                        directory(source_parent, false).map_err(|e| contextual(&self.image, e))?;
+                    let name = self.image.file_name().ok_or_else(|| {
+                        contextual(&self.image, io::ErrorKind::InvalidInput.into())
+                    })?;
+                    let source = open(&source_dir, name, OFlag::O_RDONLY | OFlag::O_NONBLOCK)
+                        .map_err(|e| contextual(&self.image, e))?;
+                    if !source
+                        .metadata()
+                        .map_err(|e| contextual(&self.image, e))?
+                        .is_file()
+                    {
+                        return Err(contextual(&self.image, io::ErrorKind::InvalidInput.into()));
+                    }
+                    Some(source)
+                } else {
+                    None
+                };
+                let vms =
+                    make_directory(&lab.directory, "vms").map_err(|e| contextual(&lab.root, e))?;
+                for node in &spec.nodes {
+                    let _vm = tracing::info_span!("store_vm", vm = %node.name).entered();
+                    let vm_started = Instant::now();
+                    let paths = lab.vm_paths(&node.name)?;
+                    let vm = make_directory(&vms, &node.name)
+                        .map_err(|e| contextual(&paths.directory, e))?;
+                    let destination = open(
                         &vm,
-                        "vm.state".as_ref(),
+                        "rootfs.ext4".as_ref(),
                         OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
                     )
-                    .map_err(|e| contextual(&paths.directory.join("vm.state"), e))?;
-                    reflink(&state_source, &state_destination).map_err(|source| {
-                        Error::Reflink {
-                            path: paths.directory.join("vm.state"),
-                            source,
-                        }
+                    .map_err(|e| contextual(&paths.rootfs, e))?;
+                    let restored_source = snapshot
+                        .map(|r| r.opener.open(&r.manifest.vms[&node.name].disks[0].path))
+                        .transpose()
+                        .map_err(|e| contextual(&paths.rootfs, e))?;
+                    let source = restored_source.as_ref().or(image.as_ref()).ok_or_else(|| {
+                        contextual(&paths.rootfs, io::ErrorKind::InvalidData.into())
                     })?;
+                    reflink(source, &destination).map_err(|source| Error::Reflink {
+                        path: paths.rootfs,
+                        source,
+                    })?;
+                    if let Some(Restored {
+                        opener,
+                        manifest,
+                        backings,
+                    }) = snapshot
+                    {
+                        let saved = &manifest.vms[&node.name];
+                        // 1. Reflink vm.state so each clone gets its own independent state file
+                        let state_source = opener
+                            .open(&saved.state_file.path)
+                            .map_err(|e| contextual(&saved.state_file.path, e))?;
+                        let state_destination = open(
+                            &vm,
+                            "vm.state".as_ref(),
+                            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                        )
+                        .map_err(|e| contextual(&paths.directory.join("vm.state"), e))?;
+                        reflink(&state_source, &state_destination).map_err(|source| {
+                            Error::Reflink {
+                                path: paths.directory.join("vm.state"),
+                                source,
+                            }
+                        })?;
 
-                    // 2. Hard-link vm.mem so all clones share the exact same inode and page cache
-                    opener
-                        .link(&saved.memory_file.path, &vm, "vm.mem")
-                        .map_err(|e| contextual(&paths.directory.join("vm.mem"), e))?;
+                        // 2. Hard-link vm.mem so all clones share the exact same inode and page cache
+                        let backing = backings.get(&node.name).ok_or_else(|| {
+                            contextual(&paths.directory, io::ErrorKind::InvalidData.into())
+                        })?;
+                        backing
+                            .link_into(&vm, "vm.mem")
+                            .map_err(|e| contextual(&paths.directory.join("vm.mem"), e))?;
+                    }
+                    tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
                 }
-                tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
-            }
-            let state = State {
-                lab_id: id.into(),
-                spec: spec.clone(),
-                created_at: SystemTime::now(),
-            };
-            let bytes = serde_json::to_vec(&state)?;
-            let mut file = open(
-                &lab.directory,
-                "state.json".as_ref(),
-                OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
-            )
-            .map_err(|e| contextual(&lab.state_path(), e))?;
-            file.write_all(&bytes)
+                let state = State {
+                    lab_id: id.into(),
+                    spec: spec.clone(),
+                    created_at: SystemTime::now(),
+                };
+                let bytes = serde_json::to_vec(&state)?;
+                let mut file = open(
+                    &lab.directory,
+                    "state.json".as_ref(),
+                    OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL,
+                )
                 .map_err(|e| contextual(&lab.state_path(), e))?;
-            Ok(())
-        })();
+                file.write_all(&bytes)
+                    .map_err(|e| contextual(&lab.state_path(), e))?;
+                Ok(())
+            })();
         if let Err(error) = result {
             let mut lab = lab;
             lab.remove()?;
@@ -1021,6 +967,14 @@ fn safe_unlink_source(
     }
 }
 
+/// Keeps the operation error primary and appends the cleanup failure, if any.
+fn with_cleanup(err: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => err,
+        Err(c_err) => io::Error::new(err.kind(), format!("{err}; additionally {c_err}")),
+    }
+}
+
 fn cleanup_dest(vm_dir: &File, file_name: &str, dest_path: &Path) -> Result<(), io::Error> {
     match unlinkat(vm_dir, file_name, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
@@ -1129,6 +1083,116 @@ struct open_how {
 const RESOLVE_BENEATH: u64 = 0x08;
 const RESOLVE_NO_SYMLINKS: u64 = 0x04;
 
+/// Rejects a shared read-only backing file unless the orchestrator owns it and nobody can write
+/// it. Mode bits alone are not enough: the owner, for example an unprivileged jailer uid, could
+/// chmod the inode back to writable and alter the memory of every clone that maps it.
+///
+/// # Errors
+/// [`io::ErrorKind::PermissionDenied`] naming the offending owner or mode.
+pub fn ensure_trusted_read_only(owner: u32, mode: u32, orchestrator: u32) -> io::Result<()> {
+    if owner != orchestrator {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "shared backing is owned by uid {owner}, not the orchestrator uid {orchestrator}"
+            ),
+        ));
+    }
+    if mode & 0o222 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("shared backing is writable (mode {:o})", mode & 0o7777),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct Restored<'a> {
+    opener: &'a SnapshotOpener,
+    manifest: &'a SnapshotManifest,
+    backings: &'a BTreeMap<String, SharedBacking>,
+}
+
+/// A snapshot memory file pinned by descriptor, validated before it is hashed or linked.
+struct SharedBacking {
+    path: PathBuf,
+    file: File,
+    stamp: (u64, u64, u64, i64, i64),
+}
+
+impl SharedBacking {
+    fn pin(opener: &SnapshotOpener, meta: &FileMeta) -> io::Result<Self> {
+        let file = opener.open(&meta.path)?;
+        let stamp = Self::validate(&file, meta.size)?;
+        Ok(Self {
+            path: meta.path.clone(),
+            file,
+            stamp,
+        })
+    }
+
+    fn validate(file: &File, size: u64) -> io::Result<(u64, u64, u64, i64, i64)> {
+        let meta = file.metadata()?;
+        if !meta.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        ensure_trusted_read_only(meta.uid(), meta.mode(), nix::unistd::geteuid().as_raw())?;
+        if meta.len() != size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "shared backing is {} bytes, manifest says {size}",
+                    meta.len()
+                ),
+            ));
+        }
+        Ok((
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+        ))
+    }
+
+    // A second open file description: hashing must not move a shared offset.
+    fn reader(&self) -> io::Result<File> {
+        File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    /// Links the pinned inode, then fails closed, removing the link, if the inode was replaced,
+    /// modified or made writable since it was pinned.
+    fn link_into(&self, dir: &File, name: &str) -> io::Result<()> {
+        let source = std::ffi::CString::new(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        nix::unistd::linkat(
+            nix::fcntl::AT_FDCWD,
+            source.as_c_str(),
+            dir,
+            name,
+            nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
+        )?;
+        let checked =
+            open(dir, name.as_ref(), OFlag::O_RDONLY | OFlag::O_NONBLOCK).and_then(|linked| {
+                let linked = Self::validate(&linked, self.stamp.2)?;
+                let pinned = Self::validate(&self.file, self.stamp.2)?;
+                if linked != self.stamp || pinned != self.stamp {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "shared backing changed after verification",
+                    ));
+                }
+                Ok(())
+            });
+        if let Err(error) = checked {
+            unlinkat(dir, name, UnlinkatFlags::NoRemoveDir)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
 /// Descriptor-relative snapshot access under operator-controlled directories.
 /// Ancestors and snapshot trees must not be writable by hostile processes: the
 /// fallback cannot confine directories renamed outside the tree after opening.
@@ -1155,35 +1219,6 @@ impl SnapshotOpener {
     /// or non-regular leaves.
     pub fn open(&self, path: &Path) -> io::Result<File> {
         self.open_impl(path, None, &mut |_| {})
-    }
-
-    /// Hard-links a snapshot file into the target directory with the given name.
-    ///
-    /// The source path must be a regular file within the snapshot tree. The target
-    /// directory receives a hard link to the same inode, enabling shared memory mapping
-    /// in the page cache across multiple restored VMs.
-    ///
-    /// # Errors
-    /// Returns an error if the source file is missing, not regular, or if linking fails.
-    pub fn link(&self, path: &Path, target_dir: &File, target_name: &str) -> io::Result<()> {
-        let source = self.open(path)?;
-        let proc_path = format!("/proc/self/fd/{}", source.as_raw_fd());
-        let proc_c = std::ffi::CString::new(proc_path)
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        let name_c = std::ffi::CString::new(target_name)
-            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-        nix::unistd::linkat(
-            nix::fcntl::AT_FDCWD,
-            proc_c.as_c_str(),
-            target_dir,
-            name_c.as_c_str(),
-            nix::fcntl::AtFlags::AT_SYMLINK_FOLLOW,
-        )
-        .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
-        if let Ok(dest) = open(target_dir, target_name.as_ref(), OFlag::O_RDONLY) {
-            let _ = dest.set_permissions(std::fs::Permissions::from_mode(0o444));
-        }
-        Ok(())
     }
 
     /// Forces a resolver and pauses immediately before each resolution step.
@@ -1283,4 +1318,27 @@ fn regular_snapshot_file(file: File) -> io::Result<File> {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     Ok(file)
+}
+
+// No public path can make the destination cleanup fail after the destination was created.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanup_failure_is_appended_to_the_operation_error() {
+        let operation = io::Error::from_raw_os_error(libc::EXDEV);
+        let cleanup = Err(io::Error::from_raw_os_error(libc::EACCES));
+        let combined = with_cleanup(operation, cleanup);
+        assert_eq!(combined.kind(), io::ErrorKind::CrossesDevices);
+        let message = combined.to_string();
+        assert!(message.contains("cross-device"), "{message}");
+        assert!(
+            message.contains("; additionally Permission denied"),
+            "{message}"
+        );
+
+        let alone = with_cleanup(io::Error::from_raw_os_error(libc::EXDEV), Ok(()));
+        assert!(!alone.to_string().contains("additionally"));
+    }
 }

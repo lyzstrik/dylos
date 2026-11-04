@@ -1141,7 +1141,8 @@ impl Bench<'_> {
         let result = async {
             let (snapshot, snapshot_dir) = self.snapshots(&mut source).await?;
             // Keep the source quiet so it does not consume CPU during fork measurements.
-            dylos_runtime::pause_all(&mut source)
+            source
+                .pause_all()
                 .await
                 .context("could not pause source lab VMs")?;
             let forks = self.forks(&snapshot_dir, failures).await?;

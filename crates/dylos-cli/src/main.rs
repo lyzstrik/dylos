@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
-use dylos_runtime::{Lab, LabConfig, LabError};
+use dylos_runtime::{Fleet, Lab, LabConfig, LabError};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 
@@ -250,32 +250,10 @@ async fn lab_up(args: UpArgs) -> Result<()> {
         }
     };
 
-    let socket = lab.control_socket();
-    let supervisor = tokio::spawn(lab.supervise());
-
-    if interrupted {
-        tracing::info!(lab = %id, "termination was requested during bring-up, requesting teardown");
-        return handle_signal_teardown(&config, &id, &socket, supervisor).await;
+    if !interrupted {
+        println!("lab {id} is up, press Ctrl+C or run `dylos lab down {id}`");
     }
-
-    println!("lab {id} is up, press Ctrl+C or run `dylos lab down {id}`");
-
-    let mut supervisor = supervisor;
-    tokio::select! {
-        res = &mut supervisor => {
-            res.context("supervisor task panicked")?
-                .with_context(|| format!("supervision of lab '{id}' failed"))?;
-            Ok(())
-        }
-        _ = sigint.recv() => {
-            tracing::info!(lab = %id, "received Ctrl+C (SIGINT), requesting teardown");
-            handle_signal_teardown(&config, &id, &socket, supervisor).await
-        }
-        _ = sigterm.recv() => {
-            tracing::info!(lab = %id, "received SIGTERM, requesting teardown");
-            handle_signal_teardown(&config, &id, &socket, supervisor).await
-        }
-    }
+    supervise(&config, vec![lab], interrupted, &mut sigint, &mut sigterm).await
 }
 
 async fn lab_restore(args: RestoreArgs) -> Result<()> {
@@ -305,17 +283,10 @@ async fn lab_restore(args: RestoreArgs) -> Result<()> {
             result = &mut restore => break result.with_context(|| format!("failed to restore lab '{id}'"))?,
         }
     };
-    let socket = lab.control_socket();
-    let mut supervisor = tokio::spawn(lab.supervise());
-    if interrupted {
-        return handle_signal_teardown(&config, &id, &socket, supervisor).await;
+    if !interrupted {
+        println!("lab {id} restored, press Ctrl+C or run `dylos lab down {id}`");
     }
-    println!("lab {id} restored, press Ctrl+C or run `dylos lab down {id}`");
-    tokio::select! {
-        result = &mut supervisor => result.context("supervisor task panicked")?.context("restored lab supervision failed"),
-        _ = sigint.recv() => handle_signal_teardown(&config, &id, &socket, supervisor).await,
-        _ = sigterm.recv() => handle_signal_teardown(&config, &id, &socket, supervisor).await,
-    }
+    supervise(&config, vec![lab], interrupted, &mut sigint, &mut sigterm).await
 }
 
 pub(crate) fn derive_clone_prefix(snapshot: &Path) -> String {
@@ -383,302 +354,52 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
         }
     };
 
-    if interrupted {
-        tracing::info!("termination was requested during fork bring-up, tearing down all clones");
-        return teardown_labs(labs).await;
-    }
-
-    let mut join_set = tokio::task::JoinSet::new();
-    let mut active_sockets = std::collections::HashMap::new();
-    let mut task_to_clone = std::collections::HashMap::new();
-    let mut clone_to_task = std::collections::HashMap::new();
-
-    for lab in labs {
-        let id = lab.id().to_string();
-        let socket = lab.control_socket();
-        let latency_ms = lab.restore_latency().map_or(0, |d| d.as_millis());
-        let pss_info = match lab.total_pss_kib().await {
-            Ok(kib) => format!("PSS: {kib} KiB"),
-            Err(e) => {
-                tracing::warn!(lab = %id, error = %e, "could not measure clone PSS");
-                "PSS: unavailable".to_string()
-            }
-        };
-        println!("clone {id}: restored in {latency_ms} ms, {pss_info}");
-        active_sockets.insert(id.clone(), socket);
-        let id_for_task = id.clone();
-        let handle = join_set.spawn(async move { (id_for_task, lab.supervise().await) });
-        task_to_clone.insert(handle.id(), id.clone());
-        clone_to_task.insert(id, handle.id());
-    }
-
-    println!(
-        "all {} clones ready, press Ctrl+C or run `dylos lab down <clone>`",
-        active_sockets.len()
-    );
-
-    supervise_clones(
-        &config,
-        join_set,
-        active_sockets,
-        task_to_clone,
-        clone_to_task,
-        &mut sigint,
-        &mut sigterm,
-    )
-    .await
-}
-
-async fn teardown_labs(labs: Vec<Lab>) -> Result<()> {
-    let mut first_error = None;
-    let mut set = tokio::task::JoinSet::new();
-    for mut lab in labs {
-        set.spawn(async move {
-            let id = lab.id().to_string();
-            (id, lab.teardown().await)
-        });
-    }
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok((id, Err(e))) => {
-                tracing::error!(clone = %id, error = %e, "clone teardown failed");
-                if first_error.is_none() {
-                    first_error = Some(anyhow!("clone '{id}' teardown failed: {e}"));
+    if !interrupted {
+        for lab in &labs {
+            let latency_ms = lab.restore_latency().map_or(0, |d| d.as_millis());
+            let pss = match lab.total_pss_kib().await {
+                Ok(kib) => format!("{kib} KiB"),
+                Err(e) => {
+                    tracing::warn!(lab = %lab.id(), error = %e, "could not measure clone PSS");
+                    "unavailable".to_string()
                 }
-            }
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "teardown task panicked");
-                if first_error.is_none() {
-                    first_error = Some(anyhow!("teardown task panicked: {join_err}"));
-                }
-            }
-            Ok((_id, Ok(()))) => {}
+            };
+            println!(
+                "clone {}: restored in {latency_ms} ms, PSS: {pss}",
+                lab.id()
+            );
         }
+        println!(
+            "all {} clones ready, press Ctrl+C or run `dylos lab down <clone>`",
+            labs.len()
+        );
     }
-    if let Some(err) = first_error {
-        Err(err)
-    } else {
-        Ok(())
-    }
+    supervise(&config, labs, interrupted, &mut sigint, &mut sigterm).await
 }
 
-async fn supervise_clones(
+/// Supervises `labs` until each is torn down, or tears all of them down on a signal, or at once
+/// if one arrived during bring-up.
+async fn supervise(
     config: &LabConfig,
-    mut join_set: tokio::task::JoinSet<(String, std::result::Result<(), LabError>)>,
-    mut active_sockets: std::collections::HashMap<String, PathBuf>,
-    mut task_to_clone: std::collections::HashMap<tokio::task::Id, String>,
-    mut clone_to_task: std::collections::HashMap<String, tokio::task::Id>,
+    labs: Vec<Lab>,
+    interrupted: bool,
     sigint: &mut tokio::signal::unix::Signal,
     sigterm: &mut tokio::signal::unix::Signal,
 ) -> Result<()> {
-    let mut first_error = None;
-
-    while !active_sockets.is_empty() {
+    let mut fleet = Fleet::new(config, teardown_timeout());
+    for lab in labs {
+        fleet.spawn(lab);
+    }
+    let shutdown = async {
+        if interrupted {
+            return;
+        }
         tokio::select! {
-            biased;
-            _ = sigint.recv() => {
-                tracing::info!("received Ctrl+C (SIGINT), requesting teardown for all active clones");
-                return teardown_active_clones(config, join_set, active_sockets, task_to_clone, clone_to_task).await;
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("received SIGTERM, requesting teardown for all active clones");
-                return teardown_active_clones(config, join_set, active_sockets, task_to_clone, clone_to_task).await;
-            }
-            res = join_set.join_next_with_id() => {
-                match res {
-                    Some(Ok((task_id, (id, task_res)))) => {
-                        task_to_clone.remove(&task_id);
-                        clone_to_task.remove(&id);
-                        active_sockets.remove(&id);
-                        match task_res {
-                            Ok(()) => {
-                                println!("clone {id} is down");
-                            }
-                            Err(e) => {
-                                tracing::error!(clone = %id, error = %e, "clone supervisor failed");
-                                if let Err(cleanup_err) = Lab::teardown_by_name(config, &id).await {
-                                    tracing::error!(clone = %id, error = %cleanup_err, "recovery teardown failed");
-                                }
-                                if first_error.is_none() {
-                                    first_error = Some(anyhow!("clone '{id}' failed: {e}"));
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(join_err)) => {
-                        let task_id = join_err.id();
-                        let id = task_to_clone.remove(&task_id).unwrap_or_else(|| "unknown".to_string());
-                        clone_to_task.remove(&id);
-                        active_sockets.remove(&id);
-                        tracing::error!(clone = %id, error = %join_err, "clone supervisor task panicked");
-                        if let Err(cleanup_err) = Lab::teardown_by_name(config, &id).await {
-                            tracing::error!(clone = %id, error = %cleanup_err, "recovery teardown failed");
-                        }
-                        if first_error.is_none() {
-                            first_error = Some(anyhow!("clone '{id}' supervisor task panicked: {join_err}"));
-                        }
-                    }
-                    None => break,
-                }
-            }
+            _ = sigint.recv() => tracing::info!("received Ctrl+C (SIGINT), requesting teardown"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, requesting teardown"),
         }
-    }
-
-    if let Some(err) = first_error {
-        Err(err)
-    } else {
-        Ok(())
-    }
-}
-
-async fn teardown_active_clones(
-    config: &LabConfig,
-    mut join_set: tokio::task::JoinSet<(String, std::result::Result<(), LabError>)>,
-    mut active_sockets: std::collections::HashMap<String, PathBuf>,
-    mut task_to_clone: std::collections::HashMap<tokio::task::Id, String>,
-    mut clone_to_task: std::collections::HashMap<String, tokio::task::Id>,
-) -> Result<()> {
-    let timeout = teardown_timeout();
-    let mut first_error = None;
-
-    let mut request_set = tokio::task::JoinSet::new();
-    for (id, socket) in active_sockets.drain() {
-        request_set.spawn(async move {
-            let res = Lab::request_teardown(&socket, timeout).await;
-            (id, res)
-        });
-    }
-
-    let mut failed_clones = Vec::new();
-    while let Some(res) = request_set.join_next().await {
-        match res {
-            Ok((_id, Ok(()))) => {}
-            Ok((id, Err(e))) => {
-                tracing::error!(clone = %id, error = %e, "clone teardown request failed, falling back to teardown by name");
-                failed_clones.push(id);
-                if first_error.is_none() {
-                    first_error = Some(anyhow!("teardown request failed: {e}"));
-                }
-            }
-            Err(join_err) => {
-                tracing::error!(error = %join_err, "teardown request task panicked");
-                if first_error.is_none() {
-                    first_error = Some(anyhow!("teardown request task panicked: {join_err}"));
-                }
-            }
-        }
-    }
-
-    for id in failed_clones {
-        if let Some(task_id) = clone_to_task.remove(&id) {
-            task_to_clone.remove(&task_id);
-        }
-        if let Err(cleanup_err) = Lab::teardown_by_name(config, &id).await {
-            tracing::error!(clone = %id, error = %cleanup_err, "recovery teardown failed");
-            if first_error.is_none() {
-                first_error = Some(anyhow!(
-                    "recovery teardown for '{id}' failed: {cleanup_err}"
-                ));
-            }
-        }
-    }
-
-    let supervise_deadline = tokio::time::sleep(timeout);
-    tokio::pin!(supervise_deadline);
-
-    loop {
-        tokio::select! {
-            biased;
-            () = &mut supervise_deadline => {
-                tracing::warn!("supervisor join timed out during teardown, aborting remaining tasks");
-                join_set.abort_all();
-                break;
-            }
-            res = join_set.join_next_with_id() => {
-                match res {
-                    Some(Ok((task_id, (id, task_res)))) => {
-                        task_to_clone.remove(&task_id);
-                        clone_to_task.remove(&id);
-                        if let Err(e) = task_res {
-                            tracing::error!(clone = %id, error = %e, "clone supervisor failed");
-                            if first_error.is_none() {
-                                first_error = Some(anyhow!("clone '{id}' supervisor failed: {e}"));
-                            }
-                        }
-                    }
-                    Some(Err(join_err)) => {
-                        let task_id = join_err.id();
-                        let id = task_to_clone.remove(&task_id).unwrap_or_else(|| "unknown".to_string());
-                        clone_to_task.remove(&id);
-                        if !join_err.is_cancelled() {
-                            tracing::error!(clone = %id, error = %join_err, "clone supervisor task panicked");
-                            if first_error.is_none() {
-                                first_error = Some(anyhow!("clone '{id}' supervisor panicked: {join_err}"));
-                            }
-                        }
-                    }
-                    None => break,
-                }
-                if task_to_clone.is_empty() {
-                    break;
-                }
-            }
-        }
-    }
-
-    for (_task_id, id) in task_to_clone {
-        tracing::warn!(clone = %id, "cleaning up un-exited clone by name");
-        if let Err(cleanup_err) = Lab::teardown_by_name(config, &id).await {
-            tracing::error!(clone = %id, error = %cleanup_err, "recovery teardown failed");
-            if first_error.is_none() {
-                first_error = Some(anyhow!(
-                    "recovery teardown for '{id}' failed: {cleanup_err}"
-                ));
-            }
-        }
-    }
-
-    if let Some(err) = first_error {
-        Err(err)
-    } else {
-        Ok(())
-    }
-}
-
-async fn handle_signal_teardown(
-    config: &LabConfig,
-    id: &str,
-    socket: &Path,
-    mut supervisor: tokio::task::JoinHandle<std::result::Result<(), LabError>>,
-) -> Result<()> {
-    let timeout = teardown_timeout();
-    let teardown_res = Lab::request_teardown(socket, timeout).await;
-    let Ok(supervise_res) = tokio::time::timeout(timeout, &mut supervisor).await else {
-        supervisor.abort();
-        tracing::warn!(
-            lab = id,
-            "supervisor timed out during teardown, recovering by name"
-        );
-        let cleanup_res = Lab::teardown_by_name(config, id).await;
-        if let Err(e) = cleanup_res {
-            return Err(anyhow!("teardown timed out and recovery failed: {e}"));
-        }
-        return Err(anyhow!("teardown of lab '{id}' timed out"));
     };
-    if let Err(err) = teardown_res {
-        tracing::warn!(lab = id, error = %err, "teardown request failed, recovering by name");
-        let cleanup_res = Lab::teardown_by_name(config, id).await;
-        if let Err(e) = cleanup_res {
-            return Err(anyhow!(
-                "teardown request failed ({err}) and recovery failed: {e}"
-            ));
-        }
-        return Err(anyhow!("failed to request teardown for lab '{id}': {err}"));
-    }
-    supervise_res
-        .context("supervisor task panicked")?
-        .with_context(|| format!("supervision of lab '{id}' failed"))?;
-    Ok(())
+    Ok(fleet.run(shutdown).await?)
 }
 
 async fn lab_down(args: DownArgs) -> Result<()> {

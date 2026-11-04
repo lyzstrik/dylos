@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod support;
 
@@ -8,7 +8,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use dylos_core::{LabSpec, guest_net};
-use dylos_runtime::{Lab, LabConfig, LabError, Timeouts};
+use dylos_runtime::{Fleet, Lab, LabConfig, LabError, Timeouts};
 use support::{Mode, Sandbox};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -467,6 +467,21 @@ fn generate_clone_ids_validates_count_and_naming() {
 }
 
 #[tokio::test]
+async fn fork_with_rejects_empty_and_oversized_clone_lists() {
+    let config = LabConfig::default();
+    let snapshot = std::path::Path::new("missing");
+    assert!(Lab::fork_with(&config, snapshot, &[]).await.is_err());
+    let ids: Vec<String> = (0..=Lab::MAX_CLONES).map(|i| format!("c{i}")).collect();
+    let Err(err) = Lab::fork_with(&config, snapshot, &ids).await else {
+        panic!("oversized clone list accepted");
+    };
+    assert!(
+        err.to_string().contains("clone identifiers required"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_latency_and_pss() {
     if !sandboxed(
         "fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_latency_and_pss",
@@ -517,6 +532,202 @@ async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_la
 
     source.teardown().await.unwrap();
     assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn fork_partial_failure_rolls_back_all_clones() {
+    if !sandboxed("fork_partial_failure_rolls_back_all_clones") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
+    source.snapshot("saved").await.unwrap();
+    let snapshot = config.store.snapshot_dir("src", "saved");
+
+    // Block one clone from being restored by pre-creating an invalid directory with no write permissions
+    let blocked_dir = config.store.base.join("fail-c2");
+    fs::create_dir_all(&blocked_dir).unwrap();
+    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
+    perms.set_mode(0o400);
+    fs::set_permissions(&blocked_dir, perms).unwrap();
+
+    let clone_ids = vec![
+        "fail-c1".to_string(),
+        "fail-c2".to_string(),
+        "fail-c3".to_string(),
+    ];
+    let res = Lab::fork_with(&config, &snapshot, &clone_ids).await;
+    assert!(res.is_err());
+
+    // Restore permissions so cleanup works
+    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    let _ = fs::set_permissions(&blocked_dir, perms);
+    let _ = fs::remove_dir_all(&blocked_dir);
+
+    // Assert fail-c1 and fail-c3 were rolled back
+    assert!(!config.store.base.join("fail-c1").exists());
+    assert!(!config.store.base.join("fail-c3").exists());
+    assert!(!config.netns_dir.join("dylos-fail-c1").exists());
+    assert!(!config.netns_dir.join("dylos-fail-c3").exists());
+
+    source.teardown().await.unwrap();
+    assert_removed(&sandbox, &config);
+}
+
+fn assert_lab_removed(sandbox: &Sandbox, config: &LabConfig, ids: &[&str]) {
+    sandbox.assert_no_jail_left();
+    for id in ids {
+        assert!(!config.store.base.join(id).exists(), "{id} storage left");
+        assert!(
+            !config.netns_dir.join(format!("dylos-{id}")).exists(),
+            "{id} netns left"
+        );
+    }
+}
+
+fn crash(lab: &Lab) -> dylos_fc::FcClient {
+    dylos_fc::FcClient::new(lab.vms()[0].paths().api_socket())
+}
+
+async fn flush(client: &dylos_fc::FcClient) {
+    client
+        .put::<_, serde_json::Value>(
+            "/actions",
+            &dylos_fc::config::InstanceActionInfo::new(dylos_fc::config::ActionType::FlushMetrics),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn fleet_recovers_failed_and_panicked_labs_and_keeps_the_others() {
+    if !sandboxed("fleet_recovers_failed_and_panicked_labs_and_keeps_the_others") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabCrashOnFlush);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut fleet = Fleet::new(&config, Duration::from_secs(5));
+    let failing = Lab::up_with(&config, &spec, "f1").await.unwrap();
+    let client = crash(&failing);
+    fleet.spawn(failing);
+    let panicking = Lab::up_with(&config, &spec, "f2").await.unwrap();
+    let socket = panicking.control_socket();
+    fleet.spawn_supervisor("f2".into(), socket, async move {
+        let _owned = panicking;
+        panic!("injected supervisor panic");
+    });
+    let healthy = Lab::up_with(&config, &spec, "f3").await.unwrap();
+    let healthy_socket = healthy.control_socket();
+    fleet.spawn(healthy);
+    let run = tokio::spawn(fleet.run(std::future::pending()));
+    flush(&client).await;
+    support::wait_until("failed labs recovered", Duration::from_secs(10), || {
+        ["f1", "f2"]
+            .iter()
+            .all(|id| !config.store.base.join(id).exists())
+    })
+    .await;
+    assert!(config.store.base.join("f3").exists());
+    // As `dylos lab down f3`: the run ends once the last lab is down.
+    Lab::request_teardown(&healthy_socket, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let failures = run.await.unwrap().unwrap_err().0;
+    let failed: Vec<_> = failures.iter().map(|f| f.lab.as_str()).collect();
+    assert_eq!(failed.len(), 2, "{failures:?}");
+    assert!(
+        failed.contains(&"f1") && failed.contains(&"f2"),
+        "{failures:?}"
+    );
+    for failure in &failures {
+        // The supervisor error only: recovery by name succeeded.
+        assert_eq!(failure.errors.len(), 1, "{failure}");
+        match failure.lab.as_str() {
+            "f1" => assert!(
+                failure.to_string().contains("VM exited unexpectedly"),
+                "{failure}"
+            ),
+            _ => assert!(
+                matches!(failure.errors[0], LabError::Task { .. }),
+                "{failure}"
+            ),
+        }
+    }
+    assert_lab_removed(&sandbox, &config, &["f1", "f2", "f3"]);
+}
+
+#[tokio::test]
+async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers() {
+    if !sandboxed("fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut fleet = Fleet::new(&config, Duration::from_millis(500));
+    // Holds the lab and its bound socket but never answers: the request times out.
+    let stalled = Lab::up_with(&config, &spec, "f1").await.unwrap();
+    let socket = stalled.control_socket();
+    fleet.spawn_supervisor("f1".into(), socket, async move {
+        let _owned = stalled;
+        std::future::pending().await
+    });
+    let unreachable = Lab::up_with(&config, &spec, "f2").await.unwrap();
+    fs::remove_file(unreachable.control_socket()).unwrap();
+    fleet.spawn(unreachable);
+    fleet.spawn(Lab::up_with(&config, &spec, "f3").await.unwrap());
+
+    let failures = fleet.run(std::future::ready(())).await.unwrap_err().0;
+    assert_eq!(failures.len(), 2, "{failures:?}");
+    for failure in &failures {
+        let kind = match failure.lab.as_str() {
+            "f1" => std::io::ErrorKind::TimedOut,
+            "f2" => std::io::ErrorKind::NotFound,
+            other => panic!("unexpected failure of {other}"),
+        };
+        assert_eq!(failure.errors.len(), 1, "{failure}");
+        assert!(
+            matches!(&failure.errors[0], LabError::Io { source, .. } if source.kind() == kind),
+            "{failure}"
+        );
+    }
+    assert_lab_removed(&sandbox, &config, &["f1", "f2", "f3"]);
+}
+
+#[tokio::test]
+async fn fleet_reports_the_recovery_error_with_the_operation_error() {
+    if !sandboxed("fleet_reports_the_recovery_error_with_the_operation_error") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut fleet = Fleet::new(&config, Duration::from_millis(300));
+    // The lab outlives its supervisor, so its lock is never released for recovery.
+    let mut kept = Lab::up_with(&config, &spec, "f1").await.unwrap();
+    fleet.spawn_supervisor("f1".into(), kept.control_socket(), std::future::pending());
+
+    let failures = fleet.run(std::future::ready(())).await.unwrap_err().0;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let errors = &failures[0].errors;
+    assert_eq!(errors.len(), 2, "{}", failures[0]);
+    assert!(
+        matches!(&errors[0], LabError::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
+    );
+    assert!(
+        matches!(&errors[1], LabError::Io { source, .. } if source.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    assert!(config.store.base.join("f1").exists());
+    kept.teardown().await.unwrap();
+    assert_lab_removed(&sandbox, &config, &["f1"]);
 }
 
 /// Leftovers of a lab whose rollback failed are only removable once the blocker is gone.
@@ -612,48 +823,4 @@ async fn fork_reports_a_successful_clone_that_could_not_be_torn_down() {
     assert!(error.leaves_resources(), "{error:?}");
     fs::remove_dir_all(config.store.base.join(&ids[0])).unwrap();
     recover(&sandbox, &config, &[&ids[1]]).await;
-}
-
-#[tokio::test]
-async fn fork_partial_failure_rolls_back_all_clones() {
-    if !sandboxed("fork_partial_failure_rolls_back_all_clones") {
-        return;
-    }
-    let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
-        return;
-    }
-    let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
-    source.snapshot("saved").await.unwrap();
-    let snapshot = config.store.snapshot_dir("src", "saved");
-
-    // Block one clone from being restored by pre-creating an invalid directory with no write permissions
-    let blocked_dir = config.store.base.join("fail-c2");
-    fs::create_dir_all(&blocked_dir).unwrap();
-    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
-    perms.set_mode(0o400);
-    fs::set_permissions(&blocked_dir, perms).unwrap();
-
-    let clone_ids = vec![
-        "fail-c1".to_string(),
-        "fail-c2".to_string(),
-        "fail-c3".to_string(),
-    ];
-    let res = Lab::fork_with(&config, &snapshot, &clone_ids).await;
-    assert!(res.is_err());
-
-    // Restore permissions so cleanup works
-    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
-    perms.set_mode(0o700);
-    let _ = fs::set_permissions(&blocked_dir, perms);
-    let _ = fs::remove_dir_all(&blocked_dir);
-
-    // Assert fail-c1 and fail-c3 were rolled back
-    assert!(!config.store.base.join("fail-c1").exists());
-    assert!(!config.store.base.join("fail-c3").exists());
-    assert!(!config.netns_dir.join("dylos-fail-c1").exists());
-    assert!(!config.netns_dir.join("dylos-fail-c3").exists());
-
-    source.teardown().await.unwrap();
-    assert_removed(&sandbox, &config);
 }
