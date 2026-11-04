@@ -35,6 +35,16 @@ if [ -f "$CMDLINE_FILE" ]; then
                             exit 0
                         fi
                         ;;
+                esac
+                ;;
+        esac
+    done
+    for arg in $CMDLINE; do
+        case "$arg" in
+            dylos.rt=*)
+                val="${arg#dylos.rt=}"
+                gw="${val#*,}"
+                case "$gw" in
                     *.*)
                         if ! check_gateway -4 "$gw"; then
                             echo 'dylos: network setup failed'

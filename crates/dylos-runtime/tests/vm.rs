@@ -74,6 +74,20 @@ async fn launch_waits_for_api_and_shutdown_is_graceful_and_idempotent() {
 }
 
 #[tokio::test]
+async fn launcher_has_its_own_process_group() {
+    use nix::unistd::{Pid, getpgid, getpgrp};
+
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let pid = Pid::from_raw(i32::try_from(vm.pid().unwrap()).unwrap());
+    assert_eq!(getpgid(Some(pid)).unwrap(), pid);
+    assert_ne!(getpgid(Some(pid)).unwrap(), getpgrp());
+    vm.shutdown().await.unwrap();
+    assert_eq!(exit_state(&vm).await, exited(0));
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
 async fn shutdown_escalates_to_sigterm() {
     let sandbox = Sandbox::new(Mode::IgnoreCtrlAltDel);
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
@@ -490,6 +504,38 @@ async fn exec_fails_when_output_exceeds_budget() {
     assert!(
         matches!(res, Err(Error::ExecFailed { ref message, .. }) if message.contains("exceeded budget")),
         "Expected budget overflow error, got: {res:?}"
+    );
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_fails_when_blank_lines_exceed_limit() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // Blank lines charge the line limit and budget, preventing unbounded accumulator growth
+    let res = vm
+        .exec("yes '' | head -n 1200", Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(res, Err(Error::ExecFailed { ref message, .. }) if message.contains("exceeded limit of 1000 lines")),
+        "Expected limit error on blank line flood, got: {res:?}"
+    );
+
+    vm.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn exec_fails_when_many_short_lines_exceed_limit() {
+    let sandbox = Sandbox::new(Mode::Echo);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    // Short lines charge both per-line separators and the line limit
+    let res = vm
+        .exec("yes a | head -n 1200", Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(res, Err(Error::ExecFailed { ref message, .. }) if message.contains("exceeded limit of 1000 lines")),
+        "Expected limit error on short line flood, got: {res:?}"
     );
 
     vm.shutdown().await.unwrap();
