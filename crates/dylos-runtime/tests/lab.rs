@@ -519,50 +519,6 @@ async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_la
     assert_removed(&sandbox, &config);
 }
 
-#[tokio::test]
-async fn fork_partial_failure_rolls_back_all_clones() {
-    if !sandboxed("fork_partial_failure_rolls_back_all_clones") {
-        return;
-    }
-    let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
-        return;
-    }
-    let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
-    source.snapshot("saved").await.unwrap();
-    let snapshot = config.store.snapshot_dir("src", "saved");
-
-    // Block one clone from being restored by pre-creating an invalid directory with no write permissions
-    let blocked_dir = config.store.base.join("fail-c2");
-    fs::create_dir_all(&blocked_dir).unwrap();
-    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
-    perms.set_mode(0o400);
-    fs::set_permissions(&blocked_dir, perms).unwrap();
-
-    let clone_ids = vec![
-        "fail-c1".to_string(),
-        "fail-c2".to_string(),
-        "fail-c3".to_string(),
-    ];
-    let res = Lab::fork_with(&config, &snapshot, &clone_ids).await;
-    assert!(res.is_err());
-
-    // Restore permissions so cleanup works
-    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
-    perms.set_mode(0o700);
-    let _ = fs::set_permissions(&blocked_dir, perms);
-    let _ = fs::remove_dir_all(&blocked_dir);
-
-    // Assert fail-c1 and fail-c3 were rolled back
-    assert!(!config.store.base.join("fail-c1").exists());
-    assert!(!config.store.base.join("fail-c3").exists());
-    assert!(!config.netns_dir.join("dylos-fail-c1").exists());
-    assert!(!config.netns_dir.join("dylos-fail-c3").exists());
-
-    source.teardown().await.unwrap();
-    assert_removed(&sandbox, &config);
-}
-
 /// Leftovers of a lab whose rollback failed are only removable once the blocker is gone.
 async fn recover(sandbox: &Sandbox, config: &LabConfig, ids: &[&str]) {
     sandbox.release_busy_jails();
@@ -656,4 +612,48 @@ async fn fork_reports_a_successful_clone_that_could_not_be_torn_down() {
     assert!(error.leaves_resources(), "{error:?}");
     fs::remove_dir_all(config.store.base.join(&ids[0])).unwrap();
     recover(&sandbox, &config, &[&ids[1]]).await;
+}
+
+#[tokio::test]
+async fn fork_partial_failure_rolls_back_all_clones() {
+    if !sandboxed("fork_partial_failure_rolls_back_all_clones") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
+    source.snapshot("saved").await.unwrap();
+    let snapshot = config.store.snapshot_dir("src", "saved");
+
+    // Block one clone from being restored by pre-creating an invalid directory with no write permissions
+    let blocked_dir = config.store.base.join("fail-c2");
+    fs::create_dir_all(&blocked_dir).unwrap();
+    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
+    perms.set_mode(0o400);
+    fs::set_permissions(&blocked_dir, perms).unwrap();
+
+    let clone_ids = vec![
+        "fail-c1".to_string(),
+        "fail-c2".to_string(),
+        "fail-c3".to_string(),
+    ];
+    let res = Lab::fork_with(&config, &snapshot, &clone_ids).await;
+    assert!(res.is_err());
+
+    // Restore permissions so cleanup works
+    let mut perms = fs::metadata(&blocked_dir).unwrap().permissions();
+    perms.set_mode(0o700);
+    let _ = fs::set_permissions(&blocked_dir, perms);
+    let _ = fs::remove_dir_all(&blocked_dir);
+
+    // Assert fail-c1 and fail-c3 were rolled back
+    assert!(!config.store.base.join("fail-c1").exists());
+    assert!(!config.store.base.join("fail-c3").exists());
+    assert!(!config.netns_dir.join("dylos-fail-c1").exists());
+    assert!(!config.netns_dir.join("dylos-fail-c3").exists());
+
+    source.teardown().await.unwrap();
+    assert_removed(&sandbox, &config);
 }
