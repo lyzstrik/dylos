@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use dylos_core::LabSpec;
 use dylos_runtime::jailer::JailerConfig;
-use dylos_runtime::{Lab, LabConfig};
+use dylos_runtime::{Lab, LabConfig, LabError};
 use futures_util::future::join_all;
 
 const DEFAULT_REPETITIONS_FULL: usize = 20;
@@ -778,6 +778,21 @@ pub struct PhaseOutcome<T> {
     pub teardown_failures: Vec<anyhow::Error>,
 }
 
+/// Turns a failed lab operation into the error to propagate, and records it in `failures` when
+/// the runtime could not roll the lab back: its resources may remain, so the run directory
+/// backing them must be preserved. A failure whose rollback completed is an ordinary error.
+pub fn lab_failure(
+    failures: &mut Vec<anyhow::Error>,
+    error: LabError,
+    context: String,
+) -> anyhow::Error {
+    let recorded = error
+        .leaves_resources()
+        .then(|| anyhow::anyhow!("{context}: {error}"));
+    failures.extend(recorded);
+    anyhow::Error::from(error).context(context)
+}
+
 /// Runs `phases` inside a fresh private directory below `parent_dir`, then disposes of it.
 ///
 /// - Clean teardown: the directory (snapshots, disks) is removed whether or not a
@@ -956,7 +971,9 @@ impl Bench<'_> {
                 &format!("b-boot-{rep}"),
             )
             .await
-            .with_context(|| format!("cold boot failed on repetition {rep}"))?;
+            .map_err(|e| {
+                lab_failure(failures, e, format!("cold boot failed on repetition {rep}"))
+            })?;
             let ms = start.elapsed().as_secs_f64() * 1000.0;
             cold_boot_ms.add(ms);
             println!(
@@ -1057,7 +1074,13 @@ impl Bench<'_> {
                 let fork_start = Instant::now();
                 let mut clones = Lab::fork_with(&self.lab_config, snapshot_dir, &clone_ids)
                     .await
-                    .with_context(|| format!("fork failed for n={count} on repetition {rep}"))?;
+                    .map_err(|e| {
+                        lab_failure(
+                            failures,
+                            e,
+                            format!("fork failed for n={count} on repetition {rep}"),
+                        )
+                    })?;
                 let wall_ms = fork_start.elapsed().as_secs_f64() * 1000.0;
                 wall.add(wall_ms);
                 amortized.add(wall_ms / count as f64);
@@ -1108,7 +1131,13 @@ impl Bench<'_> {
     ) -> anyhow::Result<(SnapshotMetrics, ForkMetrics)> {
         let mut source = Lab::up_with(&self.lab_config, &self.prereqs.spec, "b-src")
             .await
-            .context("failed to start source lab for snapshot benchmarking")?;
+            .map_err(|e| {
+                lab_failure(
+                    failures,
+                    e,
+                    "failed to start source lab for snapshot benchmarking".into(),
+                )
+            })?;
         let result = async {
             let (snapshot, snapshot_dir) = self.snapshots(&mut source).await?;
             // Keep the source quiet so it does not consume CPU during fork measurements.

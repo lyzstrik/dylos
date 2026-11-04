@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use dylos_runtime::LabError;
 use xtask::bench::{
     BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
-    cleanup_private_bench_dir, parse_bench_args, percentile, render_markdown_report,
+    cleanup_private_bench_dir, lab_failure, parse_bench_args, percentile, render_markdown_report,
     run_in_private_dir, settle_pss, setup_private_bench_dir,
 };
 
@@ -454,6 +455,71 @@ async fn teardown_failure_after_successful_measurements_is_an_error() {
 
     assert!(format!("{err:#}").contains("source lab teardown failed"));
     assert_eq!(run_dirs(&parent).len(), 1);
+    fs::remove_dir_all(&parent).unwrap();
+}
+
+fn invalid(lab: &str, message: &str) -> LabError {
+    LabError::Invalid {
+        lab: lab.into(),
+        message: message.into(),
+    }
+}
+
+async fn run_with_lab_error(parent: &Path, error: LabError) -> anyhow::Error {
+    run_in_private_dir(parent, |run_dir| async move {
+        leave_owned_files(&run_dir);
+        let mut teardown_failures = Vec::new();
+        let result: anyhow::Result<()> = Err(lab_failure(
+            &mut teardown_failures,
+            error,
+            "lab step".into(),
+        ));
+        PhaseOutcome {
+            result,
+            teardown_failures,
+        }
+    })
+    .await
+    .unwrap_err()
+}
+
+#[tokio::test]
+async fn failed_rollback_of_up_or_fork_preserves_the_run_dir() {
+    let rollback = || LabError::Rollback {
+        operation: Box::new(invalid("b-src", "boot failed")),
+        cleanup: Box::new(invalid("b-src", "cannot remove jail")),
+    };
+    let panicked = tokio::spawn(async { panic!("restore task died") })
+        .await
+        .unwrap_err();
+    let task = LabError::Task {
+        lab: "f-n2-r1-c1".into(),
+        source: panicked,
+    };
+
+    for (name, error) in [("rollback", rollback()), ("task", task)] {
+        let parent = scratch(&format!("lab-rollback-{name}"));
+        let err = run_with_lab_error(&parent, error).await;
+
+        let message = format!("{err:#}");
+        assert!(message.contains("may remain"), "{message}");
+        let dirs = run_dirs(&parent);
+        assert_eq!(dirs.len(), 1, "{message}");
+        assert!(dirs[0].join("s/b-src/snapshots/snap-1/memory.bin").exists());
+        fs::remove_dir_all(&parent).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn lab_failure_with_completed_rollback_still_removes_the_run_dir() {
+    let parent = scratch("lab-plain-failure");
+
+    let err = run_with_lab_error(&parent, invalid("b-src", "boot failed")).await;
+
+    let message = format!("{err:#}");
+    assert!(message.contains("boot failed"), "{message}");
+    assert!(!message.contains("may remain"), "{message}");
+    assert_eq!(run_dirs(&parent), Vec::<PathBuf>::new());
     fs::remove_dir_all(&parent).unwrap();
 }
 
