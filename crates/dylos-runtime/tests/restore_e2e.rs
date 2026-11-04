@@ -35,12 +35,9 @@ async fn progress(lab: &Lab, previous: u64) -> u64 {
     .expect("existing TCP flow stopped making progress")
 }
 
-async fn measure_clocks(
-    clone: &Lab,
-    clock_command: &str,
-    before_clocks: &str,
-    before_timers: &str,
-) {
+const CLOCK_COMMAND: &str = "python3 -c 'import time; print(time.time_ns(), time.monotonic_ns(), time.clock_gettime_ns(time.CLOCK_BOOTTIME))'";
+
+async fn measure_clocks(clone: &Lab, before_clocks: &str, before_timers: &str) {
     // A slow serial command cannot establish a 100 ms accuracy bound. Retry
     // only measurement uncertainty; clock errors still fail the assertion below.
     let (host_before, host_after, after_clocks) =
@@ -50,7 +47,7 @@ async fn measure_clocks(
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
                     .as_nanos();
-                let clocks = exec(clone, "A", clock_command).await;
+                let clocks = exec(clone, "A", CLOCK_COMMAND).await;
                 let host_after = SystemTime::now()
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .unwrap()
@@ -137,20 +134,20 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         progress(&original, 512).await;
         let sockets = exec(&original, "A", "ss -Htn state established | sort").await;
         assert!(sockets.contains("5201") && sockets.contains("5202"), "{sockets}");
-        let clock_command = "python3 -c 'import time; print(time.time_ns(), time.monotonic_ns(), time.clock_gettime_ns(time.CLOCK_BOOTTIME))'";
-        let before_clocks = exec(&original, "A", clock_command).await;
-        let before_timers = exec(&original, "A", "ss -Hotn state established").await;
+        let (before_clocks, before_timers) = (exec(&original, "A", CLOCK_COMMAND).await, exec(&original, "A", "ss -Hotn state established").await);
         let manifest = original.snapshot("tcp").await.unwrap();
         // Deliberate experimental downtime, rather than a readiness wait.
         tokio::time::sleep_until(tokio::time::Instant::now() + Duration::from_secs(30)).await;
         let snapshot = config.store.snapshot_dir("src", "tcp");
-        let clone = restored.insert(Lab::restore_with(&config, &snapshot, "dst").await.unwrap());
+        let clone = Lab::restore_with(&config, &snapshot, "dst").await.unwrap();
+        restored = Some(clone);
+        let clone = restored.as_mut().unwrap();
         let (source, target) = (original.network_mut().unwrap(), clone.network_mut().unwrap());
         assert_eq!(source.plan().taps(), target.plan().taps());
         assert_eq!(source.plan().bridges(), target.plan().bridges());
         assert_ne!(source.netns_path(), target.netns_path());
         let clone = &*clone;
-        measure_clocks(clone, clock_command, &before_clocks, &before_timers).await;
+        measure_clocks(clone, &before_clocks, &before_timers).await;
         // Queue lengths vary; compare endpoints while requiring both pre-existing data connections.
         let endpoints = |text: &str| { let mut rows = text.lines().map(|line| line.split_whitespace().skip(2).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>(); rows.sort(); rows };
         assert_eq!(endpoints(&sockets), endpoints(&exec(clone, "A", "ss -Htn state established | sort").await));

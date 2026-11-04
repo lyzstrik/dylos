@@ -438,11 +438,7 @@ impl Lab {
             "all VM APIs ready"
         );
         if restoring {
-            self.resume_restored(config).await?;
-            let latency = netns_started.elapsed();
-            self.restore_latency = Some(latency);
-            tracing::info!(lab = %self.id, latency_ms = latency.as_millis(), target_ms = 500,
-                "clone restored and thawed (netns to thaw)");
+            self.resume_restored(config, netns_started).await?;
             return Ok(());
         }
         let started = Instant::now();
@@ -482,7 +478,7 @@ impl Lab {
         self.bind_control_socket().await
     }
 
-    async fn resume_restored(&mut self, config: &LabConfig) -> Result<()> {
+    async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
         let listeners =
             crate::agent::listeners(&self.vms, &config.jailer).map_err(|e| io(&self.id, e))?;
         self.load_restored().await?;
@@ -493,6 +489,14 @@ impl Lab {
         if let Some(network) = self.network.as_mut() {
             network.thaw().await?;
         }
+        let latency = netns_started.elapsed();
+        self.restore_latency = Some(latency);
+        tracing::info!(
+            lab = %self.id,
+            latency_ms = latency.as_millis(),
+            target_ms = 500,
+            "clone restored and thawed (netns to thaw)"
+        );
         self.bind_control_socket().await?;
         Ok(())
     }
