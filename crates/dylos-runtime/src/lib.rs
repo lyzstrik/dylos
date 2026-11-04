@@ -13,7 +13,9 @@
 //! on the CLI application (`dylos-cli`).
 #![forbid(unsafe_code)]
 
+pub mod agent;
 pub mod error;
+pub mod fleet;
 pub mod jailer;
 pub mod lab;
 pub mod pause;
@@ -21,6 +23,7 @@ pub mod snapshot;
 pub mod vm;
 
 pub use error::{Error, Result};
+pub use fleet::{Fleet, FleetError, LabFailure};
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
 pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms};

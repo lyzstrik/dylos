@@ -355,6 +355,7 @@ dependencies = [
 name = "dylos-runtime"
 version = "0.1.0"
 dependencies = [
+ "dylos-agent",
  "dylos-core",
  "dylos-fc",
  "dylos-net",
@@ -1420,6 +1421,11 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dylos-core",
+ "dylos-runtime",
+ "dylos-store",
+ "futures-util",
+ "tokio",
 ]
 
 [[package]]

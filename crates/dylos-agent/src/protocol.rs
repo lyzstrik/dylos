@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub const ENTROPY_BYTES: usize = 32;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// Longest accepted line, newline included.
@@ -25,6 +27,9 @@ pub enum RequestBody {
     /// Set the guest wall clock to `unix_time_ns` (nanoseconds since the Unix epoch).
     Resync {
         unix_time_ns: u64,
+    },
+    InjectEntropy {
+        entropy: [u8; ENTROPY_BYTES],
     },
     Health,
 }

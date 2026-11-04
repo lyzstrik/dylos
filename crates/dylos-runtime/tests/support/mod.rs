@@ -100,6 +100,22 @@ impl Sandbox {
         assert_eq!(left, Vec::<PathBuf>::new(), "cgroups left behind");
     }
 
+    /// Makes every jail started from now on hold a mount that blocks its removal.
+    pub fn make_teardown_fail(&self) {
+        std::fs::write(self.dir.path().join("busy-jail"), b"").unwrap();
+    }
+
+    /// Releases the mounts of `make_teardown_fail` so the leftovers can be cleaned up.
+    pub fn release_busy_jails(&self) {
+        let base = self.dir.path().join("jails/firecracker");
+        for entry in std::fs::read_dir(base).into_iter().flatten() {
+            let busy = entry.unwrap().path().join("root/busy");
+            if busy.exists() {
+                nix::mount::umount2(&busy, nix::mount::MntFlags::MNT_DETACH).unwrap();
+            }
+        }
+    }
+
     pub async fn release_output_holder(&self) {
         let socket = self.dir.path().join("output-holder.sock");
         let stream = UnixStream::connect(socket).await.unwrap();
@@ -120,6 +136,21 @@ impl Sandbox {
 pub async fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
     let res = tokio::time::timeout(timeout, async {
         while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(res.is_ok(), "timed out waiting until {what}");
+}
+
+/// Like `wait_until`, for a condition that has to await.
+pub async fn wait_until_async<F: Future<Output = bool>>(
+    what: &str,
+    timeout: Duration,
+    mut condition: impl FnMut() -> F,
+) {
+    let res = tokio::time::timeout(timeout, async {
+        while !condition().await {
             tokio::task::yield_now().await;
         }
     })
@@ -156,6 +187,24 @@ pub fn run_fake_jailer_if_requested() {
         std::fs::create_dir_all(cgroup.join(parent).join(&id)).unwrap();
     }
     let mode = std::fs::read_to_string(&exec).unwrap();
+    // A mount point inside the jail makes the lab's teardown fail with EBUSY.
+    if Path::new(&base)
+        .parent()
+        .unwrap()
+        .join("busy-jail")
+        .exists()
+    {
+        let busy = root.join("busy");
+        std::fs::create_dir_all(&busy).unwrap();
+        nix::mount::mount(
+            Some("tmpfs"),
+            &busy,
+            Some("tmpfs"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .unwrap();
+    }
     if mode == "LabPartialLaunch" && id.ends_with("-B") {
         std::process::exit(3);
     }
@@ -404,6 +453,123 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         if check_lab_request(mode, sandbox, &sock, &request, &mut stream).await {
             continue;
         }
+        if request.starts_with("PUT /snapshot/load ") {
+            let root = sock.parent().unwrap().parent().unwrap();
+            assert!(request.contains("\"backend_type\":\"File\""));
+            assert!(request.contains("\"resume_vm\":false"));
+            let netns = std::fs::read_to_string(root.join("netns-arg")).unwrap();
+            let output = std::process::Command::new("nsenter")
+                .arg(format!("--net={netns}"))
+                .args(["ip", "-j", "link", "show"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let links: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            for link in links
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["ifname"] != "lo")
+            {
+                assert!(
+                    !link["flags"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|flag| flag == "UP"),
+                    "fabric was up during load: {link}"
+                );
+            }
+            std::fs::write(root.join("load-done"), b"").unwrap();
+        }
+        if request.starts_with("PATCH /vm ") && request.contains("Resumed") {
+            let root = sock.parent().unwrap().parent().unwrap();
+            if root.join("load-done").exists() {
+                let agent_socket = root.join("vsock.sock_5000");
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let stream = tokio::net::UnixStream::connect(agent_socket).await.unwrap();
+                    let mut reader = tokio::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert!(matches!(
+                        dylos_agent::protocol::Request::from_line(&line)
+                            .unwrap()
+                            .body,
+                        dylos_agent::protocol::RequestBody::InjectEntropy { .. }
+                    ));
+                    reader
+                        .get_mut()
+                        .write_all(b"{\"v\":1,\"type\":\"ok\"}\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    let request = dylos_agent::protocol::Request::from_line(&line).unwrap();
+                    assert!(matches!(
+                        request.body,
+                        dylos_agent::protocol::RequestBody::Resync { .. }
+                    ));
+                    reader
+                        .get_mut()
+                        .write_all(b"{\"v\":1,\"type\":\"ok\"}\n")
+                        .await
+                        .unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert_eq!(
+                        dylos_agent::protocol::Request::from_line(&line)
+                            .unwrap()
+                            .body,
+                        dylos_agent::protocol::RequestBody::Health
+                    );
+                    let reply = dylos_agent::protocol::Reply::new(
+                        dylos_agent::protocol::ReplyBody::Health {
+                            uptime_ms: 0,
+                            wall_clock_unix_ns: 0,
+                            agent_version: "fake".into(),
+                        },
+                    );
+                    reader
+                        .get_mut()
+                        .write_all(reply.to_line().unwrap().as_bytes())
+                        .await
+                        .unwrap();
+                });
+                let jail = root.parent().unwrap();
+                let prefix = jail
+                    .file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .rsplit_once('-')
+                    .unwrap()
+                    .0;
+                for node in ["A", "B", "C"] {
+                    assert!(
+                        jail.parent()
+                            .unwrap()
+                            .join(format!("{prefix}-{node}/root/load-done"))
+                            .exists(),
+                        "resume before every load"
+                    );
+                }
+            }
+        }
+        if let Ok(stage) = std::fs::read_to_string(sandbox.join("fail-restore")) {
+            let fail = stage == "load" && request.starts_with("PUT /snapshot/load ")
+                || stage == "resume"
+                    && request.starts_with("PATCH /vm ")
+                    && request.contains("Resumed");
+            if fail {
+                stream
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+                continue;
+            }
+        }
         if request.contains("InstanceStart") {
             if matches!(
                 mode,
@@ -450,8 +616,8 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
                 stream.shutdown().await.unwrap();
                 continue;
             }
-            std::fs::write(root.join("vm.state"), b"fake vm state content").unwrap();
-            std::fs::write(root.join("vm.mem"), b"fake vm memory content").unwrap();
+            std::fs::write(root.join("snap.state"), b"fake vm state content").unwrap();
+            std::fs::write(root.join("snap.mem"), b"fake vm memory content").unwrap();
             std::fs::write(root.join("capture-done"), b"").unwrap();
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")

@@ -465,8 +465,8 @@ async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
                 .exists()
         );
         // Verify partial jail-side snapshot files are removed on error
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
 
     lab.teardown().await.unwrap();
@@ -517,8 +517,8 @@ async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
                 .exists()
         );
         // Partial jail files must be cleaned up
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
 
     lab.teardown().await.unwrap();
@@ -585,8 +585,8 @@ async fn snapshot_fails_at_thaw_cleans_up_and_reports_error() {
                 .join(format!("{}.resumed", vm.paths().id))
                 .exists()
         );
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
 
     lab.teardown().await.unwrap();
@@ -740,8 +740,8 @@ async fn snapshot_in_flight_cancellation_during_capture() {
         || {
             !vm0_root.join("is-paused").exists()
                 && sandbox.dir.path().join(format!("{vm_id}.resumed")).exists()
-                && !vm0_root.join("vm.state").exists()
-                && !vm0_root.join("vm.mem").exists()
+                && !vm0_root.join("snap.state").exists()
+                && !vm0_root.join("snap.mem").exists()
         },
     )
     .await;
@@ -783,8 +783,8 @@ async fn snapshot_in_flight_cancellation_during_resume_still_commits() {
                 .join(format!("{}.resumed", vm.paths().id))
                 .exists()
         );
-        assert!(!vm.paths().root.join("vm.state").exists());
-        assert!(!vm.paths().root.join("vm.mem").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
     }
     let snap_dir = store.snapshot_dir("lcs", "snap-cancel-resume");
     let manifest_json = fs::read_to_string(snap_dir.join("manifest.json")).unwrap();

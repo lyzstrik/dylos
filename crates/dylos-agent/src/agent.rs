@@ -53,6 +53,26 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
     C: GuestClock,
 {
+    serve_with_entropy(
+        stream,
+        clock,
+        std::sync::Arc::new(crate::entropy::SystemEntropy),
+    )
+    .await
+}
+
+/// Serves requests with an injectable entropy mixing operation.
+/// # Errors
+/// Fails on I/O errors or an oversized request line.
+pub async fn serve_with_entropy<S, C>(
+    stream: S,
+    clock: &C,
+    entropy: std::sync::Arc<dyn crate::entropy::GuestEntropy>,
+) -> Result<(), ServeError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    C: GuestClock,
+{
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = Vec::new();
@@ -73,7 +93,23 @@ where
             return Err(ServeError::LineTooLong);
         }
         let reply = match std::str::from_utf8(&line) {
-            Ok(text) => handle_line(text, clock),
+            Ok(text) => match Request::from_line(text) {
+                Ok(Request {
+                    body: RequestBody::InjectEntropy { entropy: bytes },
+                    ..
+                }) => {
+                    let entropy = entropy.clone();
+                    match tokio::task::spawn_blocking(move || entropy.mix(bytes)).await {
+                        Ok(Ok(())) => {
+                            info!("guest host entropy mixed");
+                            Reply::new(ReplyBody::Ok)
+                        }
+                        Ok(Err(error)) => error_reply(format!("entropy mixing failed: {error}")),
+                        Err(error) => error_reply(format!("entropy mixing task failed: {error}")),
+                    }
+                }
+                _ => handle_line(text, clock),
+            },
             Err(error) => error_reply(format!("request is not UTF-8: {error}")),
         };
         write_half.write_all(reply.to_line()?.as_bytes()).await?;
@@ -95,6 +131,9 @@ fn handle<C: GuestClock>(body: &RequestBody, clock: &C) -> Reply {
             ReplyBody::Ok
         }),
         RequestBody::Health => health(clock),
+        RequestBody::InjectEntropy { .. } => {
+            return error_reply("entropy injection requires blocking executor".into());
+        }
     };
     match result {
         Ok(body) => Reply::new(body),

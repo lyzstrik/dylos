@@ -5,6 +5,7 @@ use dylos_core::manifest::{SnapshotManifest, StepDurations, VmManifest};
 use dylos_store::{SnapshotOpener, Store, VmFileSource};
 use std::collections::BTreeMap;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 fn setup() -> (tempfile::TempDir, Store, LabSpec) {
@@ -341,4 +342,171 @@ fn save_vm_file_bounded_rejection_on_file_growth() {
         400,
         "a rejected source must be kept"
     );
+}
+
+fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) {
+    use dylos_core::manifest::FileMeta;
+    use sha2::{Digest, Sha256};
+    let mut snapshot = store.create_snapshot("source", "restore-test").unwrap();
+    let mut vms = BTreeMap::new();
+    for node in &spec.nodes {
+        let root = snapshot.root().join("vms").join(&node.name);
+        fs::create_dir(&root).unwrap();
+        let meta = |name: &str| {
+            let bytes = format!("{} {name}", node.name);
+            let file_path = root.join(name);
+            fs::write(&file_path, &bytes).unwrap();
+            if name == "vm.mem" {
+                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
+            }
+            FileMeta {
+                path: PathBuf::from(format!("vms/{}/{name}", node.name)),
+                size: bytes.len() as u64,
+                sha256: format!("{:x}", Sha256::digest(bytes.as_bytes())),
+            }
+        };
+        vms.insert(
+            node.name.clone(),
+            VmManifest {
+                state_file: meta("vm.state"),
+                memory_file: meta("vm.mem"),
+                disks: vec![meta("rootfs.ext4")],
+            },
+        );
+    }
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: spec,
+        vms,
+        firecracker_version: "1.17.0".into(),
+        host_cpu_model: "test".into(),
+        created_at_unix_ms: 0,
+        step_durations_ms: StepDurations {
+            freeze: 0,
+            pause: 0,
+            snapshot: 0,
+            resume: 0,
+            thaw: 0,
+        },
+    };
+    snapshot.write_manifest(&manifest).unwrap();
+    let path = snapshot.root().to_owned();
+    snapshot.commit();
+    (path, manifest)
+}
+
+#[test]
+fn restore_verifies_before_creation_and_reflinks_independent_files() {
+    use std::os::unix::fs::MetadataExt;
+    let (_temp, store, spec) = setup();
+    let (path, manifest) = restore_fixture(&store, spec);
+    let mut lab = match store.restore("clone", &path) {
+        Ok((lab, _)) => lab,
+        Err(dylos_store::Error::Reflink { source, .. })
+            if matches!(
+                source.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
+            ) =>
+        {
+            assert!(!store.base.join("clone").exists());
+            eprintln!("SKIPPED restore store test: reflinks unsupported: {source}");
+            return;
+        }
+        Err(e) => panic!("restore failed: {e}"),
+    };
+    for node in &manifest.lab_spec.nodes {
+        for name in ["rootfs.ext4", "vm.state"] {
+            let source = path.join("vms").join(&node.name).join(name);
+            let clone = lab.root().join("vms").join(&node.name).join(name);
+            assert_eq!(fs::read(&source).unwrap(), fs::read(&clone).unwrap());
+            assert_ne!(
+                fs::metadata(&source).unwrap().ino(),
+                fs::metadata(&clone).unwrap().ino()
+            );
+            fs::write(clone, b"changed clone").unwrap();
+        }
+        let mem_source = path.join("vms").join(&node.name).join("vm.mem");
+        let mem_clone = lab.root().join("vms").join(&node.name).join("vm.mem");
+        assert_eq!(
+            fs::read(&mem_source).unwrap(),
+            fs::read(&mem_clone).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(&mem_source).unwrap().ino(),
+            fs::metadata(&mem_clone).unwrap().ino()
+        );
+        assert!(fs::metadata(&mem_clone).unwrap().permissions().readonly());
+    }
+    manifest
+        .verify(SnapshotOpener::new(&path).unwrap().verify_opener())
+        .unwrap();
+    lab.remove().unwrap();
+    lab.remove().unwrap();
+    assert!(!store.base.join("clone").exists());
+    assert!(store.restore("source", &path).is_err());
+    let tampered_path = path.join("vms/a/vm.mem");
+    let mut perms = fs::metadata(&tampered_path).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&tampered_path, perms).unwrap();
+    fs::write(&tampered_path, b"tampered").unwrap();
+    assert!(store.restore("clone", &path).is_err());
+    assert!(!store.base.join("clone").exists());
+}
+
+#[test]
+fn restore_rejects_missing_vm_and_symlink_files_without_creating_lab() {
+    use std::os::unix::fs::symlink;
+    let (_temp, store, spec) = setup();
+    let (path, mut manifest) = restore_fixture(&store, spec);
+    manifest.vms.remove("a");
+    fs::write(
+        path.join("manifest.json"),
+        manifest.to_json_string().unwrap(),
+    )
+    .unwrap();
+    assert!(store.restore("clone", &path).is_err());
+    assert!(!store.base.join("clone").exists());
+    let (_temp, store, spec) = setup();
+    let (path, _manifest) = restore_fixture(&store, spec);
+    fs::remove_file(path.join("vms/a/vm.mem")).unwrap();
+    symlink("/etc/passwd", path.join("vms/a/vm.mem")).unwrap();
+    assert!(store.restore("clone", &path).is_err());
+    assert!(!store.base.join("clone").exists());
+}
+
+#[test]
+fn restore_fails_closed_on_writable_shared_memory_backing() {
+    let (_temp, store, spec) = setup();
+    let (path, _manifest) = restore_fixture(&store, spec);
+    // Intact bytes, so only the permission check can reject it.
+    let mem = path.join("vms/a/vm.mem");
+    fs::set_permissions(&mem, fs::Permissions::from_mode(0o644)).unwrap();
+    let err = store.restore("clone", &path).unwrap_err();
+    assert!(
+        matches!(&err, dylos_store::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::PermissionDenied),
+        "{err:?}"
+    );
+    assert!(!store.base.join("clone").exists());
+}
+
+#[test]
+fn shared_backing_must_be_orchestrator_owned_and_unwritable() {
+    use dylos_store::ensure_trusted_read_only;
+    // Root orchestrator, jailer uid 65534.
+    assert!(ensure_trusted_read_only(0, 0o100_444, 0).is_ok());
+    assert!(ensure_trusted_read_only(0, 0o100_400, 0).is_ok());
+    for (owner, mode) in [
+        (65534, 0o100_444), // jailer-owned: its owner could chmod it writable again
+        (1000, 0o100_444),
+        (0, 0o100_644),
+        (0, 0o100_464),
+        (0, 0o100_446),
+    ] {
+        let err = ensure_trusted_read_only(owner, mode, 0).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "{owner} {mode:o}"
+        );
+    }
 }

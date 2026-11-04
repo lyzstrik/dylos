@@ -22,6 +22,8 @@ use crate::{LabError, Vm};
 pub struct SnapshotTimings {
     pub freeze_ms: u64,
     pub pause_ms: u64,
+    /// First-to-last successful pause acknowledgement interval, in microseconds.
+    pub pause_skew_us: u64,
     pub api_snapshot_ms: u64,
     pub storage_ms: u64,
     pub fsync_ms: u64,
@@ -112,7 +114,7 @@ async fn clean_jail_files_for_vms(vms: &[SnapshotVm]) -> Result<(), LabError> {
         for root in vm_roots {
             match dylos_store::directory(&root, false) {
                 Ok(dir) => {
-                    for file in ["vm.state", "vm.mem"] {
+                    for file in ["snap.state", "snap.mem"] {
                         match nix::unistd::unlinkat(
                             &dir,
                             file,
@@ -288,12 +290,16 @@ async fn run_snapshot_steps(
     state.paused.store(true, Ordering::SeqCst);
 
     let pause_results = join_all(job.vms.iter().map(|vm| async {
-        let started = Instant::now();
         let res = vm.client.pause().await;
-        (vm.node.clone(), res, started)
+        (vm.node.clone(), res, Instant::now())
     }))
     .await;
 
+    let first_pause = pause_results.iter().map(|(_, _, at)| *at).min();
+    let last_pause = pause_results.iter().map(|(_, _, at)| *at).max();
+    let pause_skew_us = first_pause.zip(last_pause).map_or(0, |(first, last)| {
+        u64::try_from((last - first).as_micros()).unwrap_or(u64::MAX)
+    });
     let mut first_pause_err = None;
     for (node, res, _) in pause_results {
         if let Err(err) = res
@@ -340,7 +346,7 @@ async fn run_snapshot_steps(
         let api = vm.client.clone();
         let lab_id_for_api = job.lab_id.clone();
         let handle = tokio::spawn(async move {
-            let params = SnapshotCreateParams::full("/vm.state", "/vm.mem");
+            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem");
             api.create_snapshot(&params)
                 .await
                 .map_err(|source| LabError::Api {
@@ -398,8 +404,8 @@ async fn run_snapshot_steps(
     for vm in &job.vms {
         let snap = Arc::clone(&snapshot_arc);
         let node = vm.node.clone();
-        let state_src = vm.root_dir.join("vm.state");
-        let mem_src = vm.root_dir.join("vm.mem");
+        let state_src = vm.root_dir.join("snap.state");
+        let mem_src = vm.root_dir.join("snap.mem");
         let disk_src = vm.disk_path.clone();
 
         let state_max_bytes = 16 * 1024 * 1024;
@@ -607,6 +613,7 @@ async fn run_snapshot_steps(
     let timings = SnapshotTimings {
         freeze_ms,
         pause_ms,
+        pause_skew_us,
         api_snapshot_ms,
         storage_ms,
         fsync_ms: max_fsync_ms,
@@ -623,6 +630,7 @@ async fn run_snapshot_steps(
         snapshot = %job.snapshot_id,
         freeze_ms,
         pause_ms,
+        pause_skew_us,
         snapshot_ms,
         api_snapshot_ms,
         storage_ms,
