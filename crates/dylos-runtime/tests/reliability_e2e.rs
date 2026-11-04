@@ -178,7 +178,7 @@ async fn tcp_survives_in_all_ten_clones() {
     let mut clones = Vec::new();
     let result = std::panic::AssertUnwindSafe(async {
         exec(&source, "C", "iperf3 -6 -s -D -p 5201; iperf3 -4 -s -D -p 5202").await;
-        exec(&source, "A", include_str!("fixtures/reliability-flows.sh")).await;
+        exec(&source, "A", include_str!("fixtures/reliability-flows.sh").trim_end()).await;
         progress(&source, "-6", 65536).await;
         progress(&source, "-4", 65536).await;
         let a = endpoints(&source, "A").await;
