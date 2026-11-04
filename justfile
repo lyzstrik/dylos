@@ -72,6 +72,10 @@ e2e: host-check
 e2e-build:
     cargo nextest run --workspace --run-ignored only --no-run --locked
 
+# Run spike benchmarks (requires root and KVM; pass --quick for reduced mode)
+bench *args:
+    cargo xtask bench {{args}}
+
 # Build guest images (rootfs) with rootless podman
 images:
     cargo xtask images

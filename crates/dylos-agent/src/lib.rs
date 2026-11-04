@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod clock;
+pub mod entropy;
 pub mod protocol;
 
 /// vsock port the agent dials on the host (CID 2).
