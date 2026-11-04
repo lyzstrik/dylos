@@ -22,6 +22,7 @@ pub const ENTRY: &str = "fake_jailer_entry";
 pub enum Mode {
     /// Serves the API; exits 0 on `SendCtrlAltDel`, 7 after `FlushMetrics` if `crash_on_flush`.
     Serve,
+    ParallelPause,
     Echo,
     CrashOnFlush,
     /// Answers `SendCtrlAltDel` but keeps running; dies on SIGTERM.
@@ -186,6 +187,79 @@ pub fn run_fake_jailer_if_requested() {
     std::process::exit(code);
 }
 
+async fn parallel_pause_reply(
+    mode: &str,
+    sandbox: &Path,
+    sock: &Path,
+    request: &str,
+    stream: &mut UnixStream,
+) -> bool {
+    if mode == "ParallelPause" && request.starts_with("PATCH /vm ") {
+        let root = sock.parent().unwrap().parent().unwrap();
+        let action = if request.contains("Paused") {
+            "paused"
+        } else {
+            "resumed"
+        };
+        let id = root
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap();
+        std::fs::write(sandbox.join(format!("{id}.{action}")), b"confirmed request").unwrap();
+        // No VM answers until all three requests arrived: serial dispatch fails deterministically.
+        wait_until("all VM state requests", Duration::from_secs(3), || {
+            std::fs::read_dir(sandbox)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|ext| ext == action)
+                })
+                .count()
+                == 3
+        })
+        .await;
+        std::fs::write(sandbox.join(format!("{id}.{action}-barrier")), b"").unwrap();
+        if action == "paused" {
+            std::fs::write(root.join("is-paused"), b"").unwrap();
+            if root.join("drop-paused").exists() {
+                stream.shutdown().await.unwrap();
+                return true;
+            }
+        }
+        if root.join(format!("fail-{action}")).exists() {
+            stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            return true;
+        }
+        if action == "resumed" && root.join("is-paused").exists() {
+            std::fs::remove_file(root.join("is-paused")).unwrap();
+        }
+    }
+    false
+}
+
+async fn check_lab_request(
+    mode: &str,
+    sandbox: &Path,
+    sock: &Path,
+    request: &str,
+    stream: &mut UnixStream,
+) -> bool {
+    record_lab_request(mode, sock, request);
+    assert_lab_barriers(mode, sock, request);
+    parallel_pause_reply(mode, sandbox, sock, request, stream).await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: PathBuf) -> i32 {
     println!("fake firecracker starting in mode {mode}");
@@ -231,8 +305,9 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             return 5;
         }
         let request = normalize_lab_request(mode, read_request(&mut stream).await);
-        record_lab_request(mode, &sock, &request);
-        assert_lab_barriers(mode, &sock, &request);
+        if check_lab_request(mode, sandbox, &sock, &request, &mut stream).await {
+            continue;
+        }
         if request.contains("InstanceStart") {
             if mode == "LabReady" || mode == "LabPartialLaunch" || mode == "LabCrashOnFlush" {
                 println!("dylos: ready");
@@ -273,7 +348,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             return 0;
         }
         if request.contains("SendCtrlAltDel")
-            && (mode == "Serve" || mode == "Echo" || mode.starts_with("Lab"))
+            && (matches!(mode, "Serve" | "ParallelPause" | "Echo") || mode.starts_with("Lab"))
         {
             return 0;
         }
@@ -488,7 +563,7 @@ fn assert_lab_barriers(mode: &str, sock: &Path, request: &str) {
 }
 
 fn normalize_lab_request(mode: &str, request: String) -> String {
-    if mode.starts_with("Lab") {
+    if mode.starts_with("Lab") || mode == "ParallelPause" {
         request.replacen(" http://localhost/", " /", 1)
     } else {
         request

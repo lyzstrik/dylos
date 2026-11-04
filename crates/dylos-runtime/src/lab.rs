@@ -95,6 +95,21 @@ pub struct Lab {
 }
 
 impl Lab {
+    /// Pauses every VM concurrently and returns the confirmation skew.
+    /// Freeze the fabric first for a consistent snapshot; run this future to completion.
+    /// # Errors
+    /// Resumes every VM after a pause failure, preserving rollback errors.
+    pub async fn pause_all(&mut self) -> Result<Duration> {
+        crate::pause_all(&self.id, &self.vms).await
+    }
+
+    /// Resumes every VM concurrently and waits for all responses.
+    /// # Errors
+    /// Returns the first failure and logs every failed response.
+    pub async fn resume_all(&mut self) -> Result<()> {
+        crate::resume_all(&self.id, &self.vms).await
+    }
+
     /// # Errors
     /// Rejects invalid specs and rolls back all completed steps on a launch or readiness error.
     pub async fn up(spec: &LabSpec, lab_id: &str) -> Result<Self> {
