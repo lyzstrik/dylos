@@ -11,7 +11,11 @@ use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
 fn configuration() -> Option<(tempfile::TempDir, LabConfig, LabSpec)> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // The store rejects `..` path components.
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let bin = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from);
     let kernel = workspace.join("kernels/vmlinux.bin");
     let image = workspace.join("target/images/rootfs.ext4");
