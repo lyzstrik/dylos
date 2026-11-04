@@ -266,7 +266,7 @@ impl SnapshotManifest {
                     hasher.update(&buffer[..n]);
                 }
 
-                let actual_sha256 = encode_hex(&hasher.finalize());
+                let actual_sha256 = sha256_hex(&hasher.finalize().into());
 
                 if actual_size != file.size || actual_sha256 != file.sha256 {
                     return Err(Error::IntegrityMismatch {
@@ -284,7 +284,9 @@ impl SnapshotManifest {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+/// Encodes a SHA-256 digest in the lowercase hexadecimal format used by manifests.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     bytes
         .iter()
