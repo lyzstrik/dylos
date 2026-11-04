@@ -1,0 +1,14 @@
+nodes:
+  - name: writer
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: lan
+        ipv6: fd64:1::1/64
+        ipv4: 10.0.0.1/24
+segments:
+  - name: lan
+    ipv6: fd64:1::/64
+    ipv4: 10.0.0.0/24

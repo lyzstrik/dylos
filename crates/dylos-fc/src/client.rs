@@ -39,6 +39,7 @@ use crate::snapshot::{SnapshotCreateParams, SnapshotLoadParams, Vm};
 ///
 /// A timeout leaves the server-side outcome unknown; callers must not assume
 /// rollback or blindly retry.
+#[derive(Clone, Debug)]
 pub struct FcClient {
     socket_path: PathBuf,
     timeout: Duration,
