@@ -57,6 +57,15 @@ pub enum Error {
         #[source]
         source: io::Error,
     },
+    #[error(
+        "reflink preflight from {from} to {to} failed; image, lab store and jail directory must share a reflink-compatible mount: {source}"
+    )]
+    ReflinkPreflight {
+        from: PathBuf,
+        to: PathBuf,
+        #[source]
+        source: io::Error,
+    },
     #[error("serialize lab state: {0}")]
     State(#[from] serde_json::Error),
 }
@@ -575,6 +584,35 @@ impl Drop for Snapshot {
     }
 }
 impl Store {
+    /// Checks image/store and jail/store reflinks before any lab resources are created.
+    /// Missing directories are probed at their nearest existing ancestor. Unnamed temporary
+    /// files are removed by the kernel when their descriptors close, including on failure.
+    /// # Errors
+    /// Returns an error naming both paths when opening or cloning a probe fails.
+    pub fn preflight(&self, jail: &Path) -> Result<(), Error> {
+        let check = |from: &Path, to: &Path, work: &mut dyn FnMut() -> io::Result<()>| {
+            work().map_err(|source| Error::ReflinkPreflight {
+                from: from.into(),
+                to: to.into(),
+                source,
+            })
+        };
+        check(&self.image, &self.base, &mut || {
+            let parent = directory(self.image.parent().unwrap_or_else(|| Path::new(".")), false)?;
+            let name = self.image.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+            let image = open(&parent, name, OFlag::O_RDONLY)?;
+            let destination = probe_file(&self.base)?;
+            reflink(&image, &destination)
+        })?;
+        check(jail, &self.base, &mut || {
+            let mut source = probe_file(jail)?;
+            source.write_all(b"reflink preflight")?;
+            let destination = probe_file(&self.base)?;
+            reflink(&source, &destination)?;
+            reflink(&destination, &source)
+        })
+    }
+
     /// # Errors
     /// Rejects invalid specs, existing labs, symlinks, and unsupported reflinks. Rolls back on failure.
     pub fn create(&self, id: &str, spec: &LabSpec) -> Result<Lab, Error> {
@@ -1036,6 +1074,20 @@ pub fn directory(path: &Path, create: bool) -> io::Result<File> {
     }
     Ok(parent)
 }
+fn probe_file(path: &Path) -> io::Result<File> {
+    let mut ancestor = path;
+    let parent = loop {
+        match directory(ancestor, false) {
+            Ok(parent) => break parent,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(error)?;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    open(&parent, ".".as_ref(), OFlag::O_TMPFILE | OFlag::O_RDWR)
+}
+
 fn reflink(source: &File, destination: &File) -> io::Result<()> {
     // SAFETY: FICLONE takes a valid source descriptor as its integer argument, not a pointer;
     // both Files remain live for the ioctl and the destination is opened writable.

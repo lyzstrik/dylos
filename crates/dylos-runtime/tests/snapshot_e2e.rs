@@ -397,3 +397,48 @@ fn recorded_allocation_cycles(disk: &Path) -> u64 {
         )
     })
 }
+
+#[tokio::test]
+#[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
+async fn default_store_and_jail_paths_support_up_and_snapshot() {
+    if std::env::var_os("DYLOS_DEFAULT_PATHS_HELPER").is_none() {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let status = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "default_store_and_jail_paths_support_up_and_snapshot",
+                "--nocapture",
+            ])
+            .env("DYLOS_DEFAULT_PATHS_HELPER", "1")
+            .current_dir(dir.path())
+            .kill_on_drop(true)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "default-path subprocess failed: {status}");
+        return;
+    }
+    let Some((_workspace, bin, kernel, image)) = check_prerequisites() else {
+        return;
+    };
+    let mut jailer = LabConfig::default().jailer;
+    jailer.jailer = bin.join("jailer");
+    jailer.firecracker = bin.join("firecracker");
+    let config = LabConfig {
+        kernel,
+        store: dylos_store::Store {
+            image,
+            ..dylos_store::Store::default()
+        },
+        jailer,
+        ..LabConfig::default()
+    };
+    let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
+    let mut lab = Lab::up_with(&config, &spec, "default-paths-e2e")
+        .await
+        .unwrap();
+    let result = lab.snapshot("defaults").await;
+    lab.teardown().await.unwrap();
+    assert!(result.is_ok(), "{result:?}");
+}

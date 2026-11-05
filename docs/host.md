@@ -105,3 +105,19 @@ git config --local tag.gpgsign true
 
 ## End-to-end tests
 End-to-end tests (`just e2e`) require root and `/dev/kvm`. They run automatically in CI on disposable GitHub-hosted runners (`.github/workflows/e2e.yml`). On a developer host, they are run by a human (never run `sudo` inside tests).
+
+## Lab storage and jail mounts
+
+The rootfs image (default `target/images/rootfs.ext4`), lab store and jail directory
+must support reflinks to one another on the same mount. Separate mounts of the same
+btrfs filesystem are insufficient: Linux FICLONE can return EXDEV across mounts.
+`lab up` probes actual reflinks before creating lab resources and reports both paths
+when the preflight fails; its unnamed temporary files are automatically removed.
+
+`DYLOS_LAB_DIR` overrides the default store `target/labs`. The default jail base is
+its sibling `jails` (`target/jails` with CLI defaults), keeping repository images,
+labs and jails together when the repository is on a different mount from `/srv`.
+`DYLOS_JAIL_DIR` overrides the jail base independently; select a short path on the
+same mount to keep Unix socket paths below 108 bytes. These directories must remain
+operator-controlled and not writable by the jailer uid. Existing labs created with
+`/srv/jailer` need `DYLOS_JAIL_DIR=/srv/jailer` for teardown before switching defaults.

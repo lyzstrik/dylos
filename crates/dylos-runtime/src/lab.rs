@@ -82,15 +82,28 @@ pub struct LabConfig {
 
 impl Default for LabConfig {
     fn default() -> Self {
+        let store = dylos_store::Store::default();
+        let jailer = JailerConfig::new(LabConfig::default_jail_dir(&store.base), 65534, 65534);
         Self {
-            store: dylos_store::Store::default(),
-            jailer: JailerConfig::new("/srv/jailer", 65534, 65534),
+            store,
+            jailer,
             kernel: "kernels/vmlinux.bin".into(),
             netns_dir: "/run/netns".into(),
             timeouts: Timeouts::default(),
             boot_timeout: Duration::from_secs(30),
             extra_boot_args: None,
         }
+    }
+}
+
+impl LabConfig {
+    /// A short sibling of the store keeps default snapshot paths on the same mount.
+    #[must_use]
+    pub fn default_jail_dir(store: &Path) -> PathBuf {
+        store
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("jails")
     }
 }
 
@@ -147,7 +160,12 @@ impl Lab {
         async {
             let started = Instant::now();
             let (store, spec_copy, id) = (config.store.clone(), spec.clone(), lab_id.to_owned());
-            let storage = blocking(lab_id, move || Ok(store.create(&id, &spec_copy)?)).await?;
+            let jail = config.jailer.chroot_base_dir.clone();
+            let storage = blocking(lab_id, move || {
+                store.preflight(&jail)?;
+                Ok(store.create(&id, &spec_copy)?)
+            })
+            .await?;
             let mut lab = Self {
                 id: lab_id.into(),
                 store: config.store.clone(),
