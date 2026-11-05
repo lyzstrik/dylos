@@ -20,7 +20,7 @@ use nix::{
     dir::Dir,
     errno::Errno,
     fcntl::{OFlag, openat, renameat},
-    sys::stat::{Mode, mkdirat},
+    sys::stat::{Mode, SFlag, mkdirat},
     unistd::{UnlinkatFlags, unlinkat},
 };
 use serde::{Deserialize, Serialize};
@@ -1413,8 +1413,8 @@ impl SnapshotOpener {
                     source: e.into(),
                 })?;
 
-                let mode = nix::sys::stat::SFlag::from_bits_truncate(stat.st_mode);
-                if mode.contains(nix::sys::stat::SFlag::S_IFDIR) {
+                let file_type = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+                if file_type == SFlag::S_IFDIR {
                     if !allowed_dirs.contains(&child_rel_path) {
                         return Err(dylos_core::Error::UnexpectedEntry {
                             path: child_rel_path,
@@ -1427,7 +1427,7 @@ impl SnapshotOpener {
                             source: e,
                         })?;
                     queue.push((child_rel_path, child_file));
-                } else if mode.contains(nix::sys::stat::SFlag::S_IFREG) {
+                } else if file_type == SFlag::S_IFREG {
                     if !declared_files.contains(&child_rel_path) {
                         return Err(dylos_core::Error::UnexpectedEntry {
                             path: child_rel_path,

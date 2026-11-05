@@ -238,37 +238,62 @@ async fn verify_snapshot_rejects_symlink_in_snapshot_dir() {
 }
 
 #[tokio::test]
-async fn verify_snapshot_rejects_leaf_symlink_replacement() {
+async fn verify_snapshot_rejects_symlinked_manifest_json() {
     let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
     let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
-    let leaf = tmp.path().join("vms/vm1/vm.state");
-    let outside = tmp.path().join("outside_state");
-    fs::write(&outside, b"outside").unwrap();
-    fs::remove_file(&leaf).unwrap();
-    std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+    let outside_manifest = outside.path().join("outside_manifest.json");
+    fs::write(&outside_manifest, b"{}").unwrap();
+    let manifest_link = tmp.path().join("manifest.json");
+    std::os::unix::fs::symlink(&outside_manifest, &manifest_link).unwrap();
 
     let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
-    assert!(matches!(
-        err,
-        Error::UnexpectedEntry { .. } | Error::Io { .. }
-    ));
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("manifest.json"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_leaf_symlink_replacement() {
+    let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let leaf = tmp.path().join("vms/vm1/vm.state");
+    let outside_state = outside.path().join("outside_state");
+    fs::write(&outside_state, b"outside").unwrap();
+    fs::remove_file(&leaf).unwrap();
+    std::os::unix::fs::symlink(&outside_state, &leaf).unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("vms/vm1/vm.state"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn verify_snapshot_rejects_ancestor_symlink_replacement() {
     let tmp = tempdir().unwrap();
+    let outside = tempdir().unwrap();
     let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
     let vm_dir = tmp.path().join("vms/vm1");
-    let outside = tmp.path().join("outside_dir");
-    fs::create_dir(&outside).unwrap();
+    let outside_dir = outside.path().join("outside_dir");
+    fs::create_dir(&outside_dir).unwrap();
     fs::remove_dir_all(&vm_dir).unwrap();
-    std::os::unix::fs::symlink(&outside, &vm_dir).unwrap();
+    std::os::unix::fs::symlink(&outside_dir, &vm_dir).unwrap();
 
     let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
-    assert!(matches!(
-        err,
-        Error::UnexpectedEntry { .. } | Error::Io { .. }
-    ));
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("vms/vm1"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
 }
 
 #[tokio::test]
