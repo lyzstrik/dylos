@@ -146,3 +146,79 @@ fn manifest_verifies_through_public_descriptor_opener() {
     assert!(manifest.verify(opener.verify_opener()).is_err());
     assert!(opener.verify(&manifest).is_err());
 }
+
+#[test]
+fn opener_verify_rejects_undeclared_entries() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("file"), "hello world").unwrap();
+    let meta = FileMeta {
+        path: "file".into(),
+        size: 11,
+        sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
+    };
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: dylos_core::LabSpec::from_yaml_str(include_str!("fixtures/manifest_lab.yaml"))
+            .unwrap(),
+        vms: BTreeMap::from([(
+            "router".into(),
+            VmManifest {
+                state_file: meta.clone(),
+                memory_file: meta,
+                disks: vec![],
+            },
+        )]),
+        firecracker_version: "1.17.0".into(),
+        host_cpu_model: "test".into(),
+        created_at_unix_ms: 0,
+        step_durations_ms: StepDurations {
+            freeze: 0,
+            pause: 0,
+            snapshot: 0,
+            resume: 0,
+            thaw: 0,
+        },
+    };
+    let opener = SnapshotOpener::new(tmp.path()).unwrap();
+    assert!(opener.verify(&manifest).is_ok());
+
+    // 1. Extra regular file at root
+    let extra_file = tmp.path().join("extra.txt");
+    fs::write(&extra_file, "unexpected").unwrap();
+    assert!(matches!(
+        opener.verify(&manifest),
+        Err(dylos_core::Error::UnexpectedEntry { ref path }) if path == Path::new("extra.txt")
+    ));
+    fs::remove_file(&extra_file).unwrap();
+
+    // 2. Extra directory
+    let extra_dir = tmp.path().join("extra_dir");
+    fs::create_dir(&extra_dir).unwrap();
+    assert!(matches!(
+        opener.verify(&manifest),
+        Err(dylos_core::Error::UnexpectedEntry { ref path }) if path == Path::new("extra_dir")
+    ));
+    fs::remove_dir(&extra_dir).unwrap();
+
+    // 3. Symlink entry
+    let link = tmp.path().join("symlink_entry");
+    symlink(tmp.path().join("file"), &link).unwrap();
+    assert!(matches!(
+        opener.verify(&manifest),
+        Err(dylos_core::Error::UnexpectedEntry { ref path }) if path == Path::new("symlink_entry")
+    ));
+    fs::remove_file(&link).unwrap();
+
+    // 4. Extra file inside vms
+    fs::create_dir_all(tmp.path().join("vms/router")).unwrap();
+    let vm_extra = tmp.path().join("vms/router/extra.bin");
+    fs::write(&vm_extra, "extra").unwrap();
+    assert!(matches!(
+        opener.verify(&manifest),
+        Err(dylos_core::Error::UnexpectedEntry { ref path }) if path == Path::new("vms/router/extra.bin")
+    ));
+    fs::remove_file(&vm_extra).unwrap();
+
+    // After removing extra files, verification succeeds again
+    assert!(opener.verify(&manifest).is_ok());
+}

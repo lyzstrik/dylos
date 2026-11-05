@@ -56,10 +56,7 @@ fn create_test_snapshot(dir: &Path, vm_names: &[&str]) -> (SnapshotOpener, Snaps
 
     let manifest = SnapshotManifest {
         format_version: 1,
-        lab_spec: LabSpec::from_yaml_str(
-            "segments:\n  - name: lan\n    ipv6: fd64:796c:6f73:1::/64\nnodes: []",
-        )
-        .unwrap(),
+        lab_spec: LabSpec::from_yaml_str(include_str!("fixtures/verify_lab.yaml")).unwrap(),
         vms,
         firecracker_version: "1.17.0".into(),
         host_cpu_model: "test-cpu".into(),
@@ -174,4 +171,137 @@ async fn verify_snapshot_validates_paths_before_opening() {
         }
         other => panic!("expected InvalidPath, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_undeclared_regular_file_in_snapshot_dir() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let extra = tmp.path().join("extra_root_file.txt");
+    fs::write(&extra, b"undeclared content").unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("extra_root_file.txt"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_undeclared_vm_file() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let extra = tmp.path().join("vms/vm1/extra_disk.img");
+    fs::write(&extra, b"undeclared vm file").unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("vms/vm1/extra_disk.img"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_undeclared_directory() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let rogue_dir = tmp.path().join("rogue_dir");
+    fs::create_dir(&rogue_dir).unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("rogue_dir"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_symlink_in_snapshot_dir() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let link = tmp.path().join("symlink_entry");
+    std::os::unix::fs::symlink(tmp.path().join("vms/vm1/vm.state"), &link).unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    match err {
+        Error::UnexpectedEntry { path } => {
+            assert_eq!(path, PathBuf::from("symlink_entry"));
+        }
+        other => panic!("expected UnexpectedEntry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_leaf_symlink_replacement() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let leaf = tmp.path().join("vms/vm1/vm.state");
+    let outside = tmp.path().join("outside_state");
+    fs::write(&outside, b"outside").unwrap();
+    fs::remove_file(&leaf).unwrap();
+    std::os::unix::fs::symlink(&outside, &leaf).unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    assert!(matches!(
+        err,
+        Error::UnexpectedEntry { .. } | Error::Io { .. }
+    ));
+}
+
+#[tokio::test]
+async fn verify_snapshot_rejects_ancestor_symlink_replacement() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+    let vm_dir = tmp.path().join("vms/vm1");
+    let outside = tmp.path().join("outside_dir");
+    fs::create_dir(&outside).unwrap();
+    fs::remove_dir_all(&vm_dir).unwrap();
+    std::os::unix::fs::symlink(&outside, &vm_dir).unwrap();
+
+    let err = verify_snapshot(&opener, &manifest).await.unwrap_err();
+    assert!(matches!(
+        err,
+        Error::UnexpectedEntry { .. } | Error::Io { .. }
+    ));
+}
+
+#[tokio::test]
+async fn verify_snapshot_does_not_block_tokio_executor() {
+    let tmp = tempdir().unwrap();
+    let (opener, manifest) = create_test_snapshot(
+        tmp.path(),
+        &["vm1", "vm2", "vm3", "vm4", "vm5", "vm6", "vm7", "vm8"],
+    );
+
+    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let ticks_clone = std::sync::Arc::clone(&ticks);
+    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let ticker = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    ticks_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ = &mut stop_rx => break,
+            }
+        }
+    });
+
+    let result = verify_snapshot(&opener, &manifest).await;
+    let _ = stop_tx.send(());
+    ticker.await.unwrap();
+
+    assert!(result.is_ok());
+    assert!(
+        ticks.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "Tokio async executor was blocked by hashing"
+    );
 }

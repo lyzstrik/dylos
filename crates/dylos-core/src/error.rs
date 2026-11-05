@@ -96,6 +96,9 @@ pub enum Error {
         path: std::path::PathBuf,
     },
 
+    #[error("unexpected entry in snapshot directory: {path}")]
+    UnexpectedEntry { path: std::path::PathBuf },
+
     #[error(
         "integrity mismatch for VM {vm} file {path}: size expected {expected_size}, actual {actual_size}, sha256 expected {expected_sha256}, actual {actual_sha256}"
     )]

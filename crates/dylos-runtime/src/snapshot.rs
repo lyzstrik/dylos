@@ -803,73 +803,26 @@ pub async fn snapshot_vms(
 ///
 /// # Errors
 /// Returns [`dylos_core::Error::InvalidPath`] if paths are unsafe,
+/// [`dylos_core::Error::UnexpectedEntry`] if undeclared entries are present,
 /// [`dylos_core::Error::Io`] if opening or reading files fails, or
 /// [`dylos_core::Error::IntegrityMismatch`] if a file's size or SHA-256 checksum does not match.
 pub async fn verify_snapshot(
     opener: &SnapshotOpener,
     manifest: &SnapshotManifest,
 ) -> Result<(), dylos_core::Error> {
-    manifest.validate_paths()?;
-
-    let bound = std::thread::available_parallelism()
-        .map_or(8, std::num::NonZero::get)
-        .clamp(2, 16);
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(bound));
-    let opener = Arc::new(opener.try_clone().map_err(|e| dylos_core::Error::Io {
+    let opener = opener.try_clone().map_err(|e| dylos_core::Error::Io {
         vm: "snapshot".into(),
         path: PathBuf::new(),
         source: e,
-    })?);
-
-    let mut handles = Vec::with_capacity(manifest.vms.len());
-    for (vm_name, vm_manifest) in &manifest.vms {
-        let opener = Arc::clone(&opener);
-        let vm_name = vm_name.clone();
-        let vm_manifest = vm_manifest.clone();
-        let permit =
-            semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| dylos_core::Error::Io {
-                    vm: vm_name.clone(),
-                    path: PathBuf::new(),
-                    source: std::io::Error::other("verification semaphore closed"),
-                })?;
-
-        let handle = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            vm_manifest.verify(&vm_name, |p| opener.open(p))
-        });
-        handles.push(handle);
-    }
-
-    let mut first_error = None;
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            Err(join_err) => {
-                if first_error.is_none() {
-                    first_error = Some(dylos_core::Error::Io {
-                        vm: "snapshot".into(),
-                        path: PathBuf::new(),
-                        source: std::io::Error::other(join_err),
-                    });
-                }
-            }
-        }
-    }
-
-    if let Some(err) = first_error {
-        return Err(err);
-    }
-
-    Ok(())
+    })?;
+    let manifest = manifest.clone();
+    tokio::task::spawn_blocking(move || opener.verify(&manifest))
+        .await
+        .map_err(|join_err| dylos_core::Error::Io {
+            vm: "snapshot".into(),
+            path: PathBuf::new(),
+            source: std::io::Error::other(join_err),
+        })?
 }
 
 fn host_cpu_model() -> String {

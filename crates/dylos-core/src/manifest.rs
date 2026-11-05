@@ -84,7 +84,7 @@ impl FileMeta {
     /// if the file's size or SHA-256 checksum does not match.
     pub fn verify<R: Read>(&self, vm_name: &str, mut reader: R) -> Result<(), Error> {
         let mut hasher = Sha256::new();
-        let mut buffer = vec![0u8; 65536];
+        let mut buffer = vec![0u8; 1024 * 1024];
         let mut actual_size = 0u64;
 
         loop {

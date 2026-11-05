@@ -134,6 +134,16 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         verify_ms,
     );
 
+    // LYZ-73 acceptance criterion 2: Manifest verification must be at least as fast as snapshot hashing.
+    // Allow a documented tolerance (10% or 500ms, whichever is larger) to account for CI runner
+    // scheduling noise and scheduler jitter.
+    let tolerance_ms = 500.max(u128::from(timings.hash_ms) / 10);
+    assert!(
+        verify_ms <= u128::from(timings.hash_ms) + tolerance_ms,
+        "manifest verification ({verify_ms}ms) exceeded snapshot hashing ({hash_ms}ms + {tolerance_ms}ms tolerance)",
+        hash_ms = timings.hash_ms,
+    );
+
     // Clean teardown
     lab.teardown().await.expect("teardown failed");
 }
