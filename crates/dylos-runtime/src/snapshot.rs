@@ -10,6 +10,7 @@ use dylos_core::manifest::{SnapshotManifest, StepDurations, VmManifest};
 use dylos_fc::FcClient;
 use dylos_fc::snapshot::SnapshotCreateParams;
 use dylos_net::{FabricThawHandle, LabNetwork};
+use dylos_store::SnapshotOpener;
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 use tokio::task::JoinHandle;
@@ -795,6 +796,33 @@ pub async fn snapshot_vms(
     // A later invocation may already own the slot once this task has finished.
     slot.0.lock().await.take_if(|handle| handle.id() == task_id);
     result
+}
+
+/// Verifies all files in a snapshot concurrently with bounded parallelism,
+/// offloading blocking file IO and hashing from the async runtime with `spawn_blocking`.
+///
+/// # Errors
+/// Returns [`dylos_core::Error::InvalidPath`] if paths are unsafe,
+/// [`dylos_core::Error::UnexpectedEntry`] if undeclared entries are present,
+/// [`dylos_core::Error::Io`] if opening or reading files fails, or
+/// [`dylos_core::Error::IntegrityMismatch`] if a file's size or SHA-256 checksum does not match.
+pub async fn verify_snapshot(
+    opener: &SnapshotOpener,
+    manifest: &SnapshotManifest,
+) -> Result<(), dylos_core::Error> {
+    let opener = opener.try_clone().map_err(|e| dylos_core::Error::Io {
+        vm: "snapshot".into(),
+        path: PathBuf::new(),
+        source: e,
+    })?;
+    let manifest = manifest.clone();
+    tokio::task::spawn_blocking(move || opener.verify(&manifest))
+        .await
+        .map_err(|join_err| dylos_core::Error::Io {
+            vm: "snapshot".into(),
+            path: PathBuf::new(),
+            source: std::io::Error::other(join_err),
+        })?
 }
 
 fn host_cpu_model() -> String {

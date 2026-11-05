@@ -114,8 +114,8 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let snap_dir = config.store.snapshot_dir(lab_id, "snap-five");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
     let verify_start = Instant::now();
-    manifest
-        .verify(opener.verify_opener())
+    dylos_runtime::verify_snapshot(&opener, &manifest)
+        .await
         .expect("snapshot manifest verification failed");
     let verify_ms = verify_start.elapsed().as_millis();
 
@@ -132,6 +132,16 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         manifest.step_durations_ms.resume,
         manifest.step_durations_ms.thaw,
         verify_ms,
+    );
+
+    // LYZ-73 acceptance criterion 2: Manifest verification must be at least as fast as snapshot hashing.
+    // Allow a documented tolerance (10% or 500ms, whichever is larger) to account for CI runner
+    // scheduling noise and scheduler jitter.
+    let tolerance_ms = 500.max(u128::from(timings.hash_ms) / 10);
+    assert!(
+        verify_ms <= u128::from(timings.hash_ms) + tolerance_ms,
+        "manifest verification ({verify_ms}ms) exceeded snapshot hashing ({hash_ms}ms + {tolerance_ms}ms tolerance)",
+        hash_ms = timings.hash_ms,
     );
 
     // Clean teardown
@@ -235,8 +245,8 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
     let manifest = lab.snapshot("snap-writer").await.expect("snapshot failed");
     let snap_dir = config.store.snapshot_dir(lab_id, "snap-writer");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
-    manifest
-        .verify(opener.verify_opener())
+    dylos_runtime::verify_snapshot(&opener, &manifest)
+        .await
         .expect("snapshot verification failed");
 
     // Locate cloned disk

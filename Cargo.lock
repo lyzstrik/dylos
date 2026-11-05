@@ -364,6 +364,7 @@ dependencies = [
  "futures-util",
  "nix 0.31.3",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",

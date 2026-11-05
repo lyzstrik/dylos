@@ -20,7 +20,7 @@ use nix::{
     dir::Dir,
     errno::Errno,
     fcntl::{OFlag, openat, renameat},
-    sys::stat::{Mode, mkdirat},
+    sys::stat::{Mode, SFlag, mkdirat},
     unistd::{UnlinkatFlags, unlinkat},
 };
 use serde::{Deserialize, Serialize};
@@ -663,12 +663,7 @@ impl Store {
                 .map_err(|e| contextual(&path.join(&vm.memory_file.path), e))?;
             backings.insert(node.clone(), pinned);
         }
-        manifest.verify(
-            |file: &Path| match backings.values().find(|b| b.path == file) {
-                Some(backing) => backing.reader(),
-                None => opener.open(file),
-            },
-        )?;
+        verify_restore_files(&opener, &manifest, &backings, path)?;
         let lab = self.create_from(
             id,
             &manifest.lab_spec,
@@ -680,7 +675,26 @@ impl Store {
         )?;
         Ok((lab, manifest))
     }
+}
 
+fn verify_restore_files(
+    opener: &SnapshotOpener,
+    manifest: &SnapshotManifest,
+    backings: &BTreeMap<String, SharedBacking>,
+    _path: &Path,
+) -> Result<(), Error> {
+    verify_manifest_files_parallel(opener, manifest, |node, file| {
+        if let Some(backing) = backings.get(node)
+            && file.path == backing.path
+        {
+            return backing.reader();
+        }
+        opener.open(&file.path)
+    })
+    .map_err(Error::Spec)
+}
+
+impl Store {
     #[allow(clippy::too_many_lines)]
     fn create_from(
         &self,
@@ -1359,6 +1373,141 @@ impl SnapshotOpener {
         regular_snapshot_file(parent)
     }
 
+    /// Clones the snapshot opener by duplicating its base directory file descriptor.
+    ///
+    /// # Errors
+    /// Returns an IO error if duplicating the file descriptor fails.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            base: self.base.try_clone()?,
+        })
+    }
+
+    /// Verifies that the snapshot directory contains only the declared manifest files
+    /// and defined metadata (such as `manifest.json`), rejecting any undeclared regular file,
+    /// directory, or symlink.
+    ///
+    /// # Errors
+    /// Returns [`dylos_core::Error::UnexpectedEntry`] if an undeclared file, directory, or symlink is found,
+    /// [`dylos_core::Error::InvalidPath`] if manifest paths are invalid, or
+    /// [`dylos_core::Error::Io`] if directory traversal fails.
+    pub fn verify_inventory(&self, manifest: &SnapshotManifest) -> Result<(), dylos_core::Error> {
+        manifest.validate_paths()?;
+
+        let mut declared_files = std::collections::BTreeSet::new();
+        let mut allowed_dirs = std::collections::BTreeSet::new();
+
+        declared_files.insert(PathBuf::from("manifest.json"));
+        allowed_dirs.insert(PathBuf::new());
+        allowed_dirs.insert(PathBuf::from("vms"));
+
+        for (vm_name, vm_manifest) in &manifest.vms {
+            allowed_dirs.insert(PathBuf::from("vms").join(vm_name));
+            for file in vm_manifest.files() {
+                let clean = normalize_rel_path(&file.path);
+                declared_files.insert(clean.clone());
+                let mut curr = clean.as_path();
+                while let Some(parent) = curr.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        allowed_dirs.insert(parent.to_path_buf());
+                    }
+                    curr = parent;
+                }
+            }
+        }
+
+        let mut queue = Vec::new();
+        let root_dir_file = self.base.try_clone().map_err(|e| dylos_core::Error::Io {
+            vm: "snapshot".into(),
+            path: PathBuf::new(),
+            source: e,
+        })?;
+        queue.push((PathBuf::new(), root_dir_file));
+
+        while let Some((rel_dir_path, dir_file)) = queue.pop() {
+            let dir_dup =
+                open(&dir_file, ".".as_ref(), dirs()).map_err(|e| dylos_core::Error::Io {
+                    vm: "snapshot".into(),
+                    path: rel_dir_path.clone(),
+                    source: e,
+                })?;
+            let mut entries = Dir::from_fd(dir_dup.into()).map_err(|e| dylos_core::Error::Io {
+                vm: "snapshot".into(),
+                path: rel_dir_path.clone(),
+                source: e.into(),
+            })?;
+
+            for entry in entries.iter() {
+                let entry = entry.map_err(|e| dylos_core::Error::Io {
+                    vm: "snapshot".into(),
+                    path: rel_dir_path.clone(),
+                    source: e.into(),
+                })?;
+                let name_bytes = entry.file_name().to_bytes();
+                if name_bytes == b"." || name_bytes == b".." {
+                    continue;
+                }
+                let name_os = std::os::unix::ffi::OsStrExt::from_bytes(name_bytes);
+                let child_rel_path = if rel_dir_path.as_os_str().is_empty() {
+                    PathBuf::from(name_os)
+                } else {
+                    rel_dir_path.join(name_os)
+                };
+
+                let stat = nix::sys::stat::fstatat(
+                    &dir_file,
+                    name_os,
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .map_err(|e| dylos_core::Error::Io {
+                    vm: "snapshot".into(),
+                    path: child_rel_path.clone(),
+                    source: e.into(),
+                })?;
+
+                let file_type = SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT;
+                if file_type == SFlag::S_IFDIR {
+                    if !allowed_dirs.contains(&child_rel_path) {
+                        return Err(dylos_core::Error::UnexpectedEntry {
+                            path: child_rel_path,
+                        });
+                    }
+                    let child_file =
+                        open(&dir_file, name_os, dirs()).map_err(|e| dylos_core::Error::Io {
+                            vm: "snapshot".into(),
+                            path: child_rel_path.clone(),
+                            source: e,
+                        })?;
+                    queue.push((child_rel_path, child_file));
+                } else if file_type == SFlag::S_IFREG {
+                    if !declared_files.contains(&child_rel_path) {
+                        return Err(dylos_core::Error::UnexpectedEntry {
+                            path: child_rel_path,
+                        });
+                    }
+                } else {
+                    return Err(dylos_core::Error::UnexpectedEntry {
+                        path: child_rel_path,
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Verifies the integrity of all files declared in the snapshot manifest concurrently
+    /// with bounded parallelism.
+    ///
+    /// # Errors
+    /// Returns [`dylos_core::Error::InvalidPath`] if paths are unsafe,
+    /// [`dylos_core::Error::UnexpectedEntry`] if undeclared files/directories/symlinks are present,
+    /// [`dylos_core::Error::Io`] if opening or reading files fails, or
+    /// [`dylos_core::Error::IntegrityMismatch`] if size or sha256 checksums do not match.
+    pub fn verify(&self, manifest: &SnapshotManifest) -> Result<(), dylos_core::Error> {
+        verify_manifest_files_parallel(self, manifest, |_node, file| self.open(&file.path))
+    }
+
     /// Returns a closure suitable for `SnapshotManifest::verify`.
     pub fn verify_opener(&self) -> impl FnMut(&Path) -> io::Result<File> + '_ {
         move |path| self.open(path)
@@ -1370,6 +1519,107 @@ fn regular_snapshot_file(file: File) -> io::Result<File> {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     Ok(file)
+}
+
+fn normalize_rel_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        if let Component::Normal(name) = component {
+            normalized.push(name);
+        }
+    }
+    normalized
+}
+
+fn verify_manifest_files_parallel<F, R>(
+    opener: &SnapshotOpener,
+    manifest: &SnapshotManifest,
+    open: F,
+) -> Result<(), dylos_core::Error>
+where
+    F: Fn(&str, &FileMeta) -> io::Result<R> + Sync,
+    R: Read,
+{
+    opener.verify_inventory(manifest)?;
+
+    let mut files = Vec::new();
+    for (node, vm) in &manifest.vms {
+        for file in vm.files() {
+            files.push((node.as_str(), file));
+        }
+    }
+
+    if files.is_empty() {
+        return Ok(());
+    }
+
+    // Sort files by size descending so largest files start hashing first across threads.
+    files.sort_by_key(|(_, f)| std::cmp::Reverse(f.size));
+
+    let max_threads = std::thread::available_parallelism()
+        .map_or(8, std::num::NonZero::get)
+        .clamp(2, 16);
+    let num_workers = max_threads.min(files.len()).max(1);
+
+    let work_index = std::sync::atomic::AtomicUsize::new(0);
+    let has_error = std::sync::atomic::AtomicBool::new(false);
+    let first_error = std::sync::Mutex::new(None);
+
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
+            handles.push(s.spawn(|| {
+                loop {
+                    if has_error.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = work_index.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    let (node, file) = files[idx];
+                    let res = open(node, file)
+                        .map_err(|e| dylos_core::Error::Io {
+                            vm: (*node).to_string(),
+                            path: file.path.clone(),
+                            source: e,
+                        })
+                        .and_then(|reader| file.verify(node, reader));
+
+                    if let Err(err) = res {
+                        has_error.store(true, std::sync::atomic::Ordering::Relaxed);
+                        if let Ok(mut guard) = first_error.lock()
+                            && guard.is_none()
+                        {
+                            *guard = Some(err);
+                        }
+                        break;
+                    }
+                }
+            }));
+        }
+
+        for handle in handles {
+            if handle.join().is_err()
+                && let Ok(mut guard) = first_error.lock()
+                && guard.is_none()
+            {
+                *guard = Some(dylos_core::Error::Io {
+                    vm: "snapshot".into(),
+                    path: PathBuf::new(),
+                    source: io::Error::other("verification worker thread panicked"),
+                });
+            }
+        }
+    });
+
+    if let Ok(mut guard) = first_error.into_inner()
+        && let Some(err) = guard.take()
+    {
+        return Err(err);
+    }
+
+    Ok(())
 }
 
 // No public path can make the destination cleanup fail after the destination was created.
