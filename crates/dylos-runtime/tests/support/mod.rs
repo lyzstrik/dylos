@@ -43,6 +43,7 @@ pub enum Mode {
     LeakOutputThenExit,
     EarlyReadiness,
     SpamOutput,
+    OversizedOutput,
     FalseReadiness,
     LabReady,
     LabPartialLaunch,
@@ -433,6 +434,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         spawn_echo_responder(mode);
     }
     let mut stalled = Vec::new();
+    let mut oversized_sent = false;
     loop {
         let (mut stream, _) = listener.accept().await.unwrap();
         if mode == "StallReadyThenExit" {
@@ -640,11 +642,27 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
             return 0;
         }
         if request.contains("SendCtrlAltDel")
-            && (matches!(mode, "Serve" | "ParallelPause" | "Echo") || mode.starts_with("Lab"))
+            && (matches!(mode, "Serve" | "ParallelPause" | "Echo" | "OversizedOutput")
+                || mode.starts_with("Lab"))
         {
             return 0;
         }
         if request.contains("FlushMetrics") {
+            if mode == "OversizedOutput" {
+                use std::io::Write;
+                for mut stream in [
+                    Box::new(std::io::stdout()) as Box<dyn std::io::Write>,
+                    Box::new(std::io::stderr()),
+                ] {
+                    if oversized_sent {
+                        stream.write_all(b"\nconsole-recovered\n").unwrap();
+                    } else {
+                        stream.write_all(&vec![b'x'; 256 * 1024]).unwrap();
+                    }
+                    stream.flush().unwrap();
+                }
+                oversized_sent = true;
+            }
             let mut line =
                 r#"{"utc_timestamp_ms":1,"api_server":{"process_startup_time_us":42}}"#.to_owned();
             line.push('\n');
