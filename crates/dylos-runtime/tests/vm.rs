@@ -599,3 +599,96 @@ async fn exec_deadline_covers_mutex_acquisition() {
 
     vm.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn oversized_and_newline_free_output_is_bounded_and_recovers() {
+    use std::io::Write;
+
+    let (logs, _guard) = Captured::install();
+    let sandbox = Sandbox::new(Mode::OversizedOutput);
+    let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let flush = InstanceActionInfo::new(ActionType::FlushMetrics);
+    let _: Option<serde_json::Value> = vm.client().put("/actions", &flush).await.unwrap();
+    wait_until(
+        "both newline-free streams are truncated",
+        Duration::from_secs(5),
+        || {
+            logs.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("dylos::firecracker ") && line.contains("[truncated]"))
+                .count()
+                == 128
+        },
+    )
+    .await;
+
+    let _: Option<serde_json::Value> = vm.client().put("/actions", &flush).await.unwrap();
+    wait_until(
+        "console resumes after the oversized line",
+        Duration::from_secs(5),
+        || logs.contains("console-recovered"),
+    )
+    .await;
+
+    wait_until(
+        "both metrics flushes are consumed",
+        Duration::from_secs(5),
+        || {
+            logs.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|line| line.contains("process_startup_time_us"))
+                .count()
+                == 2
+        },
+    )
+    .await;
+
+    let mut metrics = std::fs::OpenOptions::new()
+        .append(true)
+        .open(vm.paths().host_path(dylos_runtime::jailer::METRICS_FILE))
+        .unwrap();
+    metrics.write_all(&vec![b'm'; 256 * 1024]).unwrap();
+    metrics.flush().unwrap();
+    wait_until(
+        "newline-free metrics are truncated",
+        Duration::from_secs(5),
+        || {
+            logs.0.lock().unwrap().iter().any(|line| {
+                line.contains("dylos::firecracker::metrics") && line.contains("[truncated]")
+            })
+        },
+    )
+    .await;
+    metrics.write_all(b"\nmetrics-recovered\n").unwrap();
+    metrics.flush().unwrap();
+    wait_until(
+        "metrics resume after the oversized line",
+        Duration::from_secs(5),
+        || logs.contains("metrics-recovered"),
+    )
+    .await;
+    {
+        let lines = logs.0.lock().unwrap();
+        for line in lines.iter().filter(|line| line.contains("[truncated]")) {
+            let limit = if line.contains("dylos::firecracker::metrics") {
+                66_000
+            } else {
+                4300
+            };
+            assert!(line.len() < limit, "oversized event: {} bytes", line.len());
+        }
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("[truncated]"))
+                .count(),
+            132
+        );
+    }
+    vm.shutdown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}

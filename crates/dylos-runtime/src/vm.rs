@@ -8,7 +8,7 @@ use dylos_fc::FcClient;
 use dylos_fc::config::{ActionType, InstanceActionInfo};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -828,87 +828,91 @@ async fn supervise(
     res
 }
 
-const MAX_CONSOLE_LINE_BYTES: usize = 4096;
+const MAX_OUTPUT_LINE_BYTES: usize = 4096;
+const MAX_METRICS_READ_BYTES: usize = 64 * 1024;
+const TRUNCATED: &str = " [truncated]";
 
-async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max_len: usize,
-) -> std::io::Result<Option<String>> {
-    let mut line = Vec::new();
-    loop {
-        let available = reader.fill_buf().await?;
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+#[derive(Default)]
+struct BoundedLine {
+    pending: Vec<u8>,
+}
+
+impl BoundedLine {
+    fn push(&mut self, byte: u8, max_len: usize) -> Option<String> {
+        if byte == b'\n' {
+            return Some(self.finish());
         }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            if line.len() + pos >= max_len {
-                let take = max_len - line.len();
-                line.extend_from_slice(&available[..take]);
-                reader.consume(take);
-                return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
-            }
-            line.extend_from_slice(&available[..pos]);
-            reader.consume(pos + 1);
-            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
+        self.pending.push(byte);
+        if self.pending.len() == max_len {
+            // Preserve bounded chunks for exec's aggregate output budget, even without newlines.
+            let mut line = self.finish();
+            line.push_str(TRUNCATED);
+            return Some(line);
         }
-        if line.len() + available.len() >= max_len {
-            let take = max_len - line.len();
-            line.extend_from_slice(&available[..take]);
-            reader.consume(take);
-            return Ok(Some(String::from_utf8_lossy(&line).into_owned()));
-        }
-        line.extend_from_slice(available);
-        let len = available.len();
-        reader.consume(len);
+        None
+    }
+
+    fn finish(&mut self) -> String {
+        let line = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        line
     }
 }
 
 async fn forward_lines(
-    stream: impl AsyncRead + Unpin,
+    mut stream: impl AsyncRead + Unpin,
     source: &'static str,
     output: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
     readiness: watch::Sender<Readiness>,
     _done_tx: mpsc::Sender<()>,
     lines_tx: tokio::sync::broadcast::Sender<String>,
 ) {
-    let mut reader = BufReader::new(stream);
+    let mut buffer = [0; 8192];
+    let mut line = BoundedLine::default();
     loop {
-        match read_bounded_line(&mut reader, MAX_CONSOLE_LINE_BYTES).await {
-            Ok(Some(line)) => {
-                let trimmed = line.trim_end_matches('\r').to_string();
-                let marker = match trimmed.as_str() {
-                    "dylos: ready" => Some(Readiness::Ready(Instant::now())),
-                    "dylos: network setup failed" => Some(Readiness::Failed(Instant::now())),
-                    _ => None,
-                };
-                if let Some(marker) = marker {
-                    readiness.send_if_modified(|state| {
-                        if matches!(state, Readiness::Pending) {
-                            *state = marker;
-                            true
-                        } else {
-                            false
-                        }
-                    });
-                }
-                let _ = lines_tx.send(trimmed.clone());
-                tracing::info!(target: "dylos::firecracker", source, "{trimmed}");
-                let mut q = output
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if q.len() >= 20 {
-                    q.pop_front();
-                }
-                q.push_back(trimmed);
-            }
-            Ok(None) => break,
+        let count = match stream.read(&mut buffer).await {
+            Ok(count) => count,
             Err(e) => {
                 tracing::warn!(source, error = %e, "failed to read Firecracker output");
                 break;
             }
+        };
+        let lines = buffer[..count]
+            .iter()
+            .filter_map(|&byte| line.push(byte, MAX_OUTPUT_LINE_BYTES));
+        let mut lines: Vec<_> = lines.collect();
+        if count == 0 && !line.pending.is_empty() {
+            lines.push(line.finish());
+        }
+        for line in lines {
+            let trimmed = line.trim_end_matches('\r').to_string();
+            let marker = match trimmed.as_str() {
+                "dylos: ready" => Some(Readiness::Ready(Instant::now())),
+                "dylos: network setup failed" => Some(Readiness::Failed(Instant::now())),
+                _ => None,
+            };
+            if let Some(marker) = marker {
+                readiness.send_if_modified(|state| {
+                    if matches!(state, Readiness::Pending) {
+                        *state = marker;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            let _ = lines_tx.send(trimmed.clone());
+            tracing::info!(target: "dylos::firecracker", source, "{trimmed}");
+            let mut q = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if q.len() >= 20 {
+                q.pop_front();
+            }
+            q.push_back(trimmed);
+        }
+        if count == 0 {
+            break;
         }
     }
 }
@@ -923,21 +927,25 @@ async fn tail_metrics(path: PathBuf, mut state: watch::Receiver<ProcessState>, e
             return;
         }
     };
-    let mut pending = String::new();
+    let mut line = BoundedLine::default();
+    let mut buffer = vec![0; MAX_METRICS_READ_BYTES];
     let mut interval = tokio::time::interval(every);
     loop {
         let exited = tokio::select! {
             _ = interval.tick() => false,
             _ = state.wait_for(|s| *s != ProcessState::Running) => true,
         };
-        if let Err(e) = file.read_to_string(&mut pending).await {
-            tracing::warn!(error = %e, "failed to read metrics");
-        }
-        while let Some(end) = pending.find('\n') {
-            let line: String = pending.drain(..=end).collect();
-            if !line.trim().is_empty() {
-                tracing::info!(target: "dylos::firecracker::metrics", "{}", line.trim_end());
+        match file.read(&mut buffer).await {
+            Ok(count) => {
+                for byte in &buffer[..count] {
+                    if let Some(line) = line.push(*byte, MAX_METRICS_READ_BYTES)
+                        && !line.trim().is_empty()
+                    {
+                        tracing::info!(target: "dylos::firecracker::metrics", "{}", line.trim_end());
+                    }
+                }
             }
+            Err(e) => tracing::warn!(error = %e, "failed to read metrics"),
         }
         if exited {
             return;
