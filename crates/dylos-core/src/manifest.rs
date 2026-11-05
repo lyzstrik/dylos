@@ -38,10 +38,32 @@ pub struct VmManifest {
 }
 
 impl VmManifest {
-    fn files(&self) -> impl Iterator<Item = &FileMeta> {
+    pub fn files(&self) -> impl Iterator<Item = &FileMeta> {
         std::iter::once(&self.state_file)
             .chain(std::iter::once(&self.memory_file))
             .chain(&self.disks)
+    }
+
+    /// Verifies all files declared for this VM against their expected size and SHA-256 hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if opening or reading a file fails, or
+    /// [`Error::IntegrityMismatch`] if a file's size or SHA-256 checksum does not match.
+    pub fn verify<R: Read>(
+        &self,
+        vm_name: &str,
+        mut open: impl FnMut(&Path) -> std::io::Result<R>,
+    ) -> Result<(), Error> {
+        for file in self.files() {
+            let reader = open(&file.path).map_err(|e| Error::Io {
+                vm: vm_name.to_string(),
+                path: file.path.clone(),
+                source: e,
+            })?;
+            file.verify(vm_name, reader)?;
+        }
+        Ok(())
     }
 }
 
@@ -51,6 +73,53 @@ pub struct FileMeta {
     pub path: PathBuf,
     pub sha256: String,
     pub size: u64,
+}
+
+impl FileMeta {
+    /// Verifies that `reader` matches this file's expected size and SHA-256 hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if reading fails, or [`Error::IntegrityMismatch`]
+    /// if the file's size or SHA-256 checksum does not match.
+    pub fn verify<R: Read>(&self, vm_name: &str, mut reader: R) -> Result<(), Error> {
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 65536];
+        let mut actual_size = 0u64;
+
+        loop {
+            let n = match reader.read(&mut buffer) {
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    return Err(Error::Io {
+                        vm: vm_name.to_string(),
+                        path: self.path.clone(),
+                        source: e,
+                    });
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            actual_size += n as u64;
+            hasher.update(&buffer[..n]);
+        }
+
+        let actual_sha256 = sha256_hex(&hasher.finalize().into());
+
+        if actual_size != self.size || actual_sha256 != self.sha256 {
+            return Err(Error::IntegrityMismatch {
+                vm: vm_name.to_string(),
+                path: self.path.clone(),
+                expected_size: self.size,
+                actual_size,
+                expected_sha256: self.sha256.clone(),
+                actual_sha256,
+            });
+        }
+        Ok(())
+    }
 }
 
 const FORMAT_VERSION: u32 = 1;
@@ -234,51 +303,8 @@ impl SnapshotManifest {
     ) -> Result<(), Error> {
         self.validate_paths()?;
 
-        // The reader is supplied by the caller to keep dylos-core free of file system access.
         for (vm_name, vm_manifest) in &self.vms {
-            for file in vm_manifest.files() {
-                let mut reader = open(&file.path).map_err(|e| Error::Io {
-                    vm: vm_name.clone(),
-                    path: file.path.clone(),
-                    source: e,
-                })?;
-
-                let mut hasher = Sha256::new();
-                let mut buffer = [0u8; 8192];
-                let mut actual_size = 0u64;
-
-                loop {
-                    let n = match reader.read(&mut buffer) {
-                        Ok(n) => n,
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(e) => {
-                            return Err(Error::Io {
-                                vm: vm_name.clone(),
-                                path: file.path.clone(),
-                                source: e,
-                            });
-                        }
-                    };
-                    if n == 0 {
-                        break;
-                    }
-                    actual_size += n as u64;
-                    hasher.update(&buffer[..n]);
-                }
-
-                let actual_sha256 = sha256_hex(&hasher.finalize().into());
-
-                if actual_size != file.size || actual_sha256 != file.sha256 {
-                    return Err(Error::IntegrityMismatch {
-                        vm: vm_name.clone(),
-                        path: file.path.clone(),
-                        expected_size: file.size,
-                        actual_size,
-                        expected_sha256: file.sha256.clone(),
-                        actual_sha256,
-                    });
-                }
-            }
+            vm_manifest.verify(vm_name, &mut open)?;
         }
         Ok(())
     }

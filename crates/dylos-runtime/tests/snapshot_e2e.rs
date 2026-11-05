@@ -114,8 +114,8 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let snap_dir = config.store.snapshot_dir(lab_id, "snap-five");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
     let verify_start = Instant::now();
-    manifest
-        .verify(opener.verify_opener())
+    dylos_runtime::verify_snapshot(&opener, &manifest)
+        .await
         .expect("snapshot manifest verification failed");
     let verify_ms = verify_start.elapsed().as_millis();
 
@@ -235,8 +235,8 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
     let manifest = lab.snapshot("snap-writer").await.expect("snapshot failed");
     let snap_dir = config.store.snapshot_dir(lab_id, "snap-writer");
     let opener = SnapshotOpener::new(&snap_dir).unwrap();
-    manifest
-        .verify(opener.verify_opener())
+    dylos_runtime::verify_snapshot(&opener, &manifest)
+        .await
         .expect("snapshot verification failed");
 
     // Locate cloned disk

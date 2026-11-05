@@ -141,6 +141,8 @@ fn manifest_verifies_through_public_descriptor_opener() {
     };
     let opener = SnapshotOpener::new(tmp.path()).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
+    opener.verify(&manifest).unwrap();
     fs::write(tmp.path().join("file"), "wrong bytes").unwrap();
     assert!(manifest.verify(opener.verify_opener()).is_err());
+    assert!(opener.verify(&manifest).is_err());
 }

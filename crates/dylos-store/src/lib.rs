@@ -625,12 +625,7 @@ impl Store {
                 .map_err(|e| contextual(&path.join(&vm.memory_file.path), e))?;
             backings.insert(node.clone(), pinned);
         }
-        manifest.verify(
-            |file: &Path| match backings.values().find(|b| b.path == file) {
-                Some(backing) => backing.reader(),
-                None => opener.open(file),
-            },
-        )?;
+        verify_restore_files(&opener, &manifest, &backings, path)?;
         let lab = self.create_from(
             id,
             &manifest.lab_spec,
@@ -642,7 +637,72 @@ impl Store {
         )?;
         Ok((lab, manifest))
     }
+}
 
+fn verify_restore_files(
+    opener: &SnapshotOpener,
+    manifest: &SnapshotManifest,
+    backings: &BTreeMap<String, SharedBacking>,
+    path: &Path,
+) -> Result<(), Error> {
+    manifest.validate_paths()?;
+
+    let max_threads = std::thread::available_parallelism()
+        .map_or(8, std::num::NonZero::get)
+        .clamp(2, 8);
+
+    std::thread::scope(|s| {
+        let vm_list: Vec<_> = manifest.vms.iter().collect();
+        let num_workers = max_threads.min(vm_list.len()).max(1);
+        let mut chunks = vec![Vec::new(); num_workers];
+        for (i, item) in vm_list.into_iter().enumerate() {
+            chunks[i % num_workers].push(item);
+        }
+
+        let mut handles = Vec::with_capacity(num_workers);
+        for chunk in chunks {
+            handles.push(s.spawn(move || -> Result<(), Error> {
+                for (node, vm) in chunk {
+                    let backing = &backings[node];
+                    vm.verify(node, |file: &Path| {
+                        if file == backing.path {
+                            backing.reader()
+                        } else {
+                            opener.open(file)
+                        }
+                    })?;
+                }
+                Ok(())
+            }));
+        }
+
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+                Err(_) => {
+                    if first_error.is_none() {
+                        first_error = Some(contextual(
+                            path,
+                            io::Error::other("verification worker thread panicked"),
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+        Ok(())
+    })
+}
+
+impl Store {
     #[allow(clippy::too_many_lines)]
     fn create_from(
         &self,
@@ -1305,6 +1365,75 @@ impl SnapshotOpener {
             parent = open(&parent, name, flags)?;
         }
         regular_snapshot_file(parent)
+    }
+
+    /// Clones the snapshot opener by duplicating its base directory file descriptor.
+    ///
+    /// # Errors
+    /// Returns an IO error if duplicating the file descriptor fails.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(Self {
+            base: self.base.try_clone()?,
+        })
+    }
+
+    /// Verifies the integrity of all files declared in the snapshot manifest concurrently
+    /// with bounded parallelism.
+    ///
+    /// # Errors
+    /// Returns [`dylos_core::Error::InvalidPath`] if paths are unsafe,
+    /// [`dylos_core::Error::Io`] if opening or reading files fails, or
+    /// [`dylos_core::Error::IntegrityMismatch`] if size or sha256 checksums do not match.
+    pub fn verify(&self, manifest: &SnapshotManifest) -> Result<(), dylos_core::Error> {
+        manifest.validate_paths()?;
+
+        let max_threads = std::thread::available_parallelism()
+            .map_or(8, std::num::NonZero::get)
+            .clamp(2, 8);
+
+        std::thread::scope(|s| {
+            let vm_list: Vec<_> = manifest.vms.iter().collect();
+            let num_workers = max_threads.min(vm_list.len()).max(1);
+            let mut chunks = vec![Vec::new(); num_workers];
+            for (i, item) in vm_list.into_iter().enumerate() {
+                chunks[i % num_workers].push(item);
+            }
+
+            let mut handles = Vec::with_capacity(num_workers);
+            for chunk in chunks {
+                handles.push(s.spawn(move || -> Result<(), dylos_core::Error> {
+                    for (node, vm) in chunk {
+                        vm.verify(node, |file: &Path| self.open(file))?;
+                    }
+                    Ok(())
+                }));
+            }
+
+            let mut first_error = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                    Err(_) => {
+                        if first_error.is_none() {
+                            first_error = Some(dylos_core::Error::Io {
+                                vm: "snapshot".into(),
+                                path: PathBuf::new(),
+                                source: io::Error::other("verification worker thread panicked"),
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(err) = first_error {
+                return Err(err);
+            }
+            Ok(())
+        })
     }
 
     /// Returns a closure suitable for `SnapshotManifest::verify`.

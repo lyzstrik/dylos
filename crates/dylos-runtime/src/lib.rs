@@ -26,5 +26,5 @@ pub use error::{Error, Result};
 pub use fleet::{Fleet, FleetError, LabFailure};
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
-pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms};
+pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms, verify_snapshot};
 pub use vm::{ExecOutput, ProcessState, Timeouts, Vm, VmSpec};
