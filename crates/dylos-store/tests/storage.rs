@@ -173,3 +173,56 @@ fn unsupported_reflink_never_falls_back_to_copy() {
     assert!(!store.base.join("lab").exists());
     assert_eq!(fs::read(&store.image).unwrap(), b"immutable image");
 }
+
+#[test]
+fn preflight_probes_real_clones_without_leaving_files_or_directories() {
+    let (temp, store, spec) = setup().unwrap();
+    if !supported(&store, &spec).unwrap() {
+        return;
+    }
+    fs::remove_dir(&store.base).unwrap();
+    let before: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    store.preflight(&temp.path().join("jails")).unwrap();
+    let after: Vec<_> = fs::read_dir(temp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(before, after);
+    assert!(!store.base.exists());
+}
+
+#[test]
+fn preflight_rejects_jail_on_an_incompatible_mount_and_cleans_up() {
+    let (temp, store, spec) = setup().unwrap();
+    if !supported(&store, &spec).unwrap() {
+        return;
+    }
+    fs::remove_dir(&store.base).unwrap();
+    // tmpfs cannot FICLONE; only this test-owned directory is touched.
+    let jail = tempfile::tempdir_in("/dev/shm").unwrap();
+    let error = store.preflight(jail.path()).unwrap_err();
+    assert!(matches!(error, Error::ReflinkPreflight { .. }));
+    let message = error.to_string();
+    assert!(message.contains(jail.path().to_str().unwrap()), "{message}");
+    assert!(message.contains(store.base.to_str().unwrap()), "{message}");
+    assert_eq!(fs::read_dir(jail.path()).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn preflight_rejects_image_on_an_incompatible_mount_before_creation() {
+    let (temp, mut store, _spec) = setup().unwrap();
+    let image = tempfile::tempdir_in("/dev/shm").unwrap();
+    store.image = image.path().join("rootfs.ext4");
+    fs::write(&store.image, b"rootfs").unwrap();
+    let error = store.preflight(&temp.path().join("jails")).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains(store.image.to_str().unwrap()), "{message}");
+    assert!(message.contains(store.base.to_str().unwrap()), "{message}");
+    assert!(!store.base.exists());
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(image.path()).unwrap().count(), 1);
+}

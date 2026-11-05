@@ -72,7 +72,7 @@ fn pin_control_socket(base: &Path, id: &str) -> std::io::Result<File> {
     name = "dylos",
     version,
     about = "Engine for reproducible microVM lab networks",
-    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)"
+    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -164,6 +164,12 @@ fn build_config() -> LabConfig {
     if let Some(lab_dir) = std::env::var_os("DYLOS_LAB_DIR").filter(|d| !d.is_empty()) {
         config.store.base = PathBuf::from(lab_dir);
     }
+    config.jailer.chroot_base_dir = std::env::var_os("DYLOS_JAIL_DIR")
+        .filter(|d| !d.is_empty())
+        .map_or_else(
+            || LabConfig::default_jail_dir(&config.store.base),
+            PathBuf::from,
+        );
     config
 }
 

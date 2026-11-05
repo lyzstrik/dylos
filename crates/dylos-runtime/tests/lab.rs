@@ -824,3 +824,42 @@ async fn fork_reports_a_successful_clone_that_could_not_be_torn_down() {
     fs::remove_dir_all(config.store.base.join(&ids[0])).unwrap();
     recover(&sandbox, &config, &[&ids[1]]).await;
 }
+
+#[test]
+fn default_jails_follow_store_parent_and_keep_socket_paths_short() {
+    use std::path::Path;
+    assert_eq!(
+        LabConfig::default().jailer.chroot_base_dir,
+        Path::new("target/jails")
+    );
+    assert_eq!(
+        LabConfig::default_jail_dir(Path::new("/data/labs")),
+        Path::new("/data/jails")
+    );
+    assert_eq!(
+        LabConfig::default_jail_dir(Path::new("labs")),
+        Path::new("jails")
+    );
+    let config = LabConfig::default();
+    let paths = dylos_runtime::jailer::JailPaths::new(&config.jailer, "lab32-abc", "A").unwrap();
+    assert!(paths.api_socket().as_os_str().len() < 108);
+}
+
+#[tokio::test]
+async fn preflight_rejects_bad_image_before_creating_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::Serve);
+    config.store.image = sandbox.dir.path().join("missing-image");
+    let error = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+    let message = error.to_string();
+    assert!(message.contains("reflink preflight"), "{message}");
+    assert!(
+        message.contains(config.store.image.to_str().unwrap()),
+        "{message}"
+    );
+    assert!(
+        message.contains(config.store.base.to_str().unwrap()),
+        "{message}"
+    );
+    assert!(!config.store.base.exists());
+    assert_removed(&sandbox, &config);
+}
