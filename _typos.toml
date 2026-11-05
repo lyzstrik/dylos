@@ -1,5 +1,6 @@
 [files]
 ignore-hidden = false
+extend-exclude = [".git"]
 
 [default.extend-words]
 # Hostile drive ID test case using unicode escape "caf\u{e9}" in crates/dylos-fc/tests/routes_acceptance.rs
