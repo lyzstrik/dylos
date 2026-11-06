@@ -39,6 +39,7 @@ machete:
 # Check dependency policy
 deny:
     cargo deny --locked check
+    cd fuzz && cargo deny --locked check
 
 # Build and verify static musl guest agent
 agent-check:
