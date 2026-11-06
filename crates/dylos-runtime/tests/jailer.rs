@@ -1,9 +1,14 @@
+mod support;
+
 use std::ffi::OsString;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use dylos_runtime::Error;
 use dylos_runtime::jailer::{
-    ChrootFile, JailPaths, JailerConfig, jailer_args, prepare_chroot, remove_jail,
+    ChrootFile, JailPaths, JailerConfig, MAX_UNIX_SOCKET_PATH, jailer_args, prepare_chroot,
+    remove_jail, validate_unix_socket_path,
 };
 
 fn config() -> JailerConfig {
@@ -553,4 +558,169 @@ fn jail_paths_rejects_api_socket_exceeding_sun_len() {
     assert!(msg.contains(&len.to_string()), "{msg}");
     assert!(msg.contains(&limit.to_string()), "{msg}");
     assert!(msg.contains(path.to_str().unwrap()), "{msg}");
+}
+
+#[test]
+fn jail_paths_boundary_exact_107_accepted_and_108_rejected() {
+    // Suffix after chroot_base_dir:
+    // /firecracker/l-n/root/run/firecracker.socket
+    // Length: 1 + 11 + 1 + 3 + 1 + 4 + 1 + 3 + 1 + 18 = 44 bytes.
+    // Exact 107-byte acceptance: base length = 107 - 44 = 63 bytes.
+    let base_107 = PathBuf::from(format!("/{}", "a".repeat(62)));
+    assert_eq!(base_107.as_os_str().as_bytes().len(), 63);
+    let config_107 = JailerConfig::new(base_107, 65534, 65534);
+    let paths_107 = JailPaths::new(&config_107, "l", "n").unwrap();
+    let socket_107 = paths_107.api_socket();
+    assert_eq!(socket_107.as_os_str().as_bytes().len(), 107);
+    assert_eq!(socket_107.as_os_str().len(), 107);
+    assert!(validate_unix_socket_path(&socket_107).is_ok());
+
+    // Exact 108-byte rejection: base length = 108 - 44 = 64 bytes.
+    let base_108 = PathBuf::from(format!("/{}", "a".repeat(63)));
+    assert_eq!(base_108.as_os_str().as_bytes().len(), 64);
+    let config_108 = JailerConfig::new(base_108, 65534, 65534);
+    let Error::SocketPathTooLong { path, len, limit } =
+        JailPaths::new(&config_108, "l", "n").unwrap_err()
+    else {
+        unreachable!("expected SocketPathTooLong");
+    };
+    assert_eq!(len, 108);
+    assert_eq!(limit, MAX_UNIX_SOCKET_PATH);
+    assert_eq!(len, path.as_os_str().as_bytes().len());
+    assert_eq!(limit, 107);
+    assert_eq!(
+        path,
+        config_108
+            .chroot_base_dir
+            .join("firecracker/l-n/root/run/firecracker.socket")
+    );
+}
+
+#[test]
+fn jail_paths_multibyte_utf8_counts_bytes_not_characters() {
+    // Each '🦀' is 4 bytes in UTF-8, but only 1 char.
+    // 3 crabs = 12 bytes, 3 chars (byte count - char count = +9).
+    // Total byte length desired: 108 bytes.
+    // Suffix: 44 bytes. Base: 64 bytes.
+    // Base layout: '/' (1 byte) + 51 'a's (51 bytes) + 3 crabs (12 bytes) = 64 bytes.
+    // Character count of base: 1 + 51 + 3 = 55 chars.
+    // Total character count of socket: 55 + 44 = 99 chars <= 107 chars!
+    let base_multibyte_108 = PathBuf::from(format!("/{}🦀🦀🦀", "a".repeat(51)));
+    assert_eq!(base_multibyte_108.as_os_str().as_bytes().len(), 64);
+    assert_eq!(base_multibyte_108.to_str().unwrap().chars().count(), 55);
+
+    let config_108 = JailerConfig::new(base_multibyte_108, 65534, 65534);
+    let Error::SocketPathTooLong { len, limit, path } =
+        JailPaths::new(&config_108, "l", "n").unwrap_err()
+    else {
+        unreachable!("expected SocketPathTooLong");
+    };
+    assert_eq!(len, 108);
+    assert_eq!(limit, 107);
+    // Verify that character count would have erroneously passed an off-by-one or char-count check
+    assert_eq!(path.to_str().unwrap().chars().count(), 99);
+    assert_eq!(path.as_os_str().as_bytes().len(), 108);
+
+    // Exact 107-byte acceptance with multibyte UTF-8:
+    // Base: '/' (1 byte) + 50 'a's (50 bytes) + 3 crabs (12 bytes) = 63 bytes.
+    // Total byte length: 63 + 44 = 107 bytes.
+    let base_multibyte_107 = PathBuf::from(format!("/{}🦀🦀🦀", "a".repeat(50)));
+    assert_eq!(base_multibyte_107.as_os_str().as_bytes().len(), 63);
+    let config_107 = JailerConfig::new(base_multibyte_107, 65534, 65534);
+    let paths_107 = JailPaths::new(&config_107, "l", "n").unwrap();
+    let socket = paths_107.api_socket();
+    assert_eq!(socket.as_os_str().as_bytes().len(), 107);
+    assert_eq!(socket.to_str().unwrap().chars().count(), 98);
+    assert!(validate_unix_socket_path(&socket).is_ok());
+}
+
+#[test]
+fn jail_paths_non_utf8_counts_raw_bytes_without_panicking() {
+    // Non-UTF-8 bytes containing invalid sequences:
+    let mut bytes_108 = b"/non_utf8_".to_vec();
+    bytes_108.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    while bytes_108.len() < 64 {
+        bytes_108.push(b'x');
+    }
+    assert_eq!(bytes_108.len(), 64);
+    let base_non_utf8_108 = PathBuf::from(OsString::from_vec(bytes_108));
+    let config_108 = JailerConfig::new(base_non_utf8_108, 65534, 65534);
+    let Error::SocketPathTooLong { len, limit, path } =
+        JailPaths::new(&config_108, "l", "n").unwrap_err()
+    else {
+        unreachable!("expected SocketPathTooLong");
+    };
+    assert_eq!(len, 108);
+    assert_eq!(limit, 107);
+    assert_eq!(path.as_os_str().as_bytes().len(), 108);
+
+    // Non-UTF-8 107-byte acceptance:
+    let mut bytes_107 = b"/non_utf8_".to_vec();
+    bytes_107.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+    while bytes_107.len() < 63 {
+        bytes_107.push(b'x');
+    }
+    assert_eq!(bytes_107.len(), 63);
+    let base_non_utf8_107 = PathBuf::from(OsString::from_vec(bytes_107));
+    let config_107 = JailerConfig::new(base_non_utf8_107, 65534, 65534);
+    let paths_107 = JailPaths::new(&config_107, "l", "n").unwrap();
+    let socket = paths_107.api_socket();
+    assert_eq!(socket.as_os_str().as_bytes().len(), 107);
+    assert!(validate_unix_socket_path(&socket).is_ok());
+}
+
+#[test]
+fn deep_working_directory_cross_filesystem_fallback_keeps_socket_paths_within_sun_len() {
+    let parent = tempfile::tempdir().unwrap();
+    let deep_ws = parent
+        .path()
+        .join("d".repeat(35))
+        .join("e".repeat(35))
+        .join("p".repeat(35))
+        .join("workspace");
+    std::fs::create_dir_all(&deep_ws).unwrap();
+    let ws_canonical = deep_ws.canonicalize().unwrap();
+    assert!(
+        ws_canonical.as_os_str().len() > 107,
+        "deep workspace path {:?} must exceed 107 bytes (got {})",
+        ws_canonical,
+        ws_canonical.as_os_str().len()
+    );
+
+    // Force the cross-filesystem fallback by passing a tmp directory on a different filesystem (/proc)
+    let fallback_tempdir = support::test_tempdir_with_tmp(&deep_ws, Path::new("/proc"));
+
+    let deep_dev = std::fs::metadata(&deep_ws).unwrap().dev();
+    let temp_dev = std::fs::metadata(fallback_tempdir.path()).unwrap().dev();
+    assert_eq!(
+        deep_dev, temp_dev,
+        "fallback tempdir must reside on the same filesystem mount as the deep checkout"
+    );
+
+    assert!(
+        !fallback_tempdir.path().starts_with(&deep_ws),
+        "fallback tempdir {:?} must not embed the deep checkout path {:?}",
+        fallback_tempdir.path(),
+        deep_ws
+    );
+
+    let config = JailerConfig::new(fallback_tempdir.path().join("j"), 65534, 65534);
+    let paths = JailPaths::new(&config, "lab-id", "node-a").unwrap();
+    let socket = paths.api_socket();
+    assert!(
+        socket.as_os_str().len() <= MAX_UNIX_SOCKET_PATH,
+        "socket path length {} exceeds limit {}",
+        socket.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH
+    );
+    assert!(validate_unix_socket_path(&socket).is_ok());
+
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket);
+    assert!(
+        listener.is_ok(),
+        "failed to bind socket at {socket:?}: {listener:?}"
+    );
+    drop(listener);
+    let _ = std::fs::remove_file(&socket);
 }
