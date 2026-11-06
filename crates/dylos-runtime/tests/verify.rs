@@ -296,37 +296,51 @@ async fn verify_snapshot_rejects_ancestor_symlink_replacement() {
     }
 }
 
-#[tokio::test]
-async fn verify_snapshot_does_not_block_tokio_executor() {
-    let tmp = tempdir().unwrap();
-    let (opener, manifest) = create_test_snapshot(
-        tmp.path(),
-        &["vm1", "vm2", "vm3", "vm4", "vm5", "vm6", "vm7", "vm8"],
-    );
+#[test]
+fn verify_snapshot_does_not_block_tokio_executor() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let tmp = tempdir().unwrap();
+        let (opener, manifest) = create_test_snapshot(tmp.path(), &["vm1"]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            // Dropping the sender also releases this thread if an assertion panics.
+            let _ = release_rx.blocking_recv();
+        });
+        started_rx.await.unwrap();
 
-    let ticks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let ticks_clone = std::sync::Arc::clone(&ticks);
-    let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let verification = verify_snapshot(&opener, &manifest);
+        tokio::pin!(verification);
+        assert!(
+            futures_util::poll!(&mut verification).is_pending(),
+            "verification completed while the blocking pool was occupied"
+        );
 
-    let ticker = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    ticks_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                _ = &mut stop_rx => break,
+        // This executor can change the bytes before hashing starts, regardless of file size.
+        let path = PathBuf::from("vms/vm1/vm.state");
+        let original = fs::read(tmp.path().join(&path)).unwrap();
+        fs::write(tmp.path().join(&path), vec![0; original.len()]).unwrap();
+        release_tx.send(()).unwrap();
+        blocker.await.unwrap();
+
+        match verification.await.unwrap_err() {
+            Error::IntegrityMismatch {
+                vm,
+                path: actual_path,
+                expected_size,
+                actual_size,
+                ..
+            } => {
+                assert_eq!(vm, "vm1");
+                assert_eq!(actual_path, path);
+                assert_eq!(actual_size, expected_size);
             }
+            other => panic!("expected checksum mismatch after releasing hashing, got {other:?}"),
         }
     });
-
-    let result = verify_snapshot(&opener, &manifest).await;
-    let _ = stop_tx.send(());
-    ticker.await.unwrap();
-
-    assert!(result.is_ok());
-    assert!(
-        ticks.load(std::sync::atomic::Ordering::Relaxed) > 0,
-        "Tokio async executor was blocked by hashing"
-    );
 }
