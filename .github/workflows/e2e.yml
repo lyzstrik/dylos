@@ -22,11 +22,11 @@ jobs:
         include:
           # Keep the longest tests apart; the final filter also catches new tests.
           - shard: 1
-            selection: 'filter:binary(fork_e2e) | binary(snapshot_e2e)'
+            selection: 'filter:binary(fork_e2e)'
           - shard: 2
-            selection: 'filter:test(snapshot_fork_down_endurance) | binary(entropy_e2e) | binary(abc_flow_e2e)'
+            selection: 'filter:test(snapshot_fork_down_endurance) | binary(entropy_e2e) | binary(abc_flow_e2e) | binary(freeze_e2e) | test(five_vms_snapshot_measurement_and_integrity)'
           - shard: 3
-            selection: 'filter:not (binary(fork_e2e) | binary(snapshot_e2e) | test(snapshot_fork_down_endurance) | binary(entropy_e2e) | binary(abc_flow_e2e))'
+            selection: 'filter:not (binary(fork_e2e) | test(snapshot_fork_down_endurance) | binary(entropy_e2e) | binary(abc_flow_e2e) | binary(freeze_e2e) | test(five_vms_snapshot_measurement_and_integrity))'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
