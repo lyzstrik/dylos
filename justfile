@@ -66,7 +66,7 @@ host-check:
 
 # Run serial end-to-end tests; optionally select hash:1/3 or filter:<nextest expression>
 e2e partition="": host-check
-    cargo xtask e2e {{quote(partition)}}
+    cargo --locked xtask e2e {{quote(partition)}}
 
 # Build end-to-end test binaries without running them
 e2e-build:
@@ -78,7 +78,7 @@ bench *args:
 
 # Build guest images (rootfs) with rootless podman
 images:
-    cargo xtask images
+    cargo --locked xtask images
 
 # Build every fuzz harness with the isolated nightly toolchain
 fuzz-check:

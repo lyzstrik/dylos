@@ -71,6 +71,7 @@ fn run_e2e(partition: Option<&str>) -> anyhow::Result<()> {
         "nextest",
         "run",
         "--workspace",
+        "--locked",
         "--run-ignored",
         "only",
         "--test-threads",

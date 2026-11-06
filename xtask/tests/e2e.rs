@@ -23,6 +23,7 @@ fn serial_e2e_runs_all_tests_or_one_partition_with_visible_output() -> anyhow::R
             "nextest",
             "run",
             "--workspace",
+            "--locked",
             "--run-ignored",
             "only",
             "--test-threads",
