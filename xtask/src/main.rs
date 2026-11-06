@@ -42,10 +42,11 @@ fn run() -> anyhow::Result<()> {
             Ok(())
         }
         Some("e2e") => {
+            let partition = args.next().filter(|value| !value.is_empty());
             if args.next().is_some() {
-                bail!("e2e does not accept arguments");
+                bail!("e2e accepts at most one partition (for example hash:1/3)");
             }
-            run_e2e()
+            run_e2e(partition.as_deref())
         }
         Some("images") => {
             if args.next().is_some() {
@@ -64,12 +65,30 @@ fn run() -> anyhow::Result<()> {
 
 /// End-to-end tests are `#[ignore]`d so that `just check` never runs them; each one prints
 /// `SKIPPED ...` and returns when root or KVM is missing.
-fn run_e2e() -> anyhow::Result<()> {
-    let status = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
-        .args(["nextest", "run", "--workspace", "--run-ignored", "only"])
-        .arg("--no-capture")
-        .status()
-        .context("could not run cargo nextest")?;
+fn run_e2e(partition: Option<&str>) -> anyhow::Result<()> {
+    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command.args([
+        "nextest",
+        "run",
+        "--workspace",
+        "--locked",
+        "--run-ignored",
+        "only",
+        "--test-threads",
+        "1",
+        "--success-output",
+        "immediate",
+        "--failure-output",
+        "immediate",
+    ]);
+    if let Some(partition) = partition {
+        if let Some(filterset) = partition.strip_prefix("filter:") {
+            command.args(["--filterset", filterset]);
+        } else {
+            command.args(["--partition", partition]);
+        }
+    }
+    let status = command.status().context("could not run cargo nextest")?;
     if !status.success() {
         bail!("end-to-end tests failed (exit status {status})");
     }

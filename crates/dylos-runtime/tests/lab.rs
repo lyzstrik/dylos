@@ -671,7 +671,8 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
     if !supported(&config, &spec).unwrap() {
         return;
     }
-    let mut fleet = Fleet::new(&config, Duration::from_millis(500));
+    let timeout = Duration::from_secs(30);
+    let mut fleet = Fleet::new(&config, timeout);
     // Holds the lab and its bound socket but never answers: the request times out.
     let stalled = Lab::up_with(&config, &spec, "f1").await.unwrap();
     let socket = stalled.control_socket();
@@ -682,9 +683,32 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
     let unreachable = Lab::up_with(&config, &spec, "f2").await.unwrap();
     fs::remove_file(unreachable.control_socket()).unwrap();
     fleet.spawn(unreachable);
-    fleet.spawn(Lab::up_with(&config, &spec, "f3").await.unwrap());
+    let healthy = Lab::up_with(&config, &spec, "f3").await.unwrap();
+    let (healthy_done, mut healthy_stopped) = tokio::sync::oneshot::channel();
+    fleet.spawn_supervisor("f3".into(), healthy.control_socket(), async move {
+        let result = healthy.supervise().await;
+        healthy_done.send(()).unwrap();
+        result
+    });
 
-    let failures = fleet.run(std::future::ready(())).await.unwrap_err().0;
+    // A real 500 ms fleet deadline races host cleanup (VM cleanup alone allows 2 s).
+    // Keep time frozen until the healthy response, then expire only the stalled request.
+    tokio::time::pause();
+    let shutdown = tokio::spawn(fleet.run(std::future::ready(())));
+    let started = std::time::Instant::now();
+    loop {
+        match healthy_stopped.try_recv() {
+            Ok(()) => break,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(error) => panic!("healthy supervisor dropped completion signal: {error}"),
+        }
+        assert!(started.elapsed() < timeout, "healthy teardown stalled");
+        // Remaining runnable prevents Tokio from automatically advancing paused time.
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(timeout).await;
+    tokio::time::resume();
+    let failures = shutdown.await.unwrap().unwrap_err().0;
     assert_eq!(failures.len(), 2, "{failures:?}");
     for failure in &failures {
         let kind = match failure.lab.as_str() {
@@ -884,4 +908,96 @@ async fn restore_and_fork_reject_unpublished_staging() {
     assert!(!config.store.base.join("restored").exists());
     assert!(!config.store.base.join("forked-c1").exists());
     assert!(!config.store.base.join("forked-c2").exists());
+}
+
+#[tokio::test]
+async fn condition_polling_backs_off_until_success() {
+    let start = std::time::Instant::now();
+    let mut polls = 0;
+    support::wait_until("backoff", Duration::from_secs(5), || {
+        polls += 1;
+        start.elapsed() >= Duration::from_millis(35)
+    })
+    .await;
+    assert!(polls <= 5, "condition was polled {polls} times");
+
+    let start = std::time::Instant::now();
+    let mut polls = 0;
+    support::wait_until_async("async backoff", Duration::from_secs(5), || {
+        polls += 1;
+        std::future::ready(start.elapsed() >= Duration::from_millis(35))
+    })
+    .await;
+    assert!(polls <= 5, "async condition was polled {polls} times");
+}
+
+#[tokio::test]
+async fn condition_polling_still_times_out() {
+    let task = tokio::spawn(support::wait_until(
+        "never ready",
+        Duration::from_millis(25),
+        || false,
+    ));
+    assert!(task.await.unwrap_err().is_panic());
+    let task = tokio::spawn(support::wait_until_async(
+        "never ready asynchronously",
+        Duration::from_millis(25),
+        || std::future::ready(false),
+    ));
+    assert!(task.await.unwrap_err().is_panic());
+}
+
+#[tokio::test]
+async fn up_rejects_control_socket_exceeding_sun_len_before_creating_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::Serve);
+    let long_base = sandbox.dir.path().join("s".repeat(95));
+    config.store.base = long_base.clone();
+    let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+    match &err {
+        LabError::SocketPathTooLong {
+            lab,
+            path,
+            len,
+            limit,
+        } => {
+            assert_eq!(lab, "lab");
+            assert_eq!(*limit, dylos_runtime::MAX_UNIX_SOCKET_PATH);
+            assert_eq!(*len, path.as_os_str().len());
+            assert!(*len > *limit, "expected len {len} > limit {limit}");
+            assert_eq!(path, &Lab::control_socket_path(&long_base, "lab"));
+            let msg = err.to_string();
+            assert!(msg.contains(&len.to_string()), "{msg}");
+            assert!(msg.contains(&limit.to_string()), "{msg}");
+            assert!(msg.contains("lab"), "{msg}");
+        }
+        other => panic!("expected SocketPathTooLong, got {other:?}"),
+    }
+    assert!(!long_base.exists(), "store base should not be created");
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn up_rejects_api_socket_exceeding_sun_len_before_creating_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::Serve);
+    let long_jail_dir = sandbox.dir.path().join("j".repeat(80));
+    config.jailer.chroot_base_dir = long_jail_dir.clone();
+    let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+    match &err {
+        LabError::Vm(dylos_runtime::Error::SocketPathTooLong { path, len, limit }) => {
+            assert_eq!(*limit, dylos_runtime::MAX_UNIX_SOCKET_PATH);
+            assert_eq!(*len, path.as_os_str().len());
+            assert!(*len > *limit, "expected len {len} > limit {limit}");
+            assert!(path.ends_with("run/firecracker.socket"));
+            let msg = err.to_string();
+            assert!(msg.contains(&len.to_string()), "{msg}");
+            assert!(msg.contains(&limit.to_string()), "{msg}");
+        }
+        other => panic!("expected Vm(SocketPathTooLong), got {other:?}"),
+    }
+    assert!(!long_jail_dir.exists(), "jail dir should not be created");
+    assert!(
+        !config.store.base.exists(),
+        "store base should not be created"
+    );
+    assert_removed(&sandbox, &config);
 }

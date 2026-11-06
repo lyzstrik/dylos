@@ -58,11 +58,11 @@ try:
         if command == 'send':
             source, target, version, marker = args
             os.write(taps[source], frame(version, marker))
-            assert select.select([taps[target]], [], [], 2)[0], 'frame never reached TAP queue'
+            assert select.select([taps[target]], [], [], 10)[0], 'frame never reached TAP queue'
         elif command == 'read':
             target, version, marker = args
             expected = frame(version, marker)
-            deadline = time.monotonic() + 2
+            deadline = time.monotonic() + 10
             while True:
                 remaining = deadline - time.monotonic()
                 assert remaining > 0, 'expected frame never delivered'

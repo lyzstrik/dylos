@@ -16,6 +16,9 @@ use dylos_fc::config::{BootSource, Drive, InstanceActionInfo, MachineConfigurati
 use dylos_runtime::jailer::{ChrootFile, JailPaths, JailerConfig};
 use dylos_runtime::{Error, Lab, LabConfig, LabError, Timeouts, Vm, VmSpec};
 
+mod support;
+use support::test_tempdir;
+
 fn binaries_dir() -> Option<PathBuf> {
     std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from)
 }
@@ -374,8 +377,8 @@ async fn abc_lab_ping_and_iperf3_flow_through_b_then_teardown_leaves_nothing() {
     }
 
     let bin = binaries_dir().unwrap();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
 
@@ -438,7 +441,7 @@ async fn guest_with_failed_network_marker_reports_not_ready() {
     }
 
     let bin = binaries_dir().unwrap();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let mut config = JailerConfig::new(dir.path(), 65534, 65534);
     config.jailer = bin.join("jailer");
     config.firecracker = bin.join("firecracker");
@@ -524,8 +527,8 @@ async fn guest_with_unusable_connectivity_reports_not_ready() {
     }
 
     let bin = binaries_dir().unwrap();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
 
@@ -542,7 +545,7 @@ async fn guest_with_unusable_connectivity_reports_not_ready() {
     };
 
     let spec = LabSpec::from_yaml_str(include_str!("fixtures/unusable_connectivity.yaml")).unwrap();
-    let lab_id = "fail-connectivity-e2e";
+    let lab_id = "fail-conn-e2e";
     let root = config.store.base.join(lab_id);
     let netns = config.netns_dir.join(format!("dylos-{lab_id}"));
     let jail_paths_a = JailPaths::new(&config.jailer, lab_id, "A").unwrap();

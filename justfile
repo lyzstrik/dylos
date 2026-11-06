@@ -1,4 +1,4 @@
-export NEXTEST_NO_TESTS := "warn"
+export NEXTEST_NO_TESTS := "fail"
 
 # List recipes
 default:
@@ -22,6 +22,7 @@ check:
     just clippy
     just doc
     just test
+    just test-selection-check
     just deny
     just agent-check
     just ci-lint
@@ -39,6 +40,7 @@ machete:
 # Check dependency policy
 deny:
     cargo deny --locked check
+    cd fuzz && cargo deny --locked check
 
 # Build and verify static musl guest agent
 agent-check:
@@ -60,13 +62,27 @@ doc:
 test:
     cargo nextest run --workspace --locked
 
+# Prove empty unit and E2E selections fail without requiring KVM
+test-selection-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for selection in default only; do
+        status=0
+        cargo nextest run --workspace --locked --run-ignored "$selection" -E 'none()' || status=$?
+        # Nextest reserves exit code 4 for no tests selected; other failures are not proof.
+        if [ "$status" -ne 4 ]; then
+            echo "Expected empty $selection selection to exit 4, got $status" >&2
+            exit 1
+        fi
+    done
+
 # Verify host prerequisites (KVM, Firecracker, reflink)
 host-check:
     ./scripts/host-check.sh
 
-# Run end-to-end tests (requires host prerequisites)
-e2e: host-check
-    cargo xtask e2e
+# Run serial end-to-end tests; optionally select hash:1/3 or filter:<nextest expression>
+e2e partition="": host-check
+    cargo --locked xtask e2e {{quote(partition)}}
 
 # Build end-to-end test binaries without running them
 e2e-build:
@@ -78,7 +94,7 @@ bench *args:
 
 # Build guest images (rootfs) with rootless podman
 images:
-    cargo xtask images
+    cargo --locked xtask images
 
 # Build every fuzz harness with the isolated nightly toolchain
 fuzz-check:

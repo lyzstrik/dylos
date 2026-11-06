@@ -14,8 +14,19 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  E2E:
-    name: E2E
+  shard:
+    name: E2E shard ${{ matrix.shard }}/3
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Keep the longest tests apart; the final filter also catches new tests.
+          - shard: 1
+            selection: 'filter:binary(fork_e2e) | test(five_vms_snapshot_measurement_and_integrity)'
+          - shard: 2
+            selection: 'filter:test(snapshot_fork_down_endurance) | binary(entropy_e2e) | binary(freeze_e2e) | (binary(snapshot_e2e) & not test(five_vms_snapshot_measurement_and_integrity))'
+          - shard: 3
+            selection: 'filter:not (binary(fork_e2e) | binary(snapshot_e2e) | test(snapshot_fork_down_endurance) | binary(entropy_e2e) | binary(freeze_e2e))'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -118,7 +129,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/images/rootfs.ext4
-          key: rootfs-${{ runner.os }}-${{ hashFiles('xtask/images/**', 'Cargo.lock', 'rust-toolchain.toml', 'crates/dylos-agent/**') }}
+          key: rootfs-${{ runner.os }}-${{ hashFiles('xtask/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/dylos-agent/**') }}
 
       - name: Build rootfs image
         if: steps.cache-rootfs.outputs.cache-hit != 'true'
@@ -141,9 +152,11 @@ jobs:
         run: just e2e-build
 
       - name: Run end-to-end tests
+        env:
+          PARTITION: ${{ matrix.selection }}
         run: |
           set -o pipefail
-          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" "NEXTEST_SUCCESS_OUTPUT=immediate" "DYLOS_ENDURANCE_CYCLES=5" just e2e 2>&1 | tee e2e.log
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" "DYLOS_ENDURANCE_CYCLES=5" just e2e "$PARTITION" 2>&1 | tee e2e.log
           if grep -q "SKIPPED" e2e.log; then
             echo "::error::An e2e test was skipped for missing prerequisites" >&2
             exit 1
@@ -153,8 +166,19 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-failure-logs
+          name: e2e-failure-logs-${{ matrix.shard }}
           path: |
             e2e.log
             target/tmp
           if-no-files-found: warn
+
+  E2E:
+    name: E2E
+    needs: shard
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require every shard to succeed
+        env:
+          SHARD_RESULT: ${{ needs.shard.result }}
+        run: test "$SHARD_RESULT" = success
