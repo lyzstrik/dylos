@@ -257,3 +257,40 @@ async fn retry_delay_doubles_up_to_the_cap_and_resets_after_a_connection() {
     // succeeds and then drops resets the delay to the initial 100.
     assert_eq!(gaps, [100, 200, 400, 500, 500, 500, 100, 100, 200]);
 }
+
+#[tokio::test(start_paused = true)]
+async fn default_retries_stay_bounded_without_spinning_after_long_host_absence() {
+    let (instants_tx, mut instants_rx) = mpsc::unbounded_channel();
+    let agent = tokio::spawn(async move {
+        let clock = FakeClock::default();
+        let mut attempts = 0;
+        run(
+            || {
+                attempts += 1;
+                instants_tx.send(tokio::time::Instant::now()).unwrap();
+                let result = if attempts > 510 {
+                    let (guest, host) = tokio::io::duplex(64);
+                    drop(host);
+                    Ok(guest)
+                } else {
+                    Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+                };
+                async move { result }
+            },
+            &clock,
+            Backoff::default(),
+        )
+        .await
+    });
+    let first = instants_rx.recv().await.unwrap();
+    let mut previous = first;
+    for _ in 0..512 {
+        let now = instants_rx.recv().await.unwrap();
+        // Covers every failed dial and the delay after successful connections close.
+        // The lower bound proves that an unavailable host does not cause a busy loop.
+        assert_eq!(now - previous, Duration::from_millis(20));
+        previous = now;
+    }
+    assert!(previous - first > Duration::from_secs(10));
+    agent.abort();
+}
