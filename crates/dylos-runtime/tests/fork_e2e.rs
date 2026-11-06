@@ -18,6 +18,9 @@ use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 
+mod support;
+use support::test_tempdir;
+
 const A_V6: &str = "fd64:796c:6f73:1::2";
 const A_V4: &str = "10.0.1.2";
 const C_V6: &str = "fd64:796c:6f73:2::2";
@@ -296,7 +299,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         eprintln!("SKIPPED fork_e2e: requires root, KVM and built images/binaries");
         return;
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");

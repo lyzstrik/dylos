@@ -54,6 +54,49 @@ pub enum Mode {
     LabSnapshot,
 }
 
+/// Returns a short temporary directory suitable for test jails and stores.
+///
+/// Reflinks (used for microVM images and snapshots) require the image,
+/// lab store, and jail directory to reside on the same filesystem mount.
+/// On systems where `/tmp` is on a different mount from the workspace
+/// (such as GitHub Actions runners with a loop-mounted XFS filesystem or
+/// hosts with a tmpfs `/tmp`), `/tmp` cannot be used for reflinks.
+///
+/// In those cases, this helper allocates a temporary directory under `<workspace>/.t`,
+/// which resides on the same mount as `target/images/rootfs.ext4` while keeping
+/// Unix domain socket paths comfortably below Linux's 108-byte `sockaddr_un` limit.
+pub fn test_tempdir() -> tempfile::TempDir {
+    if let Some(custom) = std::env::var_os("DYLOS_TEST_TMPDIR").filter(|s| !s.is_empty()) {
+        let base = PathBuf::from(custom);
+        std::fs::create_dir_all(&base).unwrap();
+        return tempfile::Builder::new()
+            .prefix("")
+            .tempdir_in(&base)
+            .unwrap();
+    }
+
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    let same_mount = match (std::fs::metadata("/tmp"), std::fs::metadata(&workspace)) {
+        (Ok(tmp_meta), Ok(ws_meta)) => tmp_meta.dev() == ws_meta.dev(),
+        _ => false,
+    };
+
+    if same_mount {
+        tempfile::tempdir().unwrap()
+    } else {
+        let base = workspace.join(".t");
+        std::fs::create_dir_all(&base).unwrap();
+        tempfile::Builder::new()
+            .prefix("")
+            .tempdir_in(&base)
+            .unwrap()
+    }
+}
+
 pub struct Sandbox {
     pub dir: tempfile::TempDir,
     pub config: JailerConfig,
@@ -61,7 +104,7 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn new(mode: Mode) -> Self {
-        Self::with_dir(mode, tempfile::tempdir().unwrap())
+        Self::with_dir(mode, test_tempdir())
     }
 
     pub fn in_target(mode: Mode) -> Self {
