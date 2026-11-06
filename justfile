@@ -64,9 +64,9 @@ test:
 host-check:
     ./scripts/host-check.sh
 
-# Run end-to-end tests (requires host prerequisites)
-e2e: host-check
-    cargo xtask e2e
+# Run serial end-to-end tests; optionally select hash:1/3 or filter:<nextest expression>
+e2e partition="": host-check
+    cargo xtask e2e {{quote(partition)}}
 
 # Build end-to-end test binaries without running them
 e2e-build:
