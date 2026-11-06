@@ -582,11 +582,15 @@ async fn exec_concurrent_calls_serialize_correctly() {
 async fn exec_deadline_covers_mutex_acquisition() {
     let sandbox = Sandbox::new(Mode::Echo);
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
+    let lock_marker = sandbox.dir.path().join("exec-lock-acquired");
     // Launch a command that holds the console lock for 1 second.
     let slow = vm.exec("sleep 1", Duration::from_secs(2));
     let blocked = async {
-        // Yield so slow starts and acquires the stdin lock.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait until slow has acquired the stdin lock and dispatched its command.
+        support::wait_until("slow exec acquired lock", Duration::from_secs(5), || {
+            lock_marker.exists()
+        })
+        .await;
         // Attempt a second exec with a short timeout (50ms); it must time out while waiting for the lock.
         vm.exec("echo blocked", Duration::from_millis(50)).await
     };
