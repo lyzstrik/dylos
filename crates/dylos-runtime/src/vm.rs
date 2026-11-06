@@ -115,6 +115,18 @@ pub struct Vm {
     lines_tx: tokio::sync::broadcast::Sender<String>,
 }
 
+/// Validates VM vCPU count and memory size against Firecracker constraints.
+///
+/// Firecracker supports 1 to 32 vCPUs (odd counts allowed only for 1 vCPU),
+/// and non-zero memory size.
+#[must_use]
+pub fn validate_resources(vcpu_count: u32, mem_size_mib: u32) -> bool {
+    vcpu_count > 0
+        && vcpu_count <= 32
+        && (vcpu_count == 1 || vcpu_count.is_multiple_of(2))
+        && mem_size_mib > 0
+}
+
 impl Vm {
     /// Prepares the chroot, starts the jailer and waits until the Firecracker API answers.
     /// On any error, the process is killed and the jail removed before returning. Dropping the
@@ -122,10 +134,17 @@ impl Vm {
     ///
     /// # Errors
     ///
-    /// [`Error::ZeroMetricsPoll`], any [`Error`] from chroot preparation, [`Error::Spawn`],
-    /// [`Error::ExitedDuringStart`] or [`Error::ReadyTimeout`].
+    /// [`Error::InvalidResources`], [`Error::ZeroMetricsPoll`], any [`Error`] from chroot
+    /// preparation, [`Error::Spawn`], [`Error::ExitedDuringStart`] or [`Error::ReadyTimeout`].
     pub async fn launch(config: &JailerConfig, spec: &VmSpec) -> Result<Self> {
         let paths = JailPaths::new(config, &spec.lab_id, &spec.node)?;
+        if !validate_resources(u32::from(spec.vcpu_count), spec.mem_size_mib) {
+            return Err(Error::InvalidResources {
+                id: paths.id,
+                vcpu_count: u32::from(spec.vcpu_count),
+                mem_size_mib: spec.mem_size_mib,
+            });
+        }
         if spec.timeouts.metrics_poll.is_zero() {
             return Err(Error::ZeroMetricsPoll { id: paths.id });
         }

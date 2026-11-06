@@ -204,6 +204,25 @@ async fn invalid_inputs_are_rejected_before_creating_host_resources() {
 }
 
 #[tokio::test]
+async fn invalid_vm_resources_are_rejected_before_creating_host_resources() {
+    let (sandbox, config, mut spec) = setup(Mode::LabReady);
+    for (vcpus, memory) in [(0, 128), (33, 128), (3, 128), (1, 0)] {
+        spec.nodes[0].vcpus = vcpus;
+        spec.nodes[0].memory = memory;
+        let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+        assert!(
+            matches!(
+                &err,
+                LabError::Invalid { message, .. } if message.contains("invalid VM vCPU or memory configuration")
+            ),
+            "expected LabError::Invalid for vcpus={vcpus}, memory={memory}, got: {err}"
+        );
+        assert!(!config.store.base.exists());
+        assert_removed(&sandbox, &config);
+    }
+}
+
+#[tokio::test]
 async fn recovery_refuses_symlinks_mismatched_state_and_live_locks() {
     let (sandbox, config, spec) = setup(Mode::LabReady);
     let root = config.store.base.join("lab");
