@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use dylos_core::LabSpec;
+use dylos_core::{LabSpec, validate_name};
 
 use crate::Error;
 
 /// Longest Linux interface name: `IFNAMSIZ` (16) minus the trailing NUL.
 pub const IFNAME_MAX_LEN: usize = 15;
 
-const LAB_ID_MAX_LEN: usize = 64;
+const LAB_ID_MAX_LEN: usize = 32;
 
 /// Bridge of one `LabSpec` segment, named `br-<segment>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,10 +39,11 @@ pub struct FabricPlan {
 impl FabricPlan {
     /// # Errors
     ///
-    /// Invalid lab id, unknown segment, or a derived interface name that is too long, uses
+    /// Lab id rejected by [`validate_name`] with a 32-byte limit, unknown segment,
+    /// or a derived interface name that is too long, uses
     /// characters other than ASCII letters, digits, `-` and `_`, or collides with another one.
     pub fn new(lab_id: &str, spec: &LabSpec) -> Result<Self, Error> {
-        if lab_id.is_empty() || lab_id.len() > LAB_ID_MAX_LEN || !is_portable(lab_id) {
+        if validate_name(lab_id, LAB_ID_MAX_LEN).is_err() {
             return Err(Error::InvalidLabId(lab_id.to_owned()));
         }
         let mut seen: HashMap<String, String> = HashMap::new();
