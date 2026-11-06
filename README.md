@@ -107,13 +107,19 @@ just images
 
 ### 5. Running the reference lab
 
-Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. Run with `sudo -E` to preserve user environment variables (such as `PATH` and `DYLOS_FC_BIN_DIR`):
+Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. If your static Firecracker and jailer binaries are installed in `~/.local/share/dylos/bin` (as described in [`docs/host.md`](docs/host.md)), export `DYLOS_FC_BIN_DIR` so Dylos locates them instead of defaulting to `/usr/bin`.
+
+Run with `sudo -E` to preserve `DYLOS_FC_BIN_DIR`. Invoking the compiled binary directly is preferred because sudoers `secure_path` can override `PATH` and hide user-installed `cargo`:
 
 ```bash
-# Bring up the reference 3-node lab (A -- B -- C)
-sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
-# Or with the compiled binary:
+# Point to your static Firecracker and jailer binaries (installed per docs/host.md)
+export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"
+
+# Bring up the reference 3-node lab (A -- B -- C) with the compiled binary
 sudo -E ./target/release/dylos lab up labs/abc.yaml
+
+# Or via cargo (if sudo preserves PATH to cargo in your environment):
+sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
 ```
 
 `lab up` starts the microVMs, configures the network topology, and stays in the foreground supervising the lab until interrupted (such as with `Ctrl+C`) or torn down from another terminal.
@@ -121,9 +127,11 @@ sudo -E ./target/release/dylos lab up labs/abc.yaml
 To tear down the lab from another terminal (or to clean up after an exit), run `lab down` with the lab identifier (which defaults to the spec file stem, `abc`):
 
 ```bash
-sudo -E cargo run --release -p dylos-cli -- lab down abc
-# Or with the compiled binary:
+# Tear down with the compiled binary
 sudo -E ./target/release/dylos lab down abc
+
+# Or via cargo:
+sudo -E cargo run --release -p dylos-cli -- lab down abc
 ```
 
 > [!NOTE]
@@ -140,7 +148,7 @@ sudo -E ./target/release/dylos lab down abc
   ```text
   Failed to exec into Firecracker: No such file or directory
   ```
-  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md) and set `DYLOS_FC_BIN_DIR` to their directory (defaults to `~/.local/share/dylos/bin`).
+  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md) and set `DYLOS_FC_BIN_DIR` to their directory (for example `export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"`). Without `DYLOS_FC_BIN_DIR`, the CLI defaults to `/usr/bin/firecracker` and `/usr/bin/jailer` (unlike `just host-check`, which checks `~/.local/share/dylos/bin` by default).
 
 - **Cross-device link errors (`EXDEV`)**:
   If reflink preflight fails, your rootfs image, lab store directory, or jail directory reside on different filesystem mounts. Ensure they are colocated on the same reflink-capable filesystem mount (or configure `DYLOS_LAB_DIR` and `DYLOS_JAIL_DIR` to point to that mount).
