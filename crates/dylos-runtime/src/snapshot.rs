@@ -34,6 +34,8 @@ pub struct SnapshotTimings {
     pub resume_ms: u64,
     pub thaw_ms: u64,
     pub total_ms: u64,
+    /// Wall time from starting fabric freeze through completing thaw, excluding hashing.
+    pub freeze_to_thaw_ms: u64,
 }
 
 /// Explicit inputs of one lab snapshot; [`crate::Lab::snapshot`] fills them from the running lab.
@@ -325,7 +327,7 @@ async fn run_snapshot_steps(
     let snapshot_id_clone = job.snapshot_id.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
         store
-            .create_snapshot(&lab_id_clone, &snapshot_id_clone)
+            .stage_snapshot(&lab_id_clone, &snapshot_id_clone)
             .map_err(LabError::Store)
     })
     .await
@@ -413,23 +415,25 @@ async fn run_snapshot_steps(
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
 
         let handle = tokio::task::spawn_blocking(move || {
-            let (state_file, state_hash_ms) =
-                snap.save_vm_file_with_timings(&state_src, &node, "vm.state", state_max_bytes)?;
-            let (memory_file, mem_hash_ms) =
-                snap.save_vm_file_with_timings(&mem_src, &node, "vm.mem", mem_max_bytes)?;
+            let (state_file, _) = snap.capture_vm_source(
+                dylos_store::VmFileSource::open(&state_src, state_max_bytes)?,
+                &node,
+                "vm.state",
+            )?;
+            let (memory_file, _) = snap.capture_vm_source(
+                dylos_store::VmFileSource::open(&mem_src, mem_max_bytes)?,
+                &node,
+                "vm.mem",
+            )?;
             let mut disks = Vec::new();
             let mut fsync_ms = 0u64;
             let mut reflink_ms = 0u64;
-            let mut disk_hash_ms = 0u64;
             if let Some(disk_path) = disk_src {
-                let (disk_meta, timings) =
-                    snap.clone_disk_with_timings(&disk_path, &node, "rootfs.ext4")?;
+                let (disk_meta, timings) = snap.capture_disk(&disk_path, &node, "rootfs.ext4")?;
                 disks.push(disk_meta);
                 fsync_ms = timings.fsync_ms;
                 reflink_ms = timings.reflink_ms;
-                disk_hash_ms = timings.hash_ms;
             }
-            let total_hash_ms = state_hash_ms + mem_hash_ms + disk_hash_ms;
             Ok::<_, LabError>((
                 node,
                 VmManifest {
@@ -439,7 +443,6 @@ async fn run_snapshot_steps(
                 },
                 fsync_ms,
                 reflink_ms,
-                total_hash_ms,
             ))
         });
         storage_handles.push(handle);
@@ -453,15 +456,13 @@ async fn run_snapshot_steps(
     let mut vms_manifest = BTreeMap::new();
     let mut max_fsync_ms = 0u64;
     let mut max_reflink_ms = 0u64;
-    let mut max_hash_ms = 0u64;
 
     for result in storage_results {
         match result {
-            Ok(Ok((node, manifest, fsync, reflink, hash))) => {
+            Ok(Ok((node, manifest, fsync, reflink))) => {
                 vms_manifest.insert(node, manifest);
                 max_fsync_ms = max_fsync_ms.max(fsync);
                 max_reflink_ms = max_reflink_ms.max(reflink);
-                max_hash_ms = max_hash_ms.max(hash);
             }
             Ok(Err(err)) => {
                 if first_storage_error.is_none() {
@@ -500,58 +501,7 @@ async fn run_snapshot_steps(
 
     let snapshot_ms = u64::try_from(started_all.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Step 4: Write initial manifest in spawn_blocking
-    let started_manifest = Instant::now();
-    let created_at_unix_ms = u64::try_from(
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(0);
-
-    let mut manifest = SnapshotManifest {
-        format_version: 1,
-        lab_spec: job.spec.clone(),
-        vms: vms_manifest,
-        firecracker_version: "1.17.0".to_string(),
-        host_cpu_model: host_cpu_model(),
-        created_at_unix_ms,
-        step_durations_ms: StepDurations {
-            freeze: freeze_ms,
-            pause: pause_ms,
-            snapshot: snapshot_ms,
-            resume: 0,
-            thaw: 0,
-        },
-    };
-
-    let manifest_clone = manifest.clone();
-    let snap_for_write = {
-        let mut lock = poisoned(&state.partial_snapshot);
-        lock.take().ok_or_else(|| LabError::Invalid {
-            lab: job.lab_id.clone(),
-            message: "snapshot handle missing".into(),
-        })?
-    };
-
-    let snap_after_write = tokio::task::spawn_blocking(move || {
-        snap_for_write.write_manifest(&manifest_clone)?;
-        Ok::<_, LabError>(snap_for_write)
-    })
-    .await
-    .map_err(|join_err| LabError::Task {
-        lab: job.lab_id.clone(),
-        source: join_err,
-    })??;
-
-    {
-        let mut lock = poisoned(&state.partial_snapshot);
-        *lock = Some(snap_after_write);
-    }
-    let manifest_ms = u64::try_from(started_manifest.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-    // Step 5: Resume all VMs
+    // Step 4: Resume all VMs
     let started_resume = Instant::now();
     let resume_results = join_all(job.vms.iter().map(|vm| vm.client.resume())).await;
     let resume_ms = u64::try_from(started_resume.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -574,7 +524,7 @@ async fn run_snapshot_steps(
     }
     state.paused.store(false, Ordering::SeqCst);
 
-    // Step 6: Thaw fabric
+    // Step 5: Thaw fabric
     let started_thaw = Instant::now();
     if let Some(fabric) = &job.fabric {
         fabric.thaw().await.map_err(LabError::Network)?;
@@ -582,28 +532,92 @@ async fn run_snapshot_steps(
     }
     let thaw_ms = u64::try_from(started_thaw.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Step 7: Update step durations in manifest and commit atomically
-    manifest.step_durations_ms.resume = resume_ms;
-    manifest.step_durations_ms.thaw = thaw_ms;
-    let final_manifest = manifest.clone();
-    let mut snap_for_commit = {
-        let mut lock = poisoned(&state.partial_snapshot);
-        lock.take().ok_or_else(|| LabError::Invalid {
+    let freeze_to_thaw_ms = u64::try_from(started_all.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    // Hash only isolated captured files, after every VM is resumed and the fabric is thawed.
+    let snapshot = poisoned(&state.partial_snapshot)
+        .take()
+        .ok_or_else(|| LabError::Invalid {
             lab: job.lab_id.clone(),
             message: "snapshot handle missing".into(),
-        })?
+        })?;
+    let snapshot = Arc::new(snapshot);
+    let started_hash = Instant::now();
+    let handles = vms_manifest
+        .into_iter()
+        .map(|(node, mut vm)| {
+            let snapshot = Arc::clone(&snapshot);
+            tokio::task::spawn_blocking(move || {
+                snapshot.hash_file(&mut vm.state_file)?;
+                snapshot.hash_file(&mut vm.memory_file)?;
+                for disk in &mut vm.disks {
+                    snapshot.hash_file(disk)?;
+                }
+                Ok::<_, LabError>((node, vm))
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = join_all(handles).await;
+    let snapshot = Arc::try_unwrap(snapshot).map_err(|_| LabError::Invalid {
+        lab: job.lab_id.clone(),
+        message: "snapshot handle leaked across hashing tasks".into(),
+    })?;
+    *poisoned(&state.partial_snapshot) = Some(snapshot);
+    vms_manifest = BTreeMap::new();
+    for result in results {
+        let (node, vm) = result.map_err(|source| LabError::Task {
+            lab: job.lab_id.clone(),
+            source,
+        })??;
+        vms_manifest.insert(node, vm);
+    }
+    let max_hash_ms = u64::try_from(started_hash.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    // Write the completed manifest and atomically publish the staging directory.
+    let started_manifest = Instant::now();
+    let created_at_unix_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(0);
+
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: job.spec.clone(),
+        vms: vms_manifest,
+        firecracker_version: "1.17.0".to_string(),
+        host_cpu_model: host_cpu_model(),
+        created_at_unix_ms,
+        step_durations_ms: StepDurations {
+            freeze: freeze_ms,
+            pause: pause_ms,
+            snapshot: snapshot_ms,
+            resume: resume_ms,
+            thaw: thaw_ms,
+        },
     };
 
+    let final_manifest = manifest.clone();
+    let mut snap_for_commit =
+        poisoned(&state.partial_snapshot)
+            .take()
+            .ok_or_else(|| LabError::Invalid {
+                lab: job.lab_id.clone(),
+                message: "snapshot handle missing".into(),
+            })?;
     tokio::task::spawn_blocking(move || {
         snap_for_commit.write_manifest(&final_manifest)?;
-        snap_for_commit.commit();
+        snap_for_commit.publish()?;
         Ok::<_, LabError>(())
     })
     .await
-    .map_err(|join_err| LabError::Task {
+    .map_err(|source| LabError::Task {
         lab: job.lab_id.clone(),
-        source: join_err,
+        source,
     })??;
+    let manifest_ms = u64::try_from(started_manifest.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Clean jail snapshot files on success as well
     if let Err(e) = clean_jail_files_for_vms(&job.vms).await {
@@ -624,6 +638,7 @@ async fn run_snapshot_steps(
         resume_ms,
         thaw_ms,
         total_ms,
+        freeze_to_thaw_ms,
     };
 
     tracing::info!(
@@ -642,6 +657,7 @@ async fn run_snapshot_steps(
         resume_ms,
         thaw_ms,
         total_ms,
+        freeze_to_thaw_ms,
         "lab snapshot completed"
     );
 
@@ -694,9 +710,9 @@ async fn settle<T>(
 /// 1. Freeze fabric
 /// 2. Pause all VMs
 /// 3. Snapshot each VM and clone disks by reflink
-/// 4. Write manifest
-/// 5. Resume all VMs
-/// 6. Thaw fabric
+/// 4. Resume all VMs
+/// 5. Thaw fabric
+/// 6. Hash captured files, write manifest and publish atomically
 ///
 /// The sequence runs in a task owned by `slot`: dropping this future does not cancel it, and
 /// on failure it resumes VMs, thaws the fabric and removes partial files before settling.

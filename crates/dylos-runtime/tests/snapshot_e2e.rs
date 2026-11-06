@@ -120,8 +120,9 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let verify_ms = verify_start.elapsed().as_millis();
 
     eprintln!(
-        "5-VM snapshot timing breakdown: total={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
+        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
         total_ms,
+        timings.freeze_to_thaw_ms,
         manifest.step_durations_ms.freeze,
         manifest.step_durations_ms.pause,
         timings.api_snapshot_ms,
@@ -132,6 +133,12 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         manifest.step_durations_ms.resume,
         manifest.step_durations_ms.thaw,
         verify_ms,
+    );
+
+    assert!(
+        timings.freeze_to_thaw_ms < 1000,
+        "5-VM freeze-to-thaw pause must be under 1s, got {}ms",
+        timings.freeze_to_thaw_ms
     );
 
     // LYZ-73 acceptance criterion 2: Manifest verification must be at least as fast as snapshot hashing.

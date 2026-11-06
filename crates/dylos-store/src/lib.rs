@@ -19,7 +19,7 @@ use dylos_core::manifest::{FileMeta, SnapshotManifest};
 use nix::{
     dir::Dir,
     errno::Errno,
-    fcntl::{OFlag, openat, renameat},
+    fcntl::{OFlag, RenameFlags, openat, renameat, renameat2},
     sys::stat::{Mode, SFlag, mkdirat},
     unistd::{UnlinkatFlags, unlinkat},
 };
@@ -190,6 +190,7 @@ pub struct Snapshot {
     lab_id: String,
     id: String,
     owned: bool,
+    publication_id: Option<String>,
 }
 
 /// Timings recorded during a VM disk clone operation.
@@ -316,6 +317,28 @@ impl Snapshot {
         node: &str,
         disk_name: &str,
     ) -> Result<(FileMeta, DiskCloneTimings), Error> {
+        self.clone_disk_impl(source_path, node, disk_name, true)
+    }
+
+    /// Captures a private disk reflink without hashing it; hash before publication.
+    /// # Errors
+    /// Returns an error if opening, syncing or reflinking fails.
+    pub fn capture_disk(
+        &self,
+        source_path: &Path,
+        node: &str,
+        disk_name: &str,
+    ) -> Result<(FileMeta, DiskCloneTimings), Error> {
+        self.clone_disk_impl(source_path, node, disk_name, false)
+    }
+
+    fn clone_disk_impl(
+        &self,
+        source_path: &Path,
+        node: &str,
+        disk_name: &str,
+        hash: bool,
+    ) -> Result<(FileMeta, DiskCloneTimings), Error> {
         valid_id(node)?;
         valid_file_name(disk_name)?;
         let _span = tracing::info_span!("clone_disk", node = %node, disk = %disk_name).entered();
@@ -369,8 +392,12 @@ impl Snapshot {
         let reflink_ms = u64::try_from(t_reflink.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         let t_hash = Instant::now();
-        let (sha256, size) = compute_file_sha256_and_size(&dest_file, u64::MAX)
-            .map_err(|e| contextual(&dest_path, e))?;
+        let (sha256, size) = if hash {
+            compute_file_sha256_and_size(&dest_file, u64::MAX)
+        } else {
+            dest_file.metadata().map(|meta| (String::new(), meta.len()))
+        }
+        .map_err(|e| contextual(&dest_path, e))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         tracing::debug!(
@@ -436,6 +463,28 @@ impl Snapshot {
         source: VmFileSource,
         node: &str,
         file_name: &str,
+    ) -> Result<(FileMeta, u64), Error> {
+        self.save_vm_source_impl(source, node, file_name, true)
+    }
+
+    /// Captures an isolated state or memory file without hashing it.
+    /// # Errors
+    /// Enforces the same source and size checks as `save_vm_source`.
+    pub fn capture_vm_source(
+        &self,
+        source: VmFileSource,
+        node: &str,
+        file_name: &str,
+    ) -> Result<(FileMeta, u64), Error> {
+        self.save_vm_source_impl(source, node, file_name, false)
+    }
+
+    fn save_vm_source_impl(
+        &self,
+        source: VmFileSource,
+        node: &str,
+        file_name: &str,
+        hash: bool,
     ) -> Result<(FileMeta, u64), Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
@@ -503,8 +552,18 @@ impl Snapshot {
 
         // A reflink clones the current length, so the bound is enforced here as well.
         let t_hash = Instant::now();
-        let (sha256, size) = compute_file_sha256_and_size(&dest_file, max_bytes)
-            .map_err(|e| contextual(&dest_path, fail(e)))?;
+        let (sha256, size) = if hash {
+            compute_file_sha256_and_size(&dest_file, max_bytes)
+        } else {
+            dest_file.metadata().and_then(|meta| {
+                if meta.len() > max_bytes {
+                    Err(io::ErrorKind::InvalidData.into())
+                } else {
+                    Ok((String::new(), meta.len()))
+                }
+            })
+        }
+        .map_err(|e| contextual(&dest_path, fail(e)))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
 
         if file_name == "vm.mem" {
@@ -526,6 +585,62 @@ impl Snapshot {
             },
             hash_ms,
         ))
+    }
+
+    /// Hashes a captured file using its captured size as an upper bound.
+    /// # Errors
+    /// Rejects missing files and changes in captured size.
+    pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
+        let opener = SnapshotOpener {
+            base: self
+                .directory
+                .try_clone()
+                .map_err(|e| contextual(&self.root, e))?,
+        };
+        let file = opener
+            .open(&meta.path)
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        let (sha256, size) = compute_file_sha256_and_size(&file, meta.size)
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        if size != meta.size {
+            return Err(contextual(
+                &self.root.join(&meta.path),
+                io::ErrorKind::InvalidData.into(),
+            ));
+        }
+        meta.sha256 = sha256;
+        Ok(())
+    }
+
+    /// Publishes a staged snapshot by an atomic, non-overwriting rename.
+    /// # Errors
+    /// Rejects a missing manifest or an existing publication destination.
+    pub fn publish(&mut self) -> Result<(), Error> {
+        let manifest = open(&self.directory, "manifest.json".as_ref(), OFlag::O_RDONLY)
+            .map_err(|e| contextual(&self.manifest_path(), e))?;
+        manifest
+            .sync_all()
+            .map_err(|e| contextual(&self.manifest_path(), e))?;
+        self.directory
+            .sync_all()
+            .map_err(|e| contextual(&self.root, e))?;
+        if let Some(id) = &self.publication_id {
+            renameat2(
+                &self.parent,
+                self.id.as_str(),
+                &self.parent,
+                id.as_str(),
+                RenameFlags::RENAME_NOREPLACE,
+            )
+            .map_err(|e| contextual(&self.root, e.into()))?;
+            self.id.clone_from(id);
+            self.root.set_file_name(id);
+        }
+        self.parent
+            .sync_all()
+            .map_err(|e| contextual(&self.root, e))?;
+        self.commit();
+        Ok(())
     }
 
     /// Writes the snapshot manifest to `manifest.json` atomically.
@@ -630,6 +745,12 @@ impl Store {
             .is_some_and(|name| name == id)
         {
             return Err(Error::InvalidId(id.into()));
+        }
+        if path
+            .file_name()
+            .is_some_and(|name| name.as_bytes().starts_with(b".staging-"))
+        {
+            return Err(contextual(path, io::ErrorKind::InvalidInput.into()));
         }
         let opener = SnapshotOpener::new(path).map_err(|e| contextual(path, e))?;
         let mut json = String::new();
@@ -864,8 +985,26 @@ impl Store {
     /// # Errors
     /// Rejects invalid ids, existing snapshots, symlinks.
     pub fn create_snapshot(&self, lab_id: &str, snapshot_id: &str) -> Result<Snapshot, Error> {
-        valid_id(lab_id)?;
         valid_id(snapshot_id)?;
+        self.create_snapshot_directory(lab_id, snapshot_id, None)
+    }
+
+    /// Creates an unpublished snapshot rejected by restore and fork.
+    /// # Errors
+    /// Rejects invalid ids or existing staging/publication directories.
+    pub fn stage_snapshot(&self, lab_id: &str, snapshot_id: &str) -> Result<Snapshot, Error> {
+        valid_id(snapshot_id)?;
+        let staging_id = format!(".staging-{snapshot_id}");
+        self.create_snapshot_directory(lab_id, &staging_id, Some(snapshot_id.into()))
+    }
+
+    fn create_snapshot_directory(
+        &self,
+        lab_id: &str,
+        snapshot_id: &str,
+        publication_id: Option<String>,
+    ) -> Result<Snapshot, Error> {
+        valid_id(lab_id)?;
         let snapshots_base = self.base.join("snapshots");
         let snapshots_parent =
             directory(&snapshots_base, true).map_err(|e| contextual(&snapshots_base, e))?;
@@ -880,6 +1019,13 @@ impl Store {
         };
 
         let root = self.snapshot_dir(lab_id, snapshot_id);
+        if let Some(id) = &publication_id {
+            match open(&lab_dir, id.as_ref(), dirs()) {
+                Ok(_) => return Err(contextual(&root, io::ErrorKind::AlreadyExists.into())),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(contextual(&root, e)),
+            }
+        }
 
         mkdirat(&lab_dir, snapshot_id, Mode::from_bits_truncate(0o700))
             .map_err(|e| contextual(&root, e.into()))?;
@@ -900,6 +1046,7 @@ impl Store {
             lab_id: lab_id.into(),
             id: snapshot_id.into(),
             owned: true,
+            publication_id,
         };
 
         if let Err(err) = make_directory(&snapshot.directory, "vms") {

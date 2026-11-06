@@ -510,3 +510,124 @@ fn shared_backing_must_be_orchestrator_owned_and_unwritable() {
         );
     }
 }
+
+#[test]
+fn deferred_hash_reads_isolated_capture_despite_source_writer() {
+    use std::io::{Seek, SeekFrom, Write};
+    let (temp, store, _spec) = setup();
+    let snapshot = store.stage_snapshot("lab", "snap").unwrap();
+    for name in ["vm.state", "vm.mem"] {
+        let source = temp.path().join(name);
+        fs::write(&source, b"captured").unwrap();
+        let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
+        let (mut meta, _) = snapshot
+            .capture_vm_source(VmFileSource::open(&source, 1024).unwrap(), "node1", name)
+            .unwrap();
+        assert_eq!(meta.sha256, "");
+        assert!(!source.exists());
+        writer.seek(SeekFrom::Start(0)).unwrap();
+        writer.write_all(b"modified").unwrap();
+        snapshot.hash_file(&mut meta).unwrap();
+        assert_eq!(
+            fs::read(snapshot.root().join(&meta.path)).unwrap(),
+            b"captured"
+        );
+        assert_eq!(meta.sha256.len(), 64);
+    }
+    let disk = temp.path().join("disk.ext4");
+    fs::write(&disk, b"disk capture").unwrap();
+    let mut writer = fs::OpenOptions::new().write(true).open(&disk).unwrap();
+    let (mut meta, _) = match snapshot.capture_disk(&disk, "node1", "rootfs.ext4") {
+        Ok(captured) => captured,
+        Err(dylos_store::Error::Reflink { source, .. })
+            if matches!(
+                source.raw_os_error(),
+                Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
+            ) =>
+        {
+            eprintln!("SKIP disk isolation: reflinks unavailable: {source}");
+            return;
+        }
+        Err(error) => panic!("disk capture failed: {error}"),
+    };
+    writer.write_all(b"disk changed").unwrap();
+    snapshot.hash_file(&mut meta).unwrap();
+    assert_eq!(
+        fs::read(snapshot.root().join(&meta.path)).unwrap(),
+        b"disk capture"
+    );
+}
+
+#[test]
+fn staging_with_manifest_cannot_restore_and_publication_is_atomic() {
+    let (_temp, store, spec) = setup();
+    let mut snapshot = store.stage_snapshot("lab", "snap").unwrap();
+    let staging = snapshot.root().to_owned();
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: spec,
+        vms: BTreeMap::new(),
+        firecracker_version: "1.17.0".into(),
+        host_cpu_model: "test".into(),
+        created_at_unix_ms: 0,
+        step_durations_ms: StepDurations {
+            freeze: 0,
+            pause: 0,
+            snapshot: 0,
+            resume: 0,
+            thaw: 0,
+        },
+    };
+    assert!(snapshot.publish().is_err());
+    snapshot.write_manifest(&manifest).unwrap();
+    let error = store.restore("clone", &staging).unwrap_err();
+    assert!(
+        matches!(error, dylos_store::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput)
+    );
+    assert!(!store.snapshot_dir("lab", "snap").exists());
+    snapshot.publish().unwrap();
+    assert!(!staging.exists());
+    assert!(
+        store
+            .snapshot_dir("lab", "snap")
+            .join("manifest.json")
+            .exists()
+    );
+    drop(snapshot);
+    assert!(store.snapshot_dir("lab", "snap").exists());
+}
+
+#[test]
+fn staged_publication_never_replaces_existing_snapshot() {
+    let (_temp, store, spec) = setup();
+    let mut staging = store.stage_snapshot("lab", "snap").unwrap();
+    let manifest = SnapshotManifest {
+        format_version: 1,
+        lab_spec: spec,
+        vms: BTreeMap::new(),
+        firecracker_version: "1.17.0".into(),
+        host_cpu_model: "test".into(),
+        created_at_unix_ms: 0,
+        step_durations_ms: StepDurations {
+            freeze: 0,
+            pause: 0,
+            snapshot: 0,
+            resume: 0,
+            thaw: 0,
+        },
+    };
+    staging.write_manifest(&manifest).unwrap();
+    let mut existing = store.create_snapshot("lab", "snap").unwrap();
+    existing.commit();
+    assert!(staging.publish().is_err());
+    let path = staging.root().to_owned();
+    drop(staging);
+    assert!(!path.exists());
+    assert!(store.snapshot_dir("lab", "snap").exists());
+    assert!(
+        !store
+            .snapshot_dir("lab", "snap")
+            .join("manifest.json")
+            .exists()
+    );
+}
