@@ -77,8 +77,8 @@ impl LabNetwork {
         })
         .instrument(span.clone())
         .await?;
-        let elapsed_ms = started.elapsed().as_millis();
-        span.in_scope(|| info!(elapsed_ms, "lab network created"));
+        let duration_ms = started.elapsed().as_millis();
+        span.in_scope(|| info!(duration_ms, "lab network created"));
         Ok(net)
     }
 
@@ -217,7 +217,7 @@ impl FabricThawHandle {
             });
             span.in_scope(|| {
                 info!(
-                    elapsed_us = started.elapsed().as_micros(),
+                    duration_ms = started.elapsed().as_secs_f64() * 1000.0,
                     success = result.is_ok(),
                     "fabric step completed"
                 );
@@ -256,7 +256,7 @@ async fn teardown_at(
     .await?;
     info!(
         lab = plan.lab_id(),
-        elapsed_ms = started.elapsed().as_millis(),
+        duration_ms = started.elapsed().as_millis(),
         "lab network removed"
     );
     Ok(())

@@ -50,7 +50,7 @@ pub async fn pause_all(lab_id: &str, vms: &[Vm]) -> Result<Duration, LabError> {
         tracing::info!(
             skew_us = skew.as_micros(),
             confirmed = vms.len(),
-            duration_us = started.elapsed().as_micros(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
             "lab pause confirmations"
         );
         Ok(skew)
@@ -72,7 +72,7 @@ pub async fn resume_all(lab_id: &str, vms: &[Vm]) -> Result<(), LabError> {
             }
         }
         tracing::info!(
-            duration_us = started.elapsed().as_micros(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
             "lab resume completed"
         );
         failure.map_or(Ok(()), Err)
@@ -92,7 +92,7 @@ async fn change(lab: &str, vm: &Vm, pause: bool) -> Result<(), LabError> {
         };
         tracing::info!(
             pause,
-            duration_us = started.elapsed().as_micros(),
+            duration_ms = started.elapsed().as_secs_f64() * 1000.0,
             success = result.is_ok(),
             "VM state change completed"
         );
@@ -102,7 +102,7 @@ async fn change(lab: &str, vm: &Vm, pause: bool) -> Result<(), LabError> {
             source: Box::new(source),
         })
     }
-    .instrument(tracing::info_span!("vm_state", vm = %vm.paths().id))
+    .instrument(tracing::info_span!("vm_state", lab = lab, vm = %vm.paths().id))
     .await
 }
 

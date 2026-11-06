@@ -182,6 +182,7 @@ impl Lab {
                 Ok(store.create(&id, &spec_copy)?)
             })
             .await?;
+            tracing::info!(duration_ms = started.elapsed().as_millis(), "storage ready");
             let mut lab = Self {
                 id: lab_id.into(),
                 store: config.store.clone(),
@@ -470,7 +471,12 @@ impl Lab {
             })
             .collect::<Result<_>>()?;
         let started = Instant::now();
-        let results = join_all(specs.iter().map(|vm| Vm::launch(&config.jailer, vm))).await;
+        let results = join_all(
+            specs
+                .iter()
+                .map(|vm| Vm::launch_with_lab(&config.jailer, vm, &self.id)),
+        )
+        .await;
         let mut failure = None;
         for result in results {
             match result {
@@ -503,6 +509,7 @@ impl Lab {
             duration_ms = started.elapsed().as_millis(),
             "all VMs configured"
         );
+        let started = Instant::now();
         complete(
             join_all(self.vms.iter().map(|vm| async {
                 vm.client()
@@ -516,6 +523,11 @@ impl Lab {
             }))
             .await,
         )?;
+        tracing::info!(
+            duration_ms = started.elapsed().as_millis(),
+            "all VM instances started"
+        );
+        let started = Instant::now();
         complete(
             join_all(self.vms.iter().map(|vm| async {
                 vm.wait_for_ready(config.boot_timeout)
@@ -525,8 +537,23 @@ impl Lab {
             }))
             .await,
         )?;
+        tracing::info!(
+            duration_ms = started.elapsed().as_millis(),
+            "all VMs boot ready"
+        );
+        let started = Instant::now();
         self.verify_readiness(spec).await?;
-        self.bind_control_socket().await
+        tracing::info!(
+            duration_ms = started.elapsed().as_millis(),
+            "lab readiness verified"
+        );
+        let started = Instant::now();
+        self.bind_control_socket().await?;
+        tracing::info!(
+            duration_ms = started.elapsed().as_millis(),
+            "control socket ready"
+        );
+        Ok(())
     }
 
     async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
@@ -962,10 +989,20 @@ impl Lab {
                 .await,
             )?;
             self.vms.clear();
+            tracing::info!(
+                duration_ms = started.elapsed().as_millis(),
+                "all VMs shut down"
+            );
+            let network_started = Instant::now();
             if let Some(net) = &mut self.network {
                 net.teardown().await?;
             }
             self.network = None;
+            tracing::info!(
+                duration_ms = network_started.elapsed().as_millis(),
+                "network teardown completed"
+            );
+            let storage_started = Instant::now();
             self.listener = None;
             if let Some(mut storage) = self.storage.take() {
                 let (storage_back, result) = tokio::task::spawn_blocking(move || {
@@ -982,6 +1019,10 @@ impl Lab {
                 self.storage = None;
             }
             self.lock = None;
+            tracing::info!(
+                duration_ms = storage_started.elapsed().as_millis(),
+                "storage teardown completed"
+            );
             tracing::info!(duration_ms = started.elapsed().as_millis(), "lab removed");
             Ok(())
         }
@@ -1453,7 +1494,7 @@ async fn configure_vm(
             source: Box::new(source),
         })
     }
-    .instrument(tracing::info_span!("vm_configure", vm = %node.name))
+    .instrument(tracing::info_span!("vm_configure", lab = id, vm = %node.name))
     .await
 }
 

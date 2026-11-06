@@ -873,6 +873,14 @@ impl Captured {
         (Self(lines), tracing::subscriber::set_default(subscriber))
     }
 
+    pub fn contains_fields(&self, message: &str, fields: &[&str]) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(message) && fields.iter().all(|field| line.contains(field)))
+    }
+
     pub fn contains(&self, needle: &str) -> bool {
         self.0.lock().unwrap().iter().any(|l| l.contains(needle))
     }
@@ -881,6 +889,26 @@ impl Captured {
 struct Recorder(Arc<Mutex<Vec<String>>>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorder {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        _: &tracing::span::Id,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        struct Visit(String);
+        impl tracing::field::Visit for Visit {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                write!(self.0, "{}={value} ", field.name()).unwrap();
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                write!(self.0, "{}={value:?} ", field.name()).unwrap();
+            }
+        }
+        let mut visit = Visit(format!("span={} ", attrs.metadata().name()));
+        attrs.record(&mut visit);
+        self.0.lock().unwrap().push(visit.0);
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         struct Visit(String);
         impl tracing::field::Visit for Visit {

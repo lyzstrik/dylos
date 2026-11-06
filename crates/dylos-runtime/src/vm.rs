@@ -96,6 +96,7 @@ enum Readiness {
 /// before that, the child gets SIGKILL from `kill_on_drop` and the jail's drop removes what it can
 /// synchronously; a cgroup whose process is not reaped yet stays behind.
 pub struct Vm {
+    lab: String,
     paths: JailPaths,
     node: String,
     client: FcClient,
@@ -137,6 +138,15 @@ impl Vm {
     /// [`Error::InvalidResources`], [`Error::ZeroMetricsPoll`], any [`Error`] from chroot
     /// preparation, [`Error::Spawn`], [`Error::ExitedDuringStart`] or [`Error::ReadyTimeout`].
     pub async fn launch(config: &JailerConfig, spec: &VmSpec) -> Result<Self> {
+        Self::launch_with_lab(config, spec, &spec.lab_id).await
+    }
+
+    // Lab orchestration uses an encoded jail identity; logs retain the logical lab id.
+    pub(crate) async fn launch_with_lab(
+        config: &JailerConfig,
+        spec: &VmSpec,
+        lab: &str,
+    ) -> Result<Self> {
         let paths = JailPaths::new(config, &spec.lab_id, &spec.node)?;
         if !validate_resources(u32::from(spec.vcpu_count), spec.mem_size_mib) {
             return Err(Error::InvalidResources {
@@ -149,7 +159,7 @@ impl Vm {
             return Err(Error::ZeroMetricsPoll { id: paths.id });
         }
         jailer::check_static_firecracker(&config.firecracker)?;
-        let span = tracing::info_span!("vm", lab = %spec.lab_id, node = %spec.node);
+        let span = tracing::info_span!("vm", lab = lab, node = %spec.node);
         async {
             let start = std::time::Instant::now();
             let mut jail = jailer::prepare_chroot(config, &paths, &spec.files).await?;
@@ -195,6 +205,7 @@ impl Vm {
                 boot_start,
                 child_stdin,
                 spec.node.clone(),
+                lab.to_owned(),
             );
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
@@ -218,6 +229,7 @@ impl Vm {
         boot_start: Instant,
         child_stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
         node: String,
+        lab: String,
     ) -> Self {
         let paths = jail.paths().clone();
         let pid = child.id();
@@ -272,6 +284,7 @@ impl Vm {
             client: FcClient::new(paths.api_socket()),
             paths,
             node,
+            lab,
             timeouts,
             signals,
             state,
@@ -695,7 +708,7 @@ impl Vm {
         if self.supervisor.is_none() {
             return Ok(());
         }
-        let span = tracing::info_span!("vm_shutdown", vm = %self.paths.id);
+        let span = tracing::info_span!("vm_shutdown", lab = %self.lab, vm = %self.paths.id);
         async {
             let start = std::time::Instant::now();
             self.expected_exit.store(true, Ordering::SeqCst);
