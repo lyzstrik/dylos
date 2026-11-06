@@ -144,7 +144,10 @@ impl Fleet {
         tracing::info!(labs = self.members.len(), "tearing down all labs");
         let timeout = self.timeout;
         let requests = join_all(self.members.iter().map(|(task, member)| async move {
-            (*task, Lab::request_teardown(&member.socket, timeout).await)
+            (
+                *task,
+                Lab::request_teardown(&member.id, &member.socket, timeout).await,
+            )
         }))
         .await;
         for (task, result) in requests {

@@ -137,10 +137,17 @@ async fn bring_up_configures_all_vms_and_socket_teardown_removes_everything() {
             assert!(requests.contains(&format!("tap-{}-{}", node.name, interface.name)));
         }
     }
-    assert!(Lab::teardown_by_name(&config, "lab").await.is_err());
+    let error = Lab::teardown_by_name(&config, "lab").await.unwrap_err();
+    assert!(matches!(
+        error,
+        LabError::Io { lab: ref id, operation: "lock lab directory", ref path, ref source }
+            if id == "lab"
+                && path == lab.root()
+                && source.kind() == std::io::ErrorKind::WouldBlock
+    ));
     assert!(Lab::up_with(&config, &spec, "lab").await.is_err());
     let server = tokio::spawn(lab.supervise());
-    Lab::request_teardown(&socket, Duration::from_secs(5))
+    Lab::request_teardown("lab", &socket, Duration::from_secs(5))
         .await
         .unwrap();
     server.await.unwrap().unwrap();
@@ -297,7 +304,7 @@ async fn invalid_control_request_does_not_stop_the_supervisor() {
     attacker.write_all(b"badinput\n").await.unwrap();
     assert_eq!(attacker.read(&mut [0; 1]).await.unwrap(), 0);
     assert!(config.store.base.join("lab").exists());
-    Lab::request_teardown(&socket, Duration::from_secs(5))
+    Lab::request_teardown("lab", &socket, Duration::from_secs(5))
         .await
         .unwrap();
     server.await.unwrap().unwrap();
@@ -433,7 +440,7 @@ async fn restore_loads_frozen_then_resumes_and_supervises() {
     }
     let socket = lab.control_socket();
     let server = tokio::spawn(lab.supervise());
-    Lab::request_teardown(&socket, Duration::from_secs(5))
+    Lab::request_teardown("lab", &socket, Duration::from_secs(5))
         .await
         .unwrap();
     server.await.unwrap().unwrap();
@@ -541,7 +548,7 @@ async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_la
         let socket = clone.control_socket();
         let clone_id = clone.id().to_string();
         let server = tokio::spawn(clone.supervise());
-        Lab::request_teardown(&socket, Duration::from_secs(5))
+        Lab::request_teardown(&clone_id, &socket, Duration::from_secs(5))
             .await
             .unwrap();
         server.await.unwrap().unwrap();
@@ -654,7 +661,7 @@ async fn fleet_recovers_failed_and_panicked_labs_and_keeps_the_others() {
     .await;
     assert!(config.store.base.join("f3").exists());
     // As `dylos lab down f3`: the run ends once the last lab is down.
-    Lab::request_teardown(&healthy_socket, Duration::from_secs(5))
+    Lab::request_teardown("f3", &healthy_socket, Duration::from_secs(5))
         .await
         .unwrap();
     let failures = run.await.unwrap().unwrap_err().0;

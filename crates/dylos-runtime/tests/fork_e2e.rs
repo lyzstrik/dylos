@@ -271,7 +271,7 @@ async fn agent_cpu_ticks(lab: &Lab, node: &str) -> u64 {
 async fn down(config: &LabConfig, lab: Lab) {
     let (id, socket) = (lab.id().to_owned(), lab.control_socket());
     let server = tokio::spawn(lab.supervise());
-    Lab::request_teardown(&socket, Duration::from_secs(30))
+    Lab::request_teardown(&id, &socket, Duration::from_secs(30))
         .await
         .unwrap();
     server.await.unwrap().unwrap();

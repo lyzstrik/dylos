@@ -23,9 +23,11 @@ use crate::{ProcessState, Timeouts, Vm, VmSpec};
 pub enum LabError {
     #[error("lab {lab}: {message}")]
     Invalid { lab: String, message: String },
-    #[error("lab {lab}: {source}")]
+    #[error("lab {lab}: {operation} {path:?}: {source}")]
     Io {
         lab: String,
+        operation: &'static str,
+        path: PathBuf,
         #[source]
         source: std::io::Error,
     },
@@ -419,7 +421,8 @@ impl Lab {
         restoring: bool,
     ) -> Result<()> {
         let root = self.root().to_owned();
-        self.lock = Some(blocking(&self.id, move || lock_directory(&root)).await?);
+        let id = self.id.clone();
+        self.lock = Some(blocking(&self.id, move || lock_directory(&id, &root)).await?);
         let netns_started = Instant::now();
         self.network = Some(create_network(config, plan, restoring).await?);
         let netns = config.netns_dir.join(format!("dylos-{}", self.id));
@@ -517,8 +520,7 @@ impl Lab {
     }
 
     async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
-        let listeners =
-            crate::agent::listeners(&self.vms, &config.jailer).map_err(|e| io(&self.id, e))?;
+        let listeners = crate::agent::listeners(&self.id, &self.vms, &config.jailer)?;
         self.load_restored().await?;
         crate::resume_all(&self.id, &self.vms).await?;
         crate::agent::resync_all(&self.vms, &listeners)
@@ -571,10 +573,13 @@ impl Lab {
                 limit: crate::jailer::MAX_UNIX_SOCKET_PATH,
             });
         }
-        self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
+        self.listener = Some(
+            UnixListener::bind(&socket)
+                .map_err(|e| io(&self.id, "bind control socket", &socket, e))?,
+        );
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .await
-            .map_err(|e| io(&self.id, e))?;
+            .map_err(|e| io(&self.id, "set control socket permissions", &socket, e))?;
         Ok(())
     }
 
@@ -794,7 +799,7 @@ impl Lab {
         blocking(&self.id, move || {
             let mut metrics = Vec::with_capacity(targets.len());
             for (node, pid) in targets {
-                let pss = read_pid_pss(pid).map_err(|e| io(&lab_id, e))?;
+                let pss = read_pid_pss(pid).map_err(|e| io(&lab_id, "read PSS", Path::new(&format!("/proc/{pid}/smaps_rollup")), e))?;
                 tracing::info!(lab = %lab_id, vm = %node, pid = %pid, pss_kib = %pss, "measured VM PSS");
                 metrics.push((node, pss));
             }
@@ -839,8 +844,8 @@ impl Lab {
                 tokio::select! {
                     _ = exits.next(), if has_vms => break Err(invalid(&self.id, "VM exited unexpectedly")),
                     accepted = listener.accept() => {
-                        let (mut stream, _) = accepted.map_err(|e| io(&self.id, e))?;
-                        let credentials = stream.peer_cred().map_err(|e| io(&self.id, e))?;
+                        let (mut stream, _) = accepted.map_err(|e| io(&self.id, "accept control connection", &self.control_socket(), e))?;
+                        let credentials = stream.peer_cred().map_err(|e| io(&self.id, "read peer credentials", &self.control_socket(), e))?;
                         if credentials.uid() != nix::unistd::geteuid().as_raw() { continue; }
                         let mut buf = Vec::new();
                         let mut byte = [0u8; 1];
@@ -916,11 +921,13 @@ impl Lab {
             self.listener = Some(listener);
             res
         }.instrument(span).await;
+        let socket = self.control_socket();
         let cleanup = self.teardown().await;
         match (result, cleanup) {
-            (Ok(mut stream), Ok(())) => {
-                stream.write_all(b"ok\n").await.map_err(|e| io(&self.id, e))
-            }
+            (Ok(mut stream), Ok(())) => stream
+                .write_all(b"ok\n")
+                .await
+                .map_err(|e| io(&self.id, "write teardown response", &socket, e)),
             (Err(operation), Err(cleanup)) => Err(LabError::Rollback {
                 operation: Box::new(operation),
                 cleanup: Box::new(cleanup),
@@ -1012,9 +1019,16 @@ fn read_pid_pss(pid: u32) -> std::io::Result<u64> {
         "Pss field not found in smaps_rollup",
     ))
 }
-fn io(lab: &str, source: std::io::Error) -> LabError {
+pub(crate) fn io(
+    lab: &str,
+    operation: &'static str,
+    path: &Path,
+    source: std::io::Error,
+) -> LabError {
     LabError::Io {
         lab: lab.into(),
+        operation,
+        path: path.into(),
         source,
     }
 }
@@ -1091,56 +1105,68 @@ fn open_directory(path: &Path, create: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn lock_directory(path: &Path) -> Result<Flock<File>> {
-    let lab = path.to_string_lossy();
-    let file = open_directory(path, false).map_err(|e| io(&lab, e))?;
-    let metadata = file.metadata().map_err(|e| io(&lab, e))?;
+fn lock_directory(lab: &str, path: &Path) -> Result<Flock<File>> {
+    let file = open_directory(path, false).map_err(|e| io(lab, "open lab directory", path, e))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| io(lab, "read lab directory metadata", path, e))?;
     if metadata.uid() != nix::unistd::geteuid().as_raw() || metadata.mode() & 0o077 != 0 {
         return Err(invalid(
-            &lab,
+            lab,
             "lab directory must be private and owned by the orchestrator",
         ));
     }
-    Flock::lock(file, FlockArg::LockExclusiveNonblock).map_err(|(_, e)| io(&lab, e.into()))
+    Flock::lock(file, FlockArg::LockExclusiveNonblock)
+        .map_err(|(_, e)| io(lab, "lock lab directory", path, e.into()))
 }
 
 impl Lab {
     /// Requests teardown and waits for confirmation that resources were removed.
     /// # Errors
     /// Connection, timeout or protocol failure. A timeout leaves the server outcome unknown.
-    pub async fn request_teardown(socket: &Path, timeout: Duration) -> Result<()> {
-        let id = socket.to_string_lossy();
+    pub async fn request_teardown(id: &str, socket: &Path, timeout: Duration) -> Result<()> {
         tokio::time::timeout(timeout, async {
-            let mut stream = UnixStream::connect(socket).await.map_err(|e| io(&id, e))?;
+            let mut stream = UnixStream::connect(socket)
+                .await
+                .map_err(|e| io(id, "connect control socket", socket, e))?;
             stream
                 .write_all(b"teardown\n")
                 .await
-                .map_err(|e| io(&id, e))?;
+                .map_err(|e| io(id, "write control request", socket, e))?;
             let mut reply = [0; 3];
             stream
                 .read_exact(&mut reply)
                 .await
-                .map_err(|e| io(&id, e))?;
+                .map_err(|e| io(id, "read control response", socket, e))?;
             if &reply != b"ok\n" {
-                return Err(invalid(&id, "invalid teardown response"));
+                return Err(invalid(id, "invalid teardown response"));
             }
             Ok(())
         })
         .await
-        .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
+        .map_err(|_| {
+            io(
+                id,
+                "wait for control response",
+                socket,
+                std::io::ErrorKind::TimedOut.into(),
+            )
+        })?
     }
 
     /// Requests a snapshot over the control socket.
     /// # Errors
     /// Connection, timeout or protocol failure. A timeout leaves the server outcome unknown.
     pub async fn request_snapshot(
+        id: &str,
         socket: &Path,
         snapshot_id: Option<&str>,
         timeout: Duration,
     ) -> Result<String> {
-        let id = socket.to_string_lossy();
         tokio::time::timeout(timeout, async {
-            let mut stream = UnixStream::connect(socket).await.map_err(|e| io(&id, e))?;
+            let mut stream = UnixStream::connect(socket)
+                .await
+                .map_err(|e| io(id, "connect control socket", socket, e))?;
             let cmd = match snapshot_id {
                 Some(snap) => format!("snapshot {snap}\n"),
                 None => "snapshot\n".to_string(),
@@ -1148,17 +1174,20 @@ impl Lab {
             stream
                 .write_all(cmd.as_bytes())
                 .await
-                .map_err(|e| io(&id, e))?;
+                .map_err(|e| io(id, "write control request", socket, e))?;
             let mut reply_buf = Vec::new();
             let mut byte = [0u8; 1];
             loop {
-                let n = stream.read(&mut byte).await.map_err(|e| io(&id, e))?;
+                let n = stream
+                    .read(&mut byte)
+                    .await
+                    .map_err(|e| io(id, "read control response", socket, e))?;
                 if n == 0 || byte[0] == b'\n' {
                     break;
                 }
                 reply_buf.push(byte[0]);
                 if reply_buf.len() > 1024 {
-                    return Err(invalid(&id, "response too long"));
+                    return Err(invalid(id, "response too long"));
                 }
             }
             let reply = String::from_utf8_lossy(&reply_buf);
@@ -1172,13 +1201,20 @@ impl Lab {
                 };
                 Ok(actual_id)
             } else if let Some(err_msg) = trimmed.strip_prefix("err ") {
-                Err(invalid(&id, err_msg.trim()))
+                Err(invalid(id, err_msg.trim()))
             } else {
-                Err(invalid(&id, &format!("invalid snapshot response: {reply}")))
+                Err(invalid(id, &format!("invalid snapshot response: {reply}")))
             }
         })
         .await
-        .map_err(|_| io(&id, std::io::ErrorKind::TimedOut.into()))?
+        .map_err(|_| {
+            io(
+                id,
+                "wait for control response",
+                socket,
+                std::io::ErrorKind::TimedOut.into(),
+            )
+        })?
     }
 
     /// [`Self::teardown_by_name`] once the previous owner has released the lab lock: a joined
@@ -1218,7 +1254,7 @@ impl Lab {
         let root = config.store.base.join(id);
         let (root_copy, id_copy) = (root.clone(), id.to_owned());
         let recovered = blocking(id, move || {
-            let lock = match lock_directory(&root_copy) {
+            let lock = match lock_directory(&id_copy, &root_copy) {
                 Err(LabError::Io { source, .. })
                     if source.kind() == std::io::ErrorKind::NotFound =>
                 {
@@ -1234,15 +1270,33 @@ impl Lab {
             ) {
                 Ok(file) => File::from(file),
                 Err(nix::errno::Errno::ENOENT) => return Ok(Some((lock, None))),
-                Err(error) => return Err(io(&id_copy, error.into())),
+                Err(error) => {
+                    return Err(io(
+                        &id_copy,
+                        "open lab state",
+                        &root_copy.join("state.json"),
+                        error.into(),
+                    ));
+                }
             };
-            if !file.metadata().map_err(|e| io(&id_copy, e))?.is_file() {
+            if !file
+                .metadata()
+                .map_err(|e| {
+                    io(
+                        &id_copy,
+                        "read lab state metadata",
+                        &root_copy.join("state.json"),
+                        e,
+                    )
+                })?
+                .is_file()
+            {
                 return Err(invalid(&id_copy, "state is not a regular file"));
             }
             let mut bytes = Vec::new();
             file.take(1024 * 1024 + 1)
                 .read_to_end(&mut bytes)
-                .map_err(|e| io(&id_copy, e))?;
+                .map_err(|e| io(&id_copy, "read lab state", &root_copy.join("state.json"), e))?;
             if bytes.len() > 1024 * 1024 {
                 return Err(invalid(&id_copy, "state exceeds 1 MiB"));
             }
@@ -1277,7 +1331,7 @@ impl Lab {
 fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
     let dir = match open_directory(path, false) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        result => result.map_err(|e| io(id, e))?,
+        result => result.map_err(|e| io(id, "open cgroup directory", path, e))?,
     };
     let open = |name: &str, flags| {
         openat(
@@ -1287,7 +1341,7 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
             Mode::empty(),
         )
         .map(File::from)
-        .map_err(|e| io(id, e.into()))
+        .map_err(|e| io(id, "open cgroup file", &path.join(name), e.into()))
     };
     let events = || {
         let mut text = String::new();
@@ -1302,7 +1356,7 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
                 result?
                     .take(4096)
                     .read_to_string(&mut text)
-                    .map_err(|e| io(id, e))?;
+                    .map_err(|e| io(id, "read cgroup events", &path.join("cgroup.events"), e))?;
             }
         }
         if text.lines().any(|line| line == "populated 0") {
@@ -1316,7 +1370,7 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
     if events()? {
         open("cgroup.kill", OFlag::O_WRONLY)?
             .write_all(b"1")
-            .map_err(|e| io(id, e))?;
+            .map_err(|e| io(id, "write cgroup kill", &path.join("cgroup.kill"), e))?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while events()? {
             if Instant::now() >= deadline {
@@ -1429,9 +1483,14 @@ async fn create_network(config: &LabConfig, plan: FabricPlan, frozen: bool) -> R
     let netns_dir = config.netns_dir.clone();
     let lab_id = plan.lab_id().to_owned();
     blocking(plan.lab_id(), move || {
-        open_directory(&netns_dir, true)
-            .map(|_| ())
-            .map_err(|e| io(&lab_id, e))
+        open_directory(&netns_dir, true).map(|_| ()).map_err(|e| {
+            io(
+                &lab_id,
+                "open or create network namespace directory",
+                &netns_dir,
+                e,
+            )
+        })
     })
     .await?;
     let network = if frozen {
