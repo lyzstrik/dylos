@@ -29,8 +29,10 @@ pub struct Backoff {
 impl Default for Backoff {
     fn default() -> Self {
         Self {
-            initial: Duration::from_millis(100),
-            max: Duration::from_secs(5),
+            // Retry sleeps are captured in snapshots; keep the worst-case restore
+            // delay short even when the source has never had a host listener.
+            initial: Duration::from_millis(20),
+            max: Duration::from_millis(20),
         }
     }
 }
