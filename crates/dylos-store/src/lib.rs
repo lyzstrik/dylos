@@ -1339,9 +1339,18 @@ impl SnapshotOpener {
             };
 
             if fd >= 0 {
-                let fd_i32 = i32::try_from(fd)
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::Other))?;
-                // SAFETY: We exclusively own this new descriptor.
+                let Ok(fd_i32) = i32::try_from(fd) else {
+                    // SAFETY: fd comes from a successful openat2 syscall and is
+                    // exclusively owned here. Pass it unchanged to close before
+                    // returning; no File has taken ownership of it.
+                    if unsafe { libc::syscall(libc::SYS_close, fd) } < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    return Err(io::ErrorKind::Other.into());
+                };
+                // SAFETY: A successful openat2 returns a valid, newly opened descriptor
+                // that we exclusively own. The conversion preserves its value, and
+                // File takes ownership exactly once.
                 let file = unsafe { std::fs::File::from_raw_fd(fd_i32) };
                 return regular_snapshot_file(file);
             }
