@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use dylos_runtime::Error;
 use dylos_runtime::jailer::{
@@ -53,7 +53,8 @@ fn ids_the_jailer_rejects_are_refused() {
             "{lab}-{node}: {err}"
         );
     }
-    assert!(JailPaths::new(&config(), "l", &"n".repeat(62)).is_ok());
+    let max_id_config = JailerConfig::new("/j", 1234, 5678);
+    assert!(JailPaths::new(&max_id_config, "l", &"n".repeat(62)).is_ok());
 }
 
 #[test]
@@ -534,4 +535,22 @@ async fn read_only_file_is_shared_unchanged_and_writable_source_is_refused() {
     assert_eq!(after.uid(), before.uid());
     jail.release().await.unwrap();
     remove_jail(&paths).await.unwrap();
+}
+
+#[test]
+fn jail_paths_rejects_api_socket_exceeding_sun_len() {
+    let long_base = PathBuf::from("/tmp").join("a".repeat(80));
+    let config = JailerConfig::new(long_base, 65534, 65534);
+    let err = JailPaths::new(&config, "lab-id", "node-a").unwrap_err();
+    let Error::SocketPathTooLong { path, len, limit } = &err else {
+        unreachable!("expected SocketPathTooLong, got {err:?}");
+    };
+    assert_eq!(*limit, dylos_runtime::MAX_UNIX_SOCKET_PATH);
+    assert_eq!(*len, path.as_os_str().len());
+    assert!(*len > *limit, "expected len {len} > limit {limit}");
+    assert!(path.ends_with("run/firecracker.socket"));
+    let msg = err.to_string();
+    assert!(msg.contains(&len.to_string()), "{msg}");
+    assert!(msg.contains(&limit.to_string()), "{msg}");
+    assert!(msg.contains(path.to_str().unwrap()), "{msg}");
 }

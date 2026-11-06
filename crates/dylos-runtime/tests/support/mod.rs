@@ -65,10 +65,7 @@ impl Sandbox {
     }
 
     pub fn in_target(mode: Mode) -> Self {
-        Self::with_dir(
-            mode,
-            tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
-        )
+        Self::new(mode)
     }
 
     fn with_dir(mode: Mode, dir: tempfile::TempDir) -> Self {
