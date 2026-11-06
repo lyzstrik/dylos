@@ -17,17 +17,16 @@ allow = [
     "Zlib",
 ]
 
-# NCSA is permissive and OSI-approved; libfuzzer-sys is fuzz-only, never shipped.
-[[licenses.exceptions]]
-allow = ["NCSA"]
-crate = "libfuzzer-sys"
-
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+skip = [
+    { crate = "nix@0.30.1", reason = "transitive dependency of rtnetlink 0.23.0" },
+    { crate = "syn@2.0.119", reason = "transitive dependency of tracing-attributes 0.1.31 and zerocopy-derive 0.8.63" },
+]
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []

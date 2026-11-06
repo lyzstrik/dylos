@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod support;
-use support::Captured;
+use support::{Captured, test_tempdir};
 
 const NOBODY: u32 = 65534;
 
@@ -48,7 +48,7 @@ async fn vm_boots_and_reaches_readiness() {
         return;
     }
 
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let bin = binaries_dir().unwrap();
     let mut config = JailerConfig::new(dir.path(), NOBODY, NOBODY);
     config.jailer = bin.join("jailer");

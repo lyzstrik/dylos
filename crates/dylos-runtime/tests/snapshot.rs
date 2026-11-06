@@ -182,7 +182,10 @@ async fn up_lab(sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfig, Lab)> {
     };
     match Lab::up_with(&config, &test_spec(), lab_id).await {
         Ok(lab) => Some((config, lab)),
-        Err(LabError::Store(dylos_store::Error::Reflink { source, .. })) => {
+        Err(LabError::Store(
+            dylos_store::Error::Reflink { source, .. }
+            | dylos_store::Error::ReflinkPreflight { source, .. },
+        )) => {
             eprintln!("SKIPPED {lab_id}: reflinks unavailable: {source}");
             None
         }
@@ -490,7 +493,7 @@ async fn snapshot_fails_at_manifest_write_cleans_up_and_resumes() {
     .await;
 
     // At this point, store.create_snapshot has run and created the directory!
-    let snap_dir = store.snapshot_dir("lfm", "snap-err");
+    let snap_dir = store.snapshot_dir("lfm", ".staging-snap-err");
     assert!(
         snap_dir.exists(),
         "snapshot dir must exist prior to manifest write"
@@ -612,7 +615,7 @@ async fn snapshot_fails_at_cleanup_propagates_rollback_error() {
     .await;
 
     // While stall-snapshot is held, create an undeletable directory inside snap_dir
-    let snap_dir = store.snapshot_dir("lcl", "snap-clean-err");
+    let snap_dir = store.snapshot_dir("lcl", ".staging-snap-clean-err");
     let locked_dir = snap_dir.join("locked_subdir");
     fs::create_dir_all(&locked_dir).unwrap();
     fs::write(locked_dir.join("file.txt"), b"cannot delete").unwrap();
@@ -756,7 +759,7 @@ async fn snapshot_in_flight_cancellation_during_resume_still_commits() {
     let vm0_root = lab.vms[0].paths().root.clone();
     fs::write(vm0_root.join("stall-resume"), b"").unwrap();
 
-    // Storage and the manifest write precede resume, so the caller is cancelled after them.
+    // Capture precedes resume; cancellation must not prevent hashing and publication.
     tokio::select! {
         _ = lab.snapshot("snap-cancel-resume") => {}
         () = async {
@@ -1496,4 +1499,37 @@ fn e2fsck_parser_rejects_mismatch_after_summary() {
         include_str!("fixtures/e2fsck/mismatch_after_summary.txt"),
         "outside pass 5",
     );
+}
+
+#[tokio::test]
+async fn hashing_failure_after_resume_removes_unpublished_staging() {
+    let (sandbox, store, _spec, lab) = setup_lab("lh").await;
+    let root = lab.vms[0].paths().root.clone();
+    fs::write(root.join("stall-resume"), b"").unwrap();
+    let task = tokio::spawn(async move {
+        let result = lab.snapshot("snap").await;
+        (result, lab)
+    });
+    wait_until("resume started", Duration::from_secs(5), || {
+        root.join("resume-started").exists()
+    })
+    .await;
+    let staging = store.snapshot_dir("lh", ".staging-snap");
+    assert!(staging.exists());
+    assert!(!staging.join("manifest.json").exists());
+    assert!(!store.snapshot_dir("lh", "snap").exists());
+    // Capture finished, but hashing must still be pending at the resume barrier.
+    fs::remove_file(staging.join("vms/A/vm.state")).unwrap();
+    fs::remove_file(root.join("stall-resume")).unwrap();
+    let (result, mut lab) = task.await.unwrap();
+    assert!(result.is_err());
+    assert!(!staging.exists());
+    assert!(!store.snapshot_dir("lh", "snap").exists());
+    for vm in &lab.vms {
+        assert!(!vm.paths().root.join("is-paused").exists());
+        assert!(!vm.paths().root.join("snap.state").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
+    }
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
 }

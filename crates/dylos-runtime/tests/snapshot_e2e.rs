@@ -14,7 +14,7 @@ use futures_util::future::join_all;
 
 mod support;
 
-use support::{StaleSummaryCounters, verify_e2fsck_readonly_output};
+use support::{StaleSummaryCounters, test_tempdir, verify_e2fsck_readonly_output};
 
 fn check_prerequisites() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -52,8 +52,8 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let Some((_workspace, bin, kernel, image)) = check_prerequisites() else {
         return;
     };
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
     let store_base = dir.path().join("labs");
@@ -120,8 +120,9 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let verify_ms = verify_start.elapsed().as_millis();
 
     eprintln!(
-        "5-VM snapshot timing breakdown: total={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
+        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
         total_ms,
+        timings.freeze_to_thaw_ms,
         manifest.step_durations_ms.freeze,
         manifest.step_durations_ms.pause,
         timings.api_snapshot_ms,
@@ -132,6 +133,18 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         manifest.step_durations_ms.resume,
         manifest.step_durations_ms.thaw,
         verify_ms,
+    );
+
+    // Firecracker memory snapshot I/O depends on the runner's disk. Bound only the
+    // remaining paused work (freeze, pause, fsync, reflink, resume, thaw), allowing
+    // 500 ms for that work and scheduling jitter; hashing must run after thaw.
+    let pause_margin_ms = 500;
+    assert!(
+        timings.freeze_to_thaw_ms <= timings.api_snapshot_ms.saturating_add(pause_margin_ms),
+        "5-VM freeze-to-thaw pause ({}ms) exceeded API snapshot ({}ms) + {pause_margin_ms}ms margin; hashing={}ms",
+        timings.freeze_to_thaw_ms,
+        timings.api_snapshot_ms,
+        timings.hash_ms,
     );
 
     // LYZ-73 acceptance criterion 2: Manifest verification must be at least as fast as snapshot hashing.
@@ -155,8 +168,8 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
     let Some((_workspace, bin, kernel, image)) = check_prerequisites() else {
         return;
     };
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
     let store_base = dir.path().join("labs");
@@ -402,7 +415,7 @@ fn recorded_allocation_cycles(disk: &Path) -> u64 {
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn default_store_and_jail_paths_support_up_and_snapshot() {
     if std::env::var_os("DYLOS_DEFAULT_PATHS_HELPER").is_none() {
-        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let dir = test_tempdir();
         let status = tokio::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
@@ -435,9 +448,7 @@ async fn default_store_and_jail_paths_support_up_and_snapshot() {
         ..LabConfig::default()
     };
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
-    let mut lab = Lab::up_with(&config, &spec, "default-paths-e2e")
-        .await
-        .unwrap();
+    let mut lab = Lab::up_with(&config, &spec, "def-e2e").await.unwrap();
     let result = lab.snapshot("defaults").await;
     lab.teardown().await.unwrap();
     assert!(result.is_ok(), "{result:?}");

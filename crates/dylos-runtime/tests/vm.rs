@@ -684,16 +684,29 @@ async fn exec_concurrent_calls_serialize_correctly() {
 async fn exec_deadline_covers_mutex_acquisition() {
     let sandbox = Sandbox::new(Mode::Echo);
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
-    // Launch a command that holds the console lock for 1 second.
-    let slow = vm.exec("sleep 1", Duration::from_secs(2));
+    let gate_marker = sandbox.dir.path().join("exec-gate");
+    let lock_marker = sandbox.dir.path().join("exec-lock-acquired");
+    let release_marker = sandbox.dir.path().join("exec-release");
+
+    // Gate completion of the first command until released by the test.
+    std::fs::write(&gate_marker, b"1").unwrap();
+    let slow = vm.exec("echo slow", Duration::from_secs(10));
     let blocked = async {
-        // Yield so slow starts and acquires the stdin lock.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait until slow has acquired the stdin lock and entered the responder gate.
+        support::wait_until("slow exec acquired lock", Duration::from_secs(5), || {
+            lock_marker.exists()
+        })
+        .await;
         // Attempt a second exec with a short timeout (50ms); it must time out while waiting for the lock.
-        vm.exec("echo blocked", Duration::from_millis(50)).await
+        let contender_res = vm.exec("echo blocked", Duration::from_millis(50)).await;
+        // Release the first command now that the contender has timed out.
+        std::fs::write(&release_marker, b"1").unwrap();
+        contender_res
     };
     let (res_slow, res_blocked) = tokio::join!(slow, blocked);
-    assert!(res_slow.is_ok());
+    let slow_output = res_slow.unwrap();
+    assert_eq!(slow_output.exit_code, 0);
+    assert_eq!(slow_output.stdout.trim(), "slow");
     assert!(
         matches!(res_blocked, Err(Error::ExecTimeout { timeout, .. }) if timeout == Duration::from_millis(50)),
         "Expected timeout while waiting for lock, got: {res_blocked:?}"

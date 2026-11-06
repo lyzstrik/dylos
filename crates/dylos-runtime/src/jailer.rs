@@ -16,6 +16,30 @@ use crate::error::{Error, Result};
 pub const API_SOCKET: &str = "/run/firecracker.socket";
 pub const METRICS_FILE: &str = "/run/metrics.json";
 
+/// Size of `sockaddr_un.sun_path` on Linux, including the trailing NUL terminator.
+pub const SUN_PATH_LEN: usize = 108;
+
+/// Maximum length of a Unix domain socket path in bytes, excluding the trailing NUL byte.
+///
+/// `sockaddr_un.sun_path` is 108 bytes on Linux, so a null-terminated pathname
+/// must be at most 107 bytes.
+pub const MAX_UNIX_SOCKET_PATH: usize = SUN_PATH_LEN - 1;
+
+/// Validates that a Unix domain socket path does not exceed [`MAX_UNIX_SOCKET_PATH`].
+///
+/// # Errors
+///
+/// Returns `Err(len)` with the byte length of `path` if it exceeds [`MAX_UNIX_SOCKET_PATH`].
+pub fn validate_unix_socket_path(path: &Path) -> std::result::Result<(), usize> {
+    use std::os::unix::ffi::OsStrExt;
+    let len = path.as_os_str().as_bytes().len();
+    if len > MAX_UNIX_SOCKET_PATH {
+        Err(len)
+    } else {
+        Ok(())
+    }
+}
+
 /// How to start the jailer. Shared by every VM of a host.
 #[derive(Debug, Clone)]
 pub struct JailerConfig {
@@ -132,6 +156,7 @@ impl JailPaths {
     /// # Errors
     ///
     /// [`Error::InvalidJailId`] if the derived id is not accepted by the jailer.
+    /// [`Error::SocketPathTooLong`] if the derived API socket path exceeds [`MAX_UNIX_SOCKET_PATH`].
     pub fn new(config: &JailerConfig, lab_id: &str, node: &str) -> Result<Self> {
         let id = format!("{lab_id}-{node}");
         if id.len() > 64 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
@@ -146,12 +171,21 @@ impl JailPaths {
             .parent_cgroup
             .as_deref()
             .map_or(exec_name, AsRef::as_ref);
-        Ok(Self {
+        let paths = Self {
             root: jail_dir.join("root"),
             cgroup_dir: config.cgroup_root.join(parent_cgroup).join(&id),
             jail_dir,
             id,
-        })
+        };
+        let api_socket = paths.api_socket();
+        if let Err(len) = validate_unix_socket_path(&api_socket) {
+            return Err(Error::SocketPathTooLong {
+                path: api_socket,
+                len,
+                limit: MAX_UNIX_SOCKET_PATH,
+            });
+        }
+        Ok(paths)
     }
 
     #[must_use]

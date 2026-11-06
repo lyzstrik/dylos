@@ -9,6 +9,9 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig};
 use serde_json::Value;
 
+mod support;
+use support::test_tempdir;
+
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn guest(lab: &Lab, node: &str, command: &str) -> String {
@@ -80,7 +83,7 @@ async fn wait_for_rx(lab: &Lab, before: u64) {
             if guest_rx(lab).await[3] > before + 100 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -232,6 +235,28 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     guest(lab, "A", "kill -0 $(cat /tmp/freeze-iperf.pid)").await;
     guest(lab, "A", "kill $(cat /tmp/freeze-iperf.pid)").await;
     guest(lab, "C", "kill $(cat /tmp/freeze-socat.pid)").await;
+    // A dual-stack IPv6 socket also owns the IPv4 port until exit closes it.
+    // A successful kill only queues the signal; wait before starting the next family.
+    tokio::time::timeout(COMMAND_TIMEOUT, async {
+        let mut poll = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            poll.tick().await;
+            if lab
+                .exec(
+                    "C",
+                    "awk '$2 ~ /:D7D6$/ {busy=1} END {exit busy}' /proc/net/udp /proc/net/udp6",
+                    COMMAND_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("UDP marker port 55254 was not released after receiver termination");
     guest(lab, "C", "pkill iperf3").await;
     eprintln!(
         "{family}: unchanged TAP/guest RX during 2 s hold and receiver pause; original TCP flow resumed"
@@ -267,8 +292,8 @@ async fn abc_fabric_freeze_under_real_traffic() {
             return;
         }
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     // Keep expected TAP-down errors separate from serial command sentinels.
     jailer.jailer = PathBuf::from("/bin/sh");
     jailer.launcher_args = vec![

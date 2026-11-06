@@ -38,10 +38,14 @@ Lab snapshot sequence (each step completes for all VMs before the next starts; s
 
 1. Freeze the fabric: after completion T, no frame sent after T is received by a lab VM before thaw; pre-T queued frames may still be received. For the spike this is one operation per host-side TAP; later, one write to an eBPF map.
 2. Pause all VMs (`PATCH /vm` with `Paused`).
-3. Snapshot each VM (`PUT /snapshot/create`, full snapshot) and clone its disks by reflink.
-4. Write the lab manifest.
-5. Resume all VMs (`PATCH /vm` with `Resumed`).
-6. Thaw the fabric.
+3. Snapshot each VM (`PUT /snapshot/create`, full snapshot) into an isolated staging directory: capture state and memory, fsync source disks and clone them by reflink. Complete capture for every VM before resuming any VM.
+4. Resume all VMs (`PATCH /vm` with `Resumed`).
+5. Thaw the fabric.
+6. Hash all captured files and write the lab manifest in staging. Publish only after all hashes and the manifest are complete, by atomically renaming staging to the final snapshot directory. The snapshot command returns only after publication.
+
+**Revision (2026-11-05):** Hashing follows thaw to shorten the pause. Firecracker finishes writing and closes state and memory output before acknowledging capture; the store additionally reflinks (or copies) them into distinct destination inodes and unlinks the jail outputs. Captured disks are reflink copies, isolated from writes through the running VMs' disk handles. Resumed VMs therefore cannot modify the captured files during hashing. Hashing does not alter the logical cut.
+
+Staging directories are unpublished: restore and fork reject them even if a manifest is already present. Any failure before publication removes staging and recovers paused VMs and the frozen fabric in that order. A failed hash never publishes a snapshot; no partial snapshot may be restored or forked.
 
 Restore sequence: create the namespace and the fabric already frozen, load each VM (`PUT /snapshot/load` without resuming), resume all VMs, then thaw.
 

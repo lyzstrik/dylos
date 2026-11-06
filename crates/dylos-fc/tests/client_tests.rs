@@ -385,7 +385,12 @@ async fn test_client_connection_cleanup() -> TestResult {
             } else {
                 b"{\"partial\":".to_vec()
             })?;
-            let client = FcClient::new(&sock).with_timeout(Duration::from_millis(50));
+            let timeout = if oversized {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(100)
+            };
+            let client = FcClient::new(&sock).with_timeout(timeout);
             let request =
                 tokio::spawn(
                     async move { client.get::<serde_json::Value>("/machine-config").await },

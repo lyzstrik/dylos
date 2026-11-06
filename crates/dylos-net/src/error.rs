@@ -3,7 +3,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("invalid lab id {0:?}: expected 1 to 64 ASCII letters, digits, '-' or '_'")]
+    #[error(
+        "invalid lab id {0:?}: expected 1 to 32 ASCII letters, digits or '-', starting with a letter or digit"
+    )]
     InvalidLabId(String),
 
     #[error("{source_desc}: derived interface name {ifname:?} {reason}")]

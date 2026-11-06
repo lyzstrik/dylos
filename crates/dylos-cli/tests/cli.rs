@@ -21,7 +21,9 @@ fn until<T>(mut condition: impl FnMut() -> Option<T>) -> T {
             return value;
         }
         assert!(Instant::now() < deadline, "condition timed out");
-        std::thread::yield_now();
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 

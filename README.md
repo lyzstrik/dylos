@@ -1,6 +1,8 @@
 # Dylos
 
 [![CI](https://github.com/lyzstrik/dylos/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lyzstrik/dylos/actions/workflows/ci.yml)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/15522/badge)](https://www.bestpractices.dev/projects/15522)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/lyzstrik/dylos/badge)](https://scorecard.dev/viewer/?uri=github.com/lyzstrik/dylos)
 
 Dylos is an engine for realistic multi-machine environments whose goal is consistent snapshot, fork, and transparent clone resumption.
 It aims to run networks of [Firecracker](https://github.com/firecracker-microvm/firecracker) microVMs, freeze them at a single logical instant, and clone them N times so that every clone resumes as if nothing had happened.
@@ -50,6 +52,8 @@ Check the host with:
 ```bash
 just host-check
 ```
+
+See [`docs/cli.md`](docs/cli.md) for the CLI reference and LabSpec format.
 
 ## Getting started
 
