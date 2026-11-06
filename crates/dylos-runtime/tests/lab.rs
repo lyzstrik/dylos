@@ -765,11 +765,22 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
             "f2" => std::io::ErrorKind::NotFound,
             other => panic!("unexpected failure of {other}"),
         };
-        assert_eq!(failure.errors.len(), 1, "{failure}");
+        let expected_count = match failure.lab.as_str() {
+            // f2 is allowed bounded completion; because it never stops, it times out at the deadline.
+            "f2" => 2,
+            _ => 1,
+        };
+        assert_eq!(failure.errors.len(), expected_count, "{failure}");
         assert!(
             matches!(&failure.errors[0], LabError::Io { source, .. } if source.kind() == kind),
             "{failure}"
         );
+        if failure.lab == "f2" {
+            assert!(
+                matches!(&failure.errors[1], LabError::Invalid { message, .. } if message.contains("supervisor did not stop")),
+                "{failure}"
+            );
+        }
     }
     assert_lab_removed(&sandbox, &config, &["f1", "f2", "f3"]);
 }
@@ -874,37 +885,79 @@ async fn fleet_signal_teardown_keeps_supervisor_failure_as_main_error_after_unex
     assert_lab_removed(&sandbox, &config, &["f1", "h1"]);
 }
 
-#[tokio::test]
-async fn fleet_signal_teardown_during_supervisor_cleanup_preserves_failure_as_main_error() {
+async fn assert_signal_teardown_preserves_supervisor_failure_during_cleanup(remove_socket: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("control.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let f1_socket = dir.path().join("f1.sock");
+    let sync_socket = dir.path().join("sync.sock");
+
+    let f1_listener = tokio::net::UnixListener::bind(&f1_socket).unwrap();
+    let sync_listener = tokio::net::UnixListener::bind(&sync_socket).unwrap();
+
     let mut config = LabConfig::default();
     config.store.base = dir.path().to_path_buf();
     let mut fleet = Fleet::new(&config, Duration::from_secs(5));
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let (cleanup_done_tx, cleanup_done_rx) = tokio::sync::oneshot::channel();
+    let (cleanup_gate_tx, cleanup_gate_rx) = tokio::sync::oneshot::channel();
+    let (sync_teardown_tx, sync_teardown_rx) = tokio::sync::oneshot::channel();
+    let (in_join_tx, in_join_rx) = tokio::sync::oneshot::channel();
 
-    fleet.spawn_supervisor("f1".into(), socket, async move {
-        // Drop listener to simulate supervisor starting cleanup on unexpected VM exit.
-        drop(listener);
-        // Signal arrives while supervisor is mid-teardown.
+    // Supervisor for f1: simulates unexpected VM exit followed by teardown.
+    fleet.spawn_supervisor("f1".into(), f1_socket.clone(), async move {
+        // Drop or unlink the control socket before signal arrives, simulating
+        // teardown having closed the listener or removed storage.
+        drop(f1_listener);
+        if remove_socket {
+            std::fs::remove_file(&f1_socket).unwrap();
+        }
+
+        // Trigger signal teardown.
         shutdown_tx.send(()).unwrap();
-        // Simulate ongoing teardown before returning the supervisor failure.
-        let _ = cleanup_done_rx.await;
+
+        // Hold cleanup until the failed teardown request has been processed.
+        let _ = cleanup_gate_rx.await;
+
         Err(LabError::Invalid {
             lab: "f1".into(),
             message: "VM exited unexpectedly".into(),
         })
     });
 
+    // Supervisor for sync: coordinates with the test to prove that Fleet::shutdown
+    // has completed its request loop and is waiting in the join phase.
+    fleet.spawn_supervisor("sync".into(), sync_socket, async move {
+        let _ = sync_teardown_rx.await;
+        let _ = in_join_tx.send(());
+        Ok(())
+    });
+
+    // Handle teardown request for sync.
+    let sync_teardown_task = tokio::spawn(async move {
+        let (mut stream, _) = sync_listener.accept().await.unwrap();
+        let mut cmd = [0u8; 9];
+        stream.read_exact(&mut cmd).await.unwrap();
+        assert_eq!(&cmd, b"teardown\n");
+        stream.write_all(b"ok\n").await.unwrap();
+        drop(stream);
+        let _ = sync_teardown_tx.send(());
+    });
+
     let run = tokio::spawn(fleet.run(async move {
         let _ = shutdown_rx.await;
     }));
 
-    // Allow teardown request to fail with ConnectionRefused, then finish supervisor cleanup.
-    cleanup_done_tx.send(()).unwrap();
+    // Wait until Fleet::shutdown has processed teardown requests and entered the join phase.
+    in_join_rx.await.unwrap();
+    sync_teardown_task.await.unwrap();
+
+    // Prove the supervisor was NOT aborted and remains running while cleanup is pending.
+    assert!(
+        !run.is_finished(),
+        "supervisor must not be aborted while cleanup is pending"
+    );
+
+    // Release cleanup gate: supervisor finishes its teardown and returns its exit error.
+    cleanup_gate_tx.send(()).unwrap();
 
     let failures = run.await.unwrap().unwrap_err().0;
     assert_eq!(failures.len(), 1, "{failures:?}");
@@ -919,21 +972,35 @@ async fn fleet_signal_teardown_during_supervisor_cleanup_preserves_failure_as_ma
         "expected supervisor failure as main error, got: {failure}"
     );
 
-    // Teardown request connection error must be present as secondary context.
+    // Teardown request connection/not-found error must follow as secondary context.
     assert!(
         failure.errors.len() >= 2
             && matches!(
                 &failure.errors[1],
                 LabError::Io { source, .. }
-                    if matches!(
-                        source.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::BrokenPipe
-                    )
+                    if if remove_socket {
+                        source.kind() == std::io::ErrorKind::NotFound
+                    } else {
+                        matches!(
+                            source.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        )
+                    }
             ),
-        "expected connection error as secondary context, got: {failure}"
+        "expected secondary connection context (remove_socket={remove_socket}), got: {failure}"
     );
+}
+
+#[tokio::test]
+async fn fleet_signal_teardown_during_supervisor_cleanup_preserves_failure_as_main_error() {
+    assert_signal_teardown_preserves_supervisor_failure_during_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn fleet_signal_teardown_when_socket_not_found_preserves_supervisor_failure() {
+    assert_signal_teardown_preserves_supervisor_failure_during_cleanup(true).await;
 }
 
 #[tokio::test]
