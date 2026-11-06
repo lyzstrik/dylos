@@ -51,6 +51,8 @@ Check the host with:
 just host-check
 ```
 
+See [`docs/cli.md`](docs/cli.md) for the CLI reference and LabSpec format.
+
 ## Contributing
 
 Work is tracked as `LYZ-xx` issues in Linear. Every change goes through a pull request against `main`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contributor guidelines and [`AGENTS.md`](AGENTS.md) for detailed rules. Reviews follow [`docs/agents/review.md`](docs/agents/review.md).
