@@ -76,8 +76,24 @@ fn colliding_interface_names_are_rejected() {
 
 #[test]
 fn invalid_lab_ids_are_rejected() {
-    for id in ["", "has space", "../escape", &"x".repeat(65)] {
+    for id in [
+        "",
+        "has space",
+        "../escape",
+        "test_lab",
+        "-lab",
+        &"x".repeat(33),
+        &"x".repeat(65),
+    ] {
         let err = FabricPlan::new(id, &reference_lab()).unwrap_err();
         assert!(matches!(err, Error::InvalidLabId(_)), "{id:?}");
+    }
+}
+
+#[test]
+fn valid_lab_ids_are_accepted() {
+    for id in ["a", "Lab-123", &"x".repeat(32)] {
+        let plan = FabricPlan::new(id, &reference_lab()).unwrap();
+        assert_eq!(plan.lab_id(), id);
     }
 }
