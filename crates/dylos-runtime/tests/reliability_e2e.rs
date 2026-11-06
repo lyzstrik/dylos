@@ -10,6 +10,9 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
+mod support;
+use support::test_tempdir;
+
 fn configuration() -> Option<(tempfile::TempDir, LabConfig, LabSpec)> {
     // The store rejects `..` path components.
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -37,7 +40,7 @@ fn configuration() -> Option<(tempfile::TempDir, LabConfig, LabSpec)> {
         eprintln!("SKIPPED reliability_e2e: requires root, KVM, images and binaries");
         return None;
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
