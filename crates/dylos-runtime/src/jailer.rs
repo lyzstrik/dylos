@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::ErrorKind;
-use std::os::unix::fs::MetadataExt;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Component;
 
 use nix::fcntl::{AtFlags, OFlag, openat};
@@ -37,6 +37,256 @@ pub fn validate_unix_socket_path(path: &Path) -> std::result::Result<(), usize> 
         Err(len)
     } else {
         Ok(())
+    }
+}
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const PT_INTERP: u32 = 3;
+
+/// Inspects the program headers of an executable to determine if it requires an ELF interpreter (`PT_INTERP`).
+///
+/// Returns `Ok(true)` if the binary is an ELF file and requests a dynamic program interpreter,
+/// `Ok(false)` if it is statically linked (or static-pie) or not an ELF binary, and `Err` on I/O error.
+/// Inspects an executable file to determine if it requires an ELF interpreter (`PT_INTERP`).
+///
+/// An ELF binary without `PT_INTERP` is statically linked (or a static PIE).
+/// Dynamically linked executables contain a `PT_INTERP` program header specifying the dynamic loader.
+///
+/// # Errors
+/// Returns an [`std::io::Error`] if the file cannot be opened/read, is not a regular file,
+/// or is not a valid ELF binary with consistent header and table bounds.
+pub fn has_elf_interpreter(path: &Path) -> std::io::Result<bool> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).bits())
+        .open(path)?;
+
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "Firecracker binary must be a regular file",
+        ));
+    }
+    let file_len = meta.len();
+
+    let mut ident = [0u8; 16];
+    file.read_exact(&mut ident)?;
+
+    if ident[0..4] != ELF_MAGIC {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "not an ELF binary: missing ELF magic",
+        ));
+    }
+
+    let class = ident[4];
+    let is_little_endian = match ident[5] {
+        1 => true,
+        2 => false,
+        other => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported ELF data encoding {other}"),
+            ));
+        }
+    };
+
+    let (phoff, phentsize, phnum) = match class {
+        1 => parse_elf32_header(&mut file, file_len, is_little_endian)?,
+        2 => parse_elf64_header(&mut file, file_len, is_little_endian)?,
+        other => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported ELF class {other}"),
+            ));
+        }
+    };
+
+    let table_size = phnum.checked_mul(phentsize).ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "program header table size overflow")
+    })?;
+    let table_end = phoff.checked_add(table_size).ok_or_else(|| {
+        std::io::Error::new(
+            ErrorKind::InvalidData,
+            "program header table end offset overflow",
+        )
+    })?;
+    if table_end > file_len {
+        return Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            format!("program header table extends beyond file length ({table_end} > {file_len})"),
+        ));
+    }
+
+    scan_program_headers(&mut file, phoff, phentsize, phnum, is_little_endian)
+}
+
+fn read_u16(buf: &[u8], is_le: bool) -> u16 {
+    let bytes = [buf[0], buf[1]];
+    if is_le {
+        u16::from_le_bytes(bytes)
+    } else {
+        u16::from_be_bytes(bytes)
+    }
+}
+
+fn read_u32(buf: &[u8], is_le: bool) -> u32 {
+    let bytes = [buf[0], buf[1], buf[2], buf[3]];
+    if is_le {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    }
+}
+
+fn read_u64(buf: &[u8], is_le: bool) -> u64 {
+    let bytes = [
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ];
+    if is_le {
+        u64::from_le_bytes(bytes)
+    } else {
+        u64::from_be_bytes(bytes)
+    }
+}
+
+fn parse_elf32_header(
+    file: &mut File,
+    file_len: u64,
+    is_le: bool,
+) -> std::io::Result<(u64, u64, u64)> {
+    if file_len < 52 {
+        return Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated ELF32 header",
+        ));
+    }
+    let mut header = [0u8; 36];
+    file.read_exact(&mut header)?;
+    let ehsize = u64::from(read_u16(&header[24..26], is_le));
+    if ehsize < 52 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid ELF32 header size",
+        ));
+    }
+    let phoff = u64::from(read_u32(&header[12..16], is_le));
+    let phentsize = u64::from(read_u16(&header[26..28], is_le));
+    let phnum = u64::from(read_u16(&header[28..30], is_le));
+    if phnum > 0 && phentsize < 32 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid ELF32 program header entry size (must be >= 32)",
+        ));
+    }
+    Ok((phoff, phentsize, phnum))
+}
+
+fn parse_elf64_header(
+    file: &mut File,
+    file_len: u64,
+    is_le: bool,
+) -> std::io::Result<(u64, u64, u64)> {
+    if file_len < 64 {
+        return Err(std::io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "truncated ELF64 header",
+        ));
+    }
+    let mut header = [0u8; 48];
+    file.read_exact(&mut header)?;
+    let ehsize = u64::from(read_u16(&header[36..38], is_le));
+    if ehsize < 64 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid ELF64 header size",
+        ));
+    }
+    let phoff = read_u64(&header[16..24], is_le);
+    let phentsize = u64::from(read_u16(&header[38..40], is_le));
+    let phnum = u64::from(read_u16(&header[40..42], is_le));
+    if phnum > 0 && phentsize < 56 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid ELF64 program header entry size (must be >= 56)",
+        ));
+    }
+    Ok((phoff, phentsize, phnum))
+}
+
+fn scan_program_headers(
+    file: &mut File,
+    phoff: u64,
+    phentsize: u64,
+    phnum: u64,
+    is_le: bool,
+) -> std::io::Result<bool> {
+    for i in 0..phnum {
+        let entry_offset = phoff + i * phentsize;
+        file.seek(SeekFrom::Start(entry_offset))?;
+        let mut p_type_bytes = [0u8; 4];
+        file.read_exact(&mut p_type_bytes)?;
+        if read_u32(&p_type_bytes, is_le) == PT_INTERP {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Checks that the Firecracker binary at `path` is not dynamically linked.
+///
+/// Inside the Firecracker chroot jail, no dynamic loader (such as `/lib64/ld-linux-x86-64.so.2`)
+/// or shared libraries exist. Executing a dynamically linked binary inside the chroot fails with
+/// `ENOENT` (`os error 2`), which does not point to the root cause.
+///
+/// Note: The `jailer` binary itself is executed by Dylos directly on the host (outside the chroot),
+/// where host dynamic libraries and loaders are available; therefore, `jailer` does not require
+/// static linkage, only `firecracker` does.
+///
+/// # Errors
+/// Returns [`Error::DynamicFirecracker`] if the binary requests an ELF interpreter (`PT_INTERP`),
+/// [`Error::InvalidFirecrackerBinary`] if the binary is malformed or not a valid static ELF,
+/// or [`Error::Io`] if reading or opening the file fails.
+pub async fn check_static_firecracker(path: &Path) -> Result<()> {
+    let path_buf = path.to_path_buf();
+    tokio::task::spawn_blocking(move || check_static_firecracker_sync(&path_buf))
+        .await
+        .map_err(|source| Error::Task {
+            id: "preflight".into(),
+            task: "check static firecracker",
+            source,
+        })?
+}
+
+/// Synchronous check that the Firecracker binary at `path` is not dynamically linked.
+///
+/// # Errors
+/// Returns [`Error::DynamicFirecracker`] if the binary requests an ELF interpreter (`PT_INTERP`),
+/// [`Error::InvalidFirecrackerBinary`] if the binary is malformed or not a valid static ELF,
+/// or [`Error::Io`] if reading or opening the file fails.
+pub fn check_static_firecracker_sync(path: &Path) -> Result<()> {
+    match has_elf_interpreter(path) {
+        Ok(true) => Err(Error::DynamicFirecracker {
+            path: path.to_path_buf(),
+        }),
+        Ok(false) => Ok(()),
+        Err(source) => {
+            if source.kind() == ErrorKind::InvalidData || source.kind() == ErrorKind::UnexpectedEof
+            {
+                Err(Error::InvalidFirecrackerBinary {
+                    path: path.to_path_buf(),
+                    reason: source.to_string(),
+                })
+            } else {
+                Err(Error::Io {
+                    id: "preflight".into(),
+                    op: "check Firecracker binary",
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
+        }
     }
 }
 

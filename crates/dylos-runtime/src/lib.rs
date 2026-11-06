@@ -24,7 +24,10 @@ pub mod vm;
 
 pub use error::{Error, Result};
 pub use fleet::{Fleet, FleetError, LabFailure};
-pub use jailer::{MAX_UNIX_SOCKET_PATH, SUN_PATH_LEN, validate_unix_socket_path};
+pub use jailer::{
+    MAX_UNIX_SOCKET_PATH, SUN_PATH_LEN, check_static_firecracker, check_static_firecracker_sync,
+    has_elf_interpreter, validate_unix_socket_path,
+};
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
 pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms, verify_snapshot};

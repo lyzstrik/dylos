@@ -28,7 +28,7 @@ fn spec(sandbox: &Sandbox) -> VmSpec {
             ready: Duration::from_secs(1),
             graceful: Duration::from_millis(100),
             term: Duration::from_millis(100),
-            kill: Duration::from_millis(100),
+            kill: Duration::from_secs(5),
             metrics_poll: Duration::from_millis(50),
         },
     }
