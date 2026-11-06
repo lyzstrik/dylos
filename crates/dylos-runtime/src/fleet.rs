@@ -153,8 +153,21 @@ impl Fleet {
         for (task, result) in requests {
             if let (Err(error), Some(member)) = (result, self.members.get_mut(&task)) {
                 // The supervisor may still own the lab: stop it before anyone else touches it.
+                // If the connection was refused or broken, the supervisor is already exiting
+                // or in cleanup; do not abort it mid-teardown so its exit error is preserved.
                 tracing::error!(lab = %member.id, %error, "teardown request failed, aborting supervisor");
-                member.abort.abort();
+                if !matches!(
+                    &error,
+                    LabError::Io { source, .. }
+                        if matches!(
+                            source.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        )
+                ) {
+                    member.abort.abort();
+                }
                 member.errors.push(error);
             }
         }
@@ -203,7 +216,11 @@ impl Fleet {
         let Some(mut member) = self.members.remove(&task) else {
             return;
         };
-        member.errors.extend(outcome);
+        // Keep the supervisor's own failure as the main error; teardown connection
+        // or recovery errors follow as secondary context.
+        if let Some(error) = outcome {
+            member.errors.insert(0, error);
+        }
         if member.errors.is_empty() {
             tracing::info!(lab = %member.id, "lab is down");
             return;
