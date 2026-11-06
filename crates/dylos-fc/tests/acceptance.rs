@@ -698,7 +698,7 @@ async fn fake_server_raii_drops_socket() -> TestResult {
         if start.elapsed() > std::time::Duration::from_millis(500) {
             return Err("Socket file was not removed by Drop".into());
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(tokio::net::UnixStream::connect(&sock).await.is_err());

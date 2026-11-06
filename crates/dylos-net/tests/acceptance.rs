@@ -196,7 +196,10 @@ fn test_caller_and_pool_threads_are_not_moved_to_lab_netns() {
                 "drop never removed {}",
                 path.display()
             );
-            std::thread::yield_now();
+            tokio::time::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
         assert_eq!(original_ns, thread_netns(), "caller moved by drop");
         assert_eq!(original_ns, pool_ns().await, "pool thread moved by drop");
