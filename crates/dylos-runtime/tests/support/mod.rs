@@ -1185,6 +1185,15 @@ fn spawn_echo_responder(mode: &str, sandbox: &Path) {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines().map_while(Result::ok) {
             let _ = std::fs::write(sandbox.join("exec-lock-acquired"), b"1");
+            if sandbox.join("exec-gate").exists() {
+                let _ = std::fs::remove_file(sandbox.join("exec-gate"));
+                let release = sandbox.join("exec-release");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !release.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = std::fs::remove_file(&release);
+            }
             let cmd = if mode.starts_with("Lab") && line.contains("ping ") {
                 line.replace("ping ", ": ")
             } else {
