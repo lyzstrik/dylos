@@ -151,6 +151,29 @@ async fn bring_up_configures_all_vms_and_socket_teardown_removes_everything() {
         .await
         .unwrap();
     server.await.unwrap().unwrap();
+    for phase in [
+        "storage ready",
+        "fabric ready",
+        "all VM APIs ready",
+        "all VMs configured",
+        "all VM instances started",
+        "all VMs boot ready",
+        "lab readiness verified",
+        "control socket ready",
+        "all VMs shut down",
+        "network teardown completed",
+        "storage teardown completed",
+        "lab removed",
+    ] {
+        assert!(logs.contains_fields(phase, &["duration_ms="]), "{phase}");
+    }
+    for span in ["vm", "vm_configure", "vm_shutdown"] {
+        assert!(
+            logs.contains_fields(&format!("span={span} "), &["lab=lab "]),
+            "{span}: {:?}",
+            logs.0.lock().unwrap()
+        );
+    }
     assert_removed(&sandbox, &config);
     for pid in pids {
         assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
