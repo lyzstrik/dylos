@@ -64,6 +64,12 @@ pub enum LabError {
         len: usize,
         limit: usize,
     },
+    #[error(
+        "Firecracker binary at {path:?} is dynamically linked; \
+         a statically linked binary is required inside the chroot. \
+         Set DYLOS_FC_BIN_DIR or refer to docs/host.md"
+    )]
+    DynamicFirecracker { path: PathBuf },
 }
 
 impl LabError {
@@ -164,6 +170,7 @@ impl Lab {
     /// As `up`, with operator-supplied host paths and timeouts.
     pub async fn up_with(config: &LabConfig, spec: &LabSpec, lab_id: &str) -> Result<Self> {
         validate(config, spec, lab_id)?;
+        validate_firecracker(config)?;
         let plan = FabricPlan::new(lab_id, spec)?;
         let span = tracing::info_span!("lab", lab = lab_id);
         async {
@@ -210,6 +217,7 @@ impl Lab {
     /// # Errors
     /// Rejects invalid snapshots or ids and rolls back all owned resources on failure.
     pub async fn restore_with(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
+        validate_firecracker(config)?;
         let (config, snapshot, lab_id) = (config.clone(), snapshot.to_owned(), lab_id.to_owned());
         tokio::spawn(async move { Self::restore_owned(&config, &snapshot, &lab_id).await })
             .await
@@ -220,6 +228,7 @@ impl Lab {
     }
 
     async fn restore_owned(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
+        validate_firecracker(config)?;
         let (store, path, id) = (config.store.clone(), snapshot.to_owned(), lab_id.to_owned());
         let (storage, manifest) = blocking(lab_id, move || Ok(store.restore(&id, &path)?)).await?;
         let spec = manifest.lab_spec;
@@ -332,6 +341,7 @@ impl Lab {
                 return Err(invalid(id, "duplicate clone identifier"));
             }
         }
+        validate_firecracker(config)?;
 
         let mut handles = Vec::with_capacity(clone_ids.len());
         for id in clone_ids {
@@ -1031,6 +1041,13 @@ pub(crate) fn io(
         path: path.into(),
         source,
     }
+}
+
+fn validate_firecracker(config: &LabConfig) -> Result<()> {
+    crate::jailer::check_static_firecracker(&config.jailer.firecracker).map_err(|e| match e {
+        crate::Error::DynamicFirecracker { path } => LabError::DynamicFirecracker { path },
+        other => LabError::Vm(other),
+    })
 }
 
 fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {

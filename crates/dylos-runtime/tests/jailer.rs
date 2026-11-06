@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use dylos_runtime::Error;
 use dylos_runtime::jailer::{
-    ChrootFile, JailPaths, JailerConfig, MAX_UNIX_SOCKET_PATH, jailer_args, prepare_chroot,
-    remove_jail, validate_unix_socket_path,
+    ChrootFile, JailPaths, JailerConfig, MAX_UNIX_SOCKET_PATH, check_static_firecracker,
+    has_elf_interpreter, jailer_args, prepare_chroot, remove_jail, validate_unix_socket_path,
 };
 
 fn config() -> JailerConfig {
@@ -723,4 +723,47 @@ fn deep_working_directory_cross_filesystem_fallback_keeps_socket_paths_within_su
     );
     drop(listener);
     let _ = std::fs::remove_file(&socket);
+}
+
+#[test]
+fn static_binary_fixture_is_accepted_as_static_elf() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary");
+    assert!(fixture.exists(), "fixture missing at {fixture:?}");
+    assert!(!has_elf_interpreter(&fixture).unwrap());
+    assert!(check_static_firecracker(&fixture).is_ok());
+}
+
+#[test]
+fn dynamic_binary_fixture_is_rejected_with_dynamic_firecracker_error() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    assert!(fixture.exists(), "fixture missing at {fixture:?}");
+    assert!(has_elf_interpreter(&fixture).unwrap());
+
+    let err = check_static_firecracker(&fixture).unwrap_err();
+    assert!(
+        matches!(&err, Error::DynamicFirecracker { path } if path == &fixture),
+        "{err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("dynamically linked"), "{msg}");
+    assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
+    assert!(msg.contains("docs/host.md"), "{msg}");
+    assert!(msg.contains(&fixture.display().to_string()), "{msg}");
+}
+
+#[test]
+fn non_elf_file_has_no_elf_interpreter() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), b"not an elf file\n").unwrap();
+    assert!(!has_elf_interpreter(temp.path()).unwrap());
+    assert!(check_static_firecracker(temp.path()).is_ok());
+}
+
+#[test]
+fn check_static_firecracker_fails_on_missing_file() {
+    let missing = PathBuf::from("/nonexistent/firecracker/binary");
+    let err = check_static_firecracker(&missing).unwrap_err();
+    assert!(matches!(err, Error::Io { .. }), "{err:?}");
 }

@@ -148,6 +148,7 @@ impl Vm {
         if spec.timeouts.metrics_poll.is_zero() {
             return Err(Error::ZeroMetricsPoll { id: paths.id });
         }
+        jailer::check_static_firecracker(&config.firecracker)?;
         let span = tracing::info_span!("vm", lab = %spec.lab_id, node = %spec.node);
         async {
             let start = std::time::Instant::now();

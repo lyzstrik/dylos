@@ -81,6 +81,12 @@ pub enum Error {
         timeout: Duration,
         output: Vec<String>,
     },
+    #[error(
+        "Firecracker binary at {path:?} is dynamically linked; \
+         a statically linked binary is required inside the chroot. \
+         Set DYLOS_FC_BIN_DIR or refer to docs/host.md"
+    )]
+    DynamicFirecracker { path: PathBuf },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

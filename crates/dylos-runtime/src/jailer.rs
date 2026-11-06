@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::Component;
 
@@ -37,6 +37,142 @@ pub fn validate_unix_socket_path(path: &Path) -> std::result::Result<(), usize> 
         Err(len)
     } else {
         Ok(())
+    }
+}
+
+const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
+const PT_INTERP: u32 = 3;
+
+/// Inspects the program headers of an executable to determine if it requires an ELF interpreter (`PT_INTERP`).
+///
+/// Returns `Ok(true)` if the binary is an ELF file and requests a dynamic program interpreter,
+/// `Ok(false)` if it is statically linked (or static-pie) or not an ELF binary, and `Err` on I/O error.
+///
+/// # Errors
+/// Returns an [`std::io::Error`] if the file cannot be opened or read.
+pub fn has_elf_interpreter(path: &Path) -> std::io::Result<bool> {
+    let mut file = File::open(path)?;
+
+    let mut ident = [0u8; 16];
+    if file.read_exact(&mut ident).is_err() {
+        return Ok(false);
+    }
+
+    if ident[0..4] != ELF_MAGIC {
+        return Ok(false);
+    }
+
+    let class = ident[4];
+    let is_little_endian = match ident[5] {
+        1 => true,
+        2 => false,
+        _ => return Ok(false),
+    };
+
+    let read_u16 = |buf: &[u8]| -> u16 {
+        let bytes = [buf[0], buf[1]];
+        if is_little_endian {
+            u16::from_le_bytes(bytes)
+        } else {
+            u16::from_be_bytes(bytes)
+        }
+    };
+
+    let read_u32 = |buf: &[u8]| -> u32 {
+        let bytes = [buf[0], buf[1], buf[2], buf[3]];
+        if is_little_endian {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+
+    let read_u64 = |buf: &[u8]| -> u64 {
+        let bytes = [
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ];
+        if is_little_endian {
+            u64::from_le_bytes(bytes)
+        } else {
+            u64::from_be_bytes(bytes)
+        }
+    };
+
+    let (phoff, phentsize, phnum) = match class {
+        1 => {
+            // ELFCLASS32: 36 bytes remaining after 16-byte ident to reach 52-byte ELF header.
+            let mut header = [0u8; 36];
+            if file.read_exact(&mut header).is_err() {
+                return Ok(false);
+            }
+            let phoff = u64::from(read_u32(&header[12..16]));
+            let phentsize = u64::from(read_u16(&header[26..28]));
+            let phnum = u64::from(read_u16(&header[28..30]));
+            (phoff, phentsize, phnum)
+        }
+        2 => {
+            // ELFCLASS64: 48 bytes remaining after 16-byte ident to reach 64-byte ELF header.
+            let mut header = [0u8; 48];
+            if file.read_exact(&mut header).is_err() {
+                return Ok(false);
+            }
+            let phoff = read_u64(&header[16..24]);
+            let phentsize = u64::from(read_u16(&header[38..40]));
+            let phnum = u64::from(read_u16(&header[40..42]));
+            (phoff, phentsize, phnum)
+        }
+        _ => return Ok(false),
+    };
+
+    if phnum == 0 || phentsize < 4 {
+        return Ok(false);
+    }
+
+    for i in 0..phnum {
+        let Some(entry_offset) = i
+            .checked_mul(phentsize)
+            .and_then(|offset| phoff.checked_add(offset))
+        else {
+            return Ok(false);
+        };
+        file.seek(SeekFrom::Start(entry_offset))?;
+        let mut p_type_bytes = [0u8; 4];
+        if file.read_exact(&mut p_type_bytes).is_err() {
+            return Ok(false);
+        }
+        if read_u32(&p_type_bytes) == PT_INTERP {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Checks that the Firecracker binary at `path` is not dynamically linked.
+///
+/// Inside the Firecracker chroot jail, no dynamic loader (such as `/lib64/ld-linux-x86-64.so.2`)
+/// or shared libraries exist. Executing a dynamically linked binary inside the chroot fails with
+/// `ENOENT` (`os error 2`), which does not point to the root cause.
+///
+/// Note: The `jailer` binary itself is executed by Dylos directly on the host (outside the chroot),
+/// where host dynamic libraries and loaders are available; therefore, `jailer` does not require
+/// static linkage, only `firecracker` does.
+///
+/// # Errors
+/// Returns [`Error::DynamicFirecracker`] if the binary requests an ELF interpreter (`PT_INTERP`),
+/// or [`Error::Io`] if reading or opening the file fails.
+pub fn check_static_firecracker(path: &Path) -> Result<()> {
+    match has_elf_interpreter(path) {
+        Ok(true) => Err(Error::DynamicFirecracker {
+            path: path.to_path_buf(),
+        }),
+        Ok(false) => Ok(()),
+        Err(source) => Err(Error::Io {
+            id: "preflight".into(),
+            op: "check Firecracker binary",
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
