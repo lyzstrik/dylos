@@ -11,6 +11,12 @@ pub enum Error {
     ReadinessTimeout { id: String, timeout: Duration },
     #[error("invalid jail id {id:?}: must be 1 to 64 of [A-Za-z0-9-]")]
     InvalidJailId { id: String },
+    #[error("socket path {path:?} ({len} bytes) exceeds limit of {limit} bytes")]
+    SocketPathTooLong {
+        path: PathBuf,
+        len: usize,
+        limit: usize,
+    },
     #[error("invalid chroot file name {name:?} for VM {id}: must be a single path component")]
     InvalidChrootFileName { id: String, name: String },
     #[error("jail directory {path:?} already exists: stale VM {id} or VM still running")]
