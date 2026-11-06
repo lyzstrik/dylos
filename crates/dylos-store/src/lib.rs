@@ -341,7 +341,9 @@ impl Snapshot {
     ) -> Result<(FileMeta, DiskCloneTimings), Error> {
         valid_id(node)?;
         valid_file_name(disk_name)?;
-        let _span = tracing::info_span!("clone_disk", node = %node, disk = %disk_name).entered();
+        let _span =
+            tracing::info_span!("clone_disk", lab = %self.lab_id, node = %node, disk = %disk_name)
+                .entered();
         let started = Instant::now();
 
         let source_parent = source_path
@@ -401,7 +403,7 @@ impl Snapshot {
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         tracing::debug!(
-            elapsed = ?started.elapsed(),
+            duration_ms = started.elapsed().as_millis(),
             size,
             fsync_ms,
             reflink_ms,
@@ -874,7 +876,7 @@ impl Store {
                 let vms =
                     make_directory(&lab.directory, "vms").map_err(|e| contextual(&lab.root, e))?;
                 for node in &spec.nodes {
-                    let _vm = tracing::info_span!("store_vm", vm = %node.name).entered();
+                    let _vm = tracing::info_span!("store_vm", lab = id, vm = %node.name).entered();
                     let vm_started = Instant::now();
                     let paths = lab.vm_paths(&node.name)?;
                     let vm = make_directory(&vms, &node.name)
@@ -928,7 +930,10 @@ impl Store {
                             .link_into(&vm, "vm.mem")
                             .map_err(|e| contextual(&paths.directory.join("vm.mem"), e))?;
                     }
-                    tracing::debug!(elapsed = ?vm_started.elapsed(), "rootfs reflink complete");
+                    tracing::debug!(
+                        duration_ms = vm_started.elapsed().as_millis(),
+                        "rootfs reflink complete"
+                    );
                 }
                 let state = State {
                     lab_id: id.into(),
@@ -951,7 +956,10 @@ impl Store {
             lab.remove()?;
             return Err(error);
         }
-        tracing::debug!(elapsed = ?started.elapsed(), "lab creation complete");
+        tracing::debug!(
+            duration_ms = started.elapsed().as_millis(),
+            "lab creation complete"
+        );
         Ok(lab)
     }
     /// Removes even a partially created lab. Symlinks are unlinked, never traversed.
