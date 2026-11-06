@@ -580,10 +580,19 @@ fn staging_with_manifest_cannot_restore_and_publication_is_atomic() {
     };
     assert!(snapshot.publish().is_err());
     snapshot.write_manifest(&manifest).unwrap();
-    let error = store.restore("clone", &staging).unwrap_err();
-    assert!(
-        matches!(error, dylos_store::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput)
-    );
+    for path in [
+        staging.clone(),
+        staging.join("."),
+        staging.join("child/.."),
+        staging.join("../snap"),
+    ] {
+        let error = store.restore("clone", &path).unwrap_err();
+        assert!(
+            matches!(error, dylos_store::Error::Io { source, .. } if source.kind() == std::io::ErrorKind::InvalidInput),
+            "staging component must be rejected: {}",
+            path.display(),
+        );
+    }
     assert!(!store.snapshot_dir("lab", "snap").exists());
     snapshot.publish().unwrap();
     assert!(!staging.exists());

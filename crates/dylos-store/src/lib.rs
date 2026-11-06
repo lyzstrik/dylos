@@ -746,10 +746,9 @@ impl Store {
         {
             return Err(Error::InvalidId(id.into()));
         }
-        if path
-            .file_name()
-            .is_some_and(|name| name.as_bytes().starts_with(b".staging-"))
-        {
+        if path.components().any(|component| {
+            matches!(component, Component::Normal(name) if name.as_bytes().starts_with(b".staging-"))
+        }) {
             return Err(contextual(path, io::ErrorKind::InvalidInput.into()));
         }
         let opener = SnapshotOpener::new(path).map_err(|e| contextual(path, e))?;
