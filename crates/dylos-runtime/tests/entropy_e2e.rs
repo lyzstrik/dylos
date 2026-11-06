@@ -70,6 +70,13 @@ async fn clones_reseed_kernel_rng_via_vmgenid() {
     }
     let mut original = Lab::up_with(&config, &spec, "esrc").await.unwrap();
     let result = std::panic::AssertUnwindSafe(async {
+        assert_eq!(
+            exec(&original, "A", "readlink /proc/$(pidof dylos-agent)/fd/2").await,
+            "/var/log/dylos-agent.log",
+            "agent diagnostics must be separate from serial command output"
+        );
+        // Kernel notices share ttyS0 with exec output; keep them in dmesg only.
+        exec(&original, "A", "dmesg -n 1").await;
         let baseline = exec(&original, "A", "cat /proc/sys/kernel/random/uuid").await;
         let notices = exec(&original, "A",
             "dmesg | awk '/crng reseeded due to virtual machine fork/ {n++} END {print n+0}'").await;
@@ -80,12 +87,25 @@ async fn clones_reseed_kernel_rng_via_vmgenid() {
         let assertions = std::panic::AssertUnwindSafe(async {
             let mut values = Vec::new();
             for clone in &clones {
-                // Wait for a new kernel event, not a notice inherited in guest memory.
-                let command = format!(
-                    "while [ \"$(dmesg | grep -c 'crng reseeded due to virtual machine fork')\" -le {notices} ]; do :; done; cat /proc/sys/kernel/random/uuid"
-                );
-                let uuid = exec(clone, "A", &command).await;
-                assert_eq!(uuid.len(), 36);
+                let diagnostics = exec(clone, "A", "cat /var/log/dylos-agent.log").await;
+                assert!(diagnostics.contains("guest clock resynchronized"),
+                    "{}: missing agent readiness diagnostics: {diagnostics:?}", clone.id());
+                eprintln!("{}: agent diagnostics: {diagnostics:?}", clone.id());
+                // Poll from the host so the single guest vCPU can process VMGenID.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut poll = tokio::time::interval(Duration::from_millis(20));
+                    loop {
+                        poll.tick().await;
+                        let count = exec(clone, "A",
+                            "dmesg | awk '/crng reseeded due to virtual machine fork/ {n++} END {print n+0}'").await;
+                        if count.parse::<u64>().expect("reseed event count")
+                            > notices.parse::<u64>().expect("baseline reseed event count") {
+                            break;
+                        }
+                    }
+                }).await.expect("new VMGenID reseed event within 10 s");
+                let uuid = exec(clone, "A", "cat /proc/sys/kernel/random/uuid").await;
+                assert_eq!(uuid.len(), 36, "{}: UUID output: {uuid:?}", clone.id());
                 assert_ne!(uuid, baseline);
                 values.push(uuid);
                 let bytes = exec(clone, "A", "od -An -N32 -tx1 /dev/urandom").await;
