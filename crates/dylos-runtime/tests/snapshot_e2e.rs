@@ -120,8 +120,9 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let verify_ms = verify_start.elapsed().as_millis();
 
     eprintln!(
-        "5-VM snapshot timing breakdown: total={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
+        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
         total_ms,
+        timings.freeze_to_thaw_ms,
         manifest.step_durations_ms.freeze,
         manifest.step_durations_ms.pause,
         timings.api_snapshot_ms,
@@ -132,6 +133,18 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         manifest.step_durations_ms.resume,
         manifest.step_durations_ms.thaw,
         verify_ms,
+    );
+
+    // Firecracker memory snapshot I/O depends on the runner's disk. Bound only the
+    // remaining paused work (freeze, pause, fsync, reflink, resume, thaw), allowing
+    // 500 ms for that work and scheduling jitter; hashing must run after thaw.
+    let pause_margin_ms = 500;
+    assert!(
+        timings.freeze_to_thaw_ms <= timings.api_snapshot_ms.saturating_add(pause_margin_ms),
+        "5-VM freeze-to-thaw pause ({}ms) exceeded API snapshot ({}ms) + {pause_margin_ms}ms margin; hashing={}ms",
+        timings.freeze_to_thaw_ms,
+        timings.api_snapshot_ms,
+        timings.hash_ms,
     );
 
     // LYZ-73 acceptance criterion 2: Manifest verification must be at least as fast as snapshot hashing.

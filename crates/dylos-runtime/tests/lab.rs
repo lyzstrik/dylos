@@ -889,6 +889,28 @@ async fn preflight_rejects_bad_image_before_creating_resources() {
 }
 
 #[tokio::test]
+async fn restore_and_fork_reject_unpublished_staging() {
+    let (_sandbox, config, _spec) = setup(Mode::LabReady);
+    let staging = config.store.stage_snapshot("source", "snap").unwrap();
+    for result in [
+        Lab::restore_with(&config, staging.root(), "restored")
+            .await
+            .map(|_| ()),
+        Lab::fork(&config, staging.root(), "forked", 2)
+            .await
+            .map(|_| ()),
+    ] {
+        let error = result.unwrap_err();
+        assert!(
+            matches!(error, LabError::Store(dylos_store::Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::InvalidInput)
+        );
+    }
+    assert!(!config.store.base.join("restored").exists());
+    assert!(!config.store.base.join("forked-c1").exists());
+    assert!(!config.store.base.join("forked-c2").exists());
+}
+
+#[tokio::test]
 async fn condition_polling_backs_off_until_success() {
     let start = std::time::Instant::now();
     let mut polls = 0;
