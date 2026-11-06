@@ -235,6 +235,28 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     guest(lab, "A", "kill -0 $(cat /tmp/freeze-iperf.pid)").await;
     guest(lab, "A", "kill $(cat /tmp/freeze-iperf.pid)").await;
     guest(lab, "C", "kill $(cat /tmp/freeze-socat.pid)").await;
+    // A dual-stack IPv6 socket also owns the IPv4 port until exit closes it.
+    // A successful kill only queues the signal; wait before starting the next family.
+    tokio::time::timeout(COMMAND_TIMEOUT, async {
+        let mut poll = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            poll.tick().await;
+            if lab
+                .exec(
+                    "C",
+                    "awk '$2 ~ /:D7D6$/ {busy=1} END {exit busy}' /proc/net/udp /proc/net/udp6",
+                    COMMAND_TIMEOUT,
+                )
+                .await
+                .unwrap()
+                .success()
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("UDP marker port 55254 was not released after receiver termination");
     guest(lab, "C", "pkill iperf3").await;
     eprintln!(
         "{family}: unchanged TAP/guest RX during 2 s hold and receiver pause; original TCP flow resumed"
