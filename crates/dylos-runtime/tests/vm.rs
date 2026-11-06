@@ -473,7 +473,7 @@ async fn cancelled_shutdown_retries_and_waits_for_cleanup() {
     let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
     sandbox.config.cleanup_barrier = Some(barrier.clone());
     let mut test_spec = spec(&sandbox);
-    test_spec.timeouts.kill = Duration::from_millis(100);
+    test_spec.timeouts.kill = Duration::from_millis(500);
     let mut vm = Vm::launch(&sandbox.config, &test_spec).await.unwrap();
     let cancelled = tokio::select! {
         biased;

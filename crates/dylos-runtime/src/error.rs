@@ -87,6 +87,11 @@ pub enum Error {
          Set DYLOS_FC_BIN_DIR or refer to docs/host.md"
     )]
     DynamicFirecracker { path: PathBuf },
+    #[error(
+        "Firecracker binary at {path:?} is not a valid static ELF binary: {reason}. \
+         Set DYLOS_FC_BIN_DIR or refer to docs/host.md"
+    )]
+    InvalidFirecrackerBinary { path: PathBuf, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

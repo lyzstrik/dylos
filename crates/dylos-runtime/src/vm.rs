@@ -147,6 +147,15 @@ impl Vm {
         spec: &VmSpec,
         lab: &str,
     ) -> Result<Self> {
+        jailer::check_static_firecracker(&config.firecracker).await?;
+        Self::launch_configured(config, spec, lab).await
+    }
+
+    pub(crate) async fn launch_configured(
+        config: &JailerConfig,
+        spec: &VmSpec,
+        lab: &str,
+    ) -> Result<Self> {
         let paths = JailPaths::new(config, &spec.lab_id, &spec.node)?;
         if !validate_resources(u32::from(spec.vcpu_count), spec.mem_size_mib) {
             return Err(Error::InvalidResources {
@@ -158,7 +167,6 @@ impl Vm {
         if spec.timeouts.metrics_poll.is_zero() {
             return Err(Error::ZeroMetricsPoll { id: paths.id });
         }
-        jailer::check_static_firecracker(&config.firecracker)?;
         let span = tracing::info_span!("vm", lab = lab, node = %spec.node);
         async {
             let start = std::time::Instant::now();

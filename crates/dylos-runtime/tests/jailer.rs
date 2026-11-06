@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use dylos_runtime::Error;
 use dylos_runtime::jailer::{
     ChrootFile, JailPaths, JailerConfig, MAX_UNIX_SOCKET_PATH, check_static_firecracker,
-    has_elf_interpreter, jailer_args, prepare_chroot, remove_jail, validate_unix_socket_path,
+    check_static_firecracker_sync, has_elf_interpreter, jailer_args, prepare_chroot, remove_jail,
+    validate_unix_socket_path,
 };
 
 fn config() -> JailerConfig {
@@ -725,23 +726,51 @@ fn deep_working_directory_cross_filesystem_fallback_keeps_socket_paths_within_su
     let _ = std::fs::remove_file(&socket);
 }
 
-#[test]
-fn static_binary_fixture_is_accepted_as_static_elf() {
+#[tokio::test]
+async fn static_binary_fixture_is_accepted_as_static_elf() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary");
     assert!(fixture.exists(), "fixture missing at {fixture:?}");
     assert!(!has_elf_interpreter(&fixture).unwrap());
-    assert!(check_static_firecracker(&fixture).is_ok());
+    assert!(check_static_firecracker(&fixture).await.is_ok());
+    assert!(check_static_firecracker_sync(&fixture).is_ok());
 }
 
-#[test]
-fn dynamic_binary_fixture_is_rejected_with_dynamic_firecracker_error() {
+#[tokio::test]
+async fn static_binary_elf32_fixture_is_accepted() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary_elf32");
+    assert!(fixture.exists(), "fixture missing at {fixture:?}");
+    assert!(!has_elf_interpreter(&fixture).unwrap());
+    assert!(check_static_firecracker(&fixture).await.is_ok());
+}
+
+#[tokio::test]
+async fn static_binary_big_endian_fixture_is_accepted() {
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/elf/static_binary_big_endian");
+    assert!(fixture.exists(), "fixture missing at {fixture:?}");
+    assert!(!has_elf_interpreter(&fixture).unwrap());
+    assert!(check_static_firecracker(&fixture).await.is_ok());
+}
+
+#[tokio::test]
+async fn static_binary_pie_fixture_is_accepted() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary_pie");
+    assert!(fixture.exists(), "fixture missing at {fixture:?}");
+    assert!(!has_elf_interpreter(&fixture).unwrap());
+    assert!(check_static_firecracker(&fixture).await.is_ok());
+}
+
+#[tokio::test]
+async fn dynamic_binary_fixture_is_rejected_with_dynamic_firecracker_error() {
     let fixture =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
     assert!(fixture.exists(), "fixture missing at {fixture:?}");
     assert!(has_elf_interpreter(&fixture).unwrap());
 
-    let err = check_static_firecracker(&fixture).unwrap_err();
+    let err = check_static_firecracker(&fixture).await.unwrap_err();
     assert!(
         matches!(&err, Error::DynamicFirecracker { path } if path == &fixture),
         "{err:?}"
@@ -753,17 +782,94 @@ fn dynamic_binary_fixture_is_rejected_with_dynamic_firecracker_error() {
     assert!(msg.contains(&fixture.display().to_string()), "{msg}");
 }
 
-#[test]
-fn non_elf_file_has_no_elf_interpreter() {
+#[tokio::test]
+async fn non_elf_file_is_rejected_as_invalid_firecracker() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(temp.path(), b"not an elf file\n").unwrap();
-    assert!(!has_elf_interpreter(temp.path()).unwrap());
-    assert!(check_static_firecracker(temp.path()).is_ok());
+    assert!(has_elf_interpreter(temp.path()).is_err());
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("magic")),
+        "{err:?}"
+    );
 }
 
-#[test]
-fn check_static_firecracker_fails_on_missing_file() {
+#[tokio::test]
+async fn directory_path_is_rejected_as_invalid_firecracker() {
+    let temp = tempfile::tempdir().unwrap();
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("regular file")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn truncated_elf_header_is_rejected() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(temp.path(), b"\x7fELF\x02\x01\x01\x00truncated").unwrap();
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("truncated")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_elf_class_is_rejected() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    bytes[4] = 3;
+    std::fs::write(temp.path(), &bytes).unwrap();
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("class")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn unsupported_elf_endianness_is_rejected() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    bytes[5] = 0;
+    std::fs::write(temp.path(), &bytes).unwrap();
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("encoding")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn program_header_table_extending_beyond_eof_is_rejected() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    bytes[0x38] = 10;
+    std::fs::write(temp.path(), &bytes).unwrap();
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("beyond file length")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn undersized_phentsize_is_rejected() {
+    let temp = tempfile::NamedTempFile::new().unwrap();
+    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    bytes[0x36] = 16;
+    std::fs::write(temp.path(), &bytes).unwrap();
+    let err = check_static_firecracker(temp.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains("entry size")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn check_static_firecracker_fails_on_missing_file() {
     let missing = PathBuf::from("/nonexistent/firecracker/binary");
-    let err = check_static_firecracker(&missing).unwrap_err();
+    let err = check_static_firecracker(&missing).await.unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "{err:?}");
 }

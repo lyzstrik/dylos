@@ -70,6 +70,11 @@ pub enum LabError {
          Set DYLOS_FC_BIN_DIR or refer to docs/host.md"
     )]
     DynamicFirecracker { path: PathBuf },
+    #[error(
+        "Firecracker binary at {path:?} is not a valid static ELF binary: {reason}. \
+         Set DYLOS_FC_BIN_DIR or refer to docs/host.md"
+    )]
+    InvalidFirecrackerBinary { path: PathBuf, reason: String },
 }
 
 impl LabError {
@@ -170,7 +175,7 @@ impl Lab {
     /// As `up`, with operator-supplied host paths and timeouts.
     pub async fn up_with(config: &LabConfig, spec: &LabSpec, lab_id: &str) -> Result<Self> {
         validate(config, spec, lab_id)?;
-        validate_firecracker(config)?;
+        validate_firecracker(config).await?;
         let plan = FabricPlan::new(lab_id, spec)?;
         let span = tracing::info_span!("lab", lab = lab_id);
         async {
@@ -218,7 +223,6 @@ impl Lab {
     /// # Errors
     /// Rejects invalid snapshots or ids and rolls back all owned resources on failure.
     pub async fn restore_with(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
-        validate_firecracker(config)?;
         let (config, snapshot, lab_id) = (config.clone(), snapshot.to_owned(), lab_id.to_owned());
         tokio::spawn(async move { Self::restore_owned(&config, &snapshot, &lab_id).await })
             .await
@@ -229,7 +233,18 @@ impl Lab {
     }
 
     async fn restore_owned(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
-        validate_firecracker(config)?;
+        Self::restore_owned_internal(config, snapshot, lab_id, true).await
+    }
+
+    async fn restore_owned_internal(
+        config: &LabConfig,
+        snapshot: &Path,
+        lab_id: &str,
+        check_fc: bool,
+    ) -> Result<Self> {
+        if check_fc {
+            validate_firecracker(config).await?;
+        }
         let (store, path, id) = (config.store.clone(), snapshot.to_owned(), lab_id.to_owned());
         let (storage, manifest) = blocking(lab_id, move || Ok(store.restore(&id, &path)?)).await?;
         let spec = manifest.lab_spec;
@@ -342,7 +357,7 @@ impl Lab {
                 return Err(invalid(id, "duplicate clone identifier"));
             }
         }
-        validate_firecracker(config)?;
+        validate_firecracker(config).await?;
 
         let mut handles = Vec::with_capacity(clone_ids.len());
         for id in clone_ids {
@@ -350,7 +365,7 @@ impl Lab {
             let snapshot = snapshot.to_path_buf();
             let id = id.clone();
             handles.push(tokio::spawn(async move {
-                Self::restore_owned(&config, &snapshot, &id).await
+                Self::restore_owned_internal(&config, &snapshot, &id, false).await
             }));
         }
 
@@ -474,7 +489,7 @@ impl Lab {
         let results = join_all(
             specs
                 .iter()
-                .map(|vm| Vm::launch_with_lab(&config.jailer, vm, &self.id)),
+                .map(|vm| Vm::launch_configured(&config.jailer, vm, &self.id)),
         )
         .await;
         let mut failure = None;
@@ -1084,11 +1099,16 @@ pub(crate) fn io(
     }
 }
 
-fn validate_firecracker(config: &LabConfig) -> Result<()> {
-    crate::jailer::check_static_firecracker(&config.jailer.firecracker).map_err(|e| match e {
-        crate::Error::DynamicFirecracker { path } => LabError::DynamicFirecracker { path },
-        other => LabError::Vm(other),
-    })
+async fn validate_firecracker(config: &LabConfig) -> Result<()> {
+    crate::jailer::check_static_firecracker(&config.jailer.firecracker)
+        .await
+        .map_err(|e| match e {
+            crate::Error::DynamicFirecracker { path } => LabError::DynamicFirecracker { path },
+            crate::Error::InvalidFirecrackerBinary { path, reason } => {
+                LabError::InvalidFirecrackerBinary { path, reason }
+            }
+            other => LabError::Vm(other),
+        })
 }
 
 fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {
