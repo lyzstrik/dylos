@@ -863,3 +863,58 @@ async fn preflight_rejects_bad_image_before_creating_resources() {
     assert!(!config.store.base.exists());
     assert_removed(&sandbox, &config);
 }
+
+#[tokio::test]
+async fn up_rejects_control_socket_exceeding_sun_len_before_creating_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::Serve);
+    let long_base = sandbox.dir.path().join("s".repeat(95));
+    config.store.base = long_base.clone();
+    let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+    match &err {
+        LabError::SocketPathTooLong {
+            lab,
+            path,
+            len,
+            limit,
+        } => {
+            assert_eq!(lab, "lab");
+            assert_eq!(*limit, dylos_runtime::MAX_UNIX_SOCKET_PATH);
+            assert_eq!(*len, path.as_os_str().len());
+            assert!(*len > *limit, "expected len {len} > limit {limit}");
+            assert_eq!(path, &Lab::control_socket_path(&long_base, "lab"));
+            let msg = err.to_string();
+            assert!(msg.contains(&len.to_string()), "{msg}");
+            assert!(msg.contains(&limit.to_string()), "{msg}");
+            assert!(msg.contains("lab"), "{msg}");
+        }
+        other => panic!("expected SocketPathTooLong, got {other:?}"),
+    }
+    assert!(!long_base.exists(), "store base should not be created");
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn up_rejects_api_socket_exceeding_sun_len_before_creating_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::Serve);
+    let long_jail_dir = sandbox.dir.path().join("j".repeat(80));
+    config.jailer.chroot_base_dir = long_jail_dir.clone();
+    let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+    match &err {
+        LabError::Vm(dylos_runtime::Error::SocketPathTooLong { path, len, limit }) => {
+            assert_eq!(*limit, dylos_runtime::MAX_UNIX_SOCKET_PATH);
+            assert_eq!(*len, path.as_os_str().len());
+            assert!(*len > *limit, "expected len {len} > limit {limit}");
+            assert!(path.ends_with("run/firecracker.socket"));
+            let msg = err.to_string();
+            assert!(msg.contains(&len.to_string()), "{msg}");
+            assert!(msg.contains(&limit.to_string()), "{msg}");
+        }
+        other => panic!("expected Vm(SocketPathTooLong), got {other:?}"),
+    }
+    assert!(!long_jail_dir.exists(), "jail dir should not be created");
+    assert!(
+        !config.store.base.exists(),
+        "store base should not be created"
+    );
+    assert_removed(&sandbox, &config);
+}
