@@ -105,7 +105,7 @@ async fn clones_reseed_kernel_rng_via_vmgenid() {
                     }
                 }).await.expect("new VMGenID reseed event within 10 s");
                 let uuid = exec(clone, "A", "cat /proc/sys/kernel/random/uuid").await;
-                assert_eq!(uuid.len(), 36, "{}: UUID output: {uuid:?}", clone.id());
+                assert_eq!(uuid.len(), 36, "{}: expected one UUID", clone.id());
                 assert_ne!(uuid, baseline);
                 values.push(uuid);
                 let bytes = exec(clone, "A", "od -An -N32 -tx1 /dev/urandom").await;
