@@ -182,7 +182,10 @@ async fn up_lab(sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfig, Lab)> {
     };
     match Lab::up_with(&config, &test_spec(), lab_id).await {
         Ok(lab) => Some((config, lab)),
-        Err(LabError::Store(dylos_store::Error::Reflink { source, .. })) => {
+        Err(LabError::Store(
+            dylos_store::Error::Reflink { source, .. }
+            | dylos_store::Error::ReflinkPreflight { source, .. },
+        )) => {
             eprintln!("SKIPPED {lab_id}: reflinks unavailable: {source}");
             None
         }

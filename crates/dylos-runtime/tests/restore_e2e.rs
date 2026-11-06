@@ -9,6 +9,9 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
+mod support;
+use support::test_tempdir;
+
 async fn exec(lab: &Lab, node: &str, command: &str) -> String {
     let result = lab
         .exec(node, command, Duration::from_secs(10))
@@ -28,7 +31,7 @@ async fn progress(lab: &Lab, previous: u64) -> u64 {
             if size > previous {
                 return size;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -110,7 +113,7 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         eprintln!("SKIPPED restore_e2e: requires root, KVM and built images/binaries");
         return;
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");

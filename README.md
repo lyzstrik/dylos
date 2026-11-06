@@ -53,9 +53,114 @@ just host-check
 
 See [`docs/cli.md`](docs/cli.md) for the CLI reference and LabSpec format.
 
+## Getting started
+
+### 1. Obtain the source
+
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/lyzstrik/dylos.git
+cd dylos
+```
+
+### 2. Host setup
+
+Dylos requires:
+- Linux with KVM (`/dev/kvm` readable and writable)
+- Pinned, statically linked Firecracker and jailer (`v1.17.0`)
+- A filesystem with reflink support (`btrfs`, or `XFS` with reflink)
+- Pinned Rust toolchain and developer tools (`just`, `cargo-nextest`, `cargo-deny`, `typos`, etc.)
+
+Follow [`docs/host.md`](docs/host.md) for full installation and host configuration details. Verify that all host prerequisites are satisfied:
+
+```bash
+just host-check
+```
+
+### 3. Build and check
+
+Run all checks, tests, and linters through `just`:
+
+```bash
+just check
+```
+
+Dylos does not install a system binary. You can run commands directly using `cargo run --release -p dylos-cli -- ...` or compile the release binary:
+
+```bash
+cargo build --release -p dylos-cli
+```
+
+The resulting binary will be located at `target/release/dylos`. Release builds are recommended because debug builds hash snapshot state roughly 20x slower.
+
+### 4. Prepare guest assets
+
+Before launching a lab, ensure the guest kernel and root filesystem image are available:
+- **Guest kernel**: download `kernels/vmlinux.bin` according to the source URL and checksum in [`docs/host.md`](docs/host.md).
+- **Guest rootfs**: build `target/images/rootfs.ext4` with rootless Podman:
+
+```bash
+just images
+```
+
+> [!IMPORTANT]
+> The rootfs image (`target/images/rootfs.ext4`), lab storage (default `target/labs`, overridden by `DYLOS_LAB_DIR`), and jail directory (default `target/jails`, overridden by `DYLOS_JAIL_DIR`) must reside on the same filesystem mount to support reflinks (`FICLONE`). Reflinks fail across different mount boundaries (`EXDEV`).
+
+### 5. Running the reference lab
+
+Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. If your static Firecracker and jailer binaries are installed in `~/.local/share/dylos/bin` (as described in [`docs/host.md`](docs/host.md)), export `DYLOS_FC_BIN_DIR` so Dylos locates them instead of defaulting to `/usr/bin`.
+
+Run with `sudo -E` to preserve `DYLOS_FC_BIN_DIR`. Invoking the compiled binary directly is preferred because sudoers `secure_path` can override `PATH` and hide user-installed `cargo`:
+
+```bash
+# Point to your static Firecracker and jailer binaries (installed per docs/host.md)
+export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"
+
+# Bring up the reference 3-node lab (A -- B -- C) with the compiled binary
+sudo -E ./target/release/dylos lab up labs/abc.yaml
+
+# Or via cargo (if sudo preserves PATH to cargo in your environment):
+sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
+```
+
+`lab up` starts the microVMs, configures the network topology, and stays in the foreground supervising the lab until interrupted (such as with `Ctrl+C`) or torn down from another terminal.
+
+To tear down the lab from another terminal (or to clean up after an exit), run `lab down` with the lab identifier (which defaults to the spec file stem, `abc`):
+
+```bash
+# Tear down with the compiled binary
+sudo -E ./target/release/dylos lab down abc
+
+# Or via cargo:
+sudo -E cargo run --release -p dylos-cli -- lab down abc
+```
+
+> [!NOTE]
+> There is no `lab list` command; labs are managed by their identifier (`abc`, or an explicit name passed via `--id <ID>`). See available CLI subcommands with:
+>
+> ```bash
+> cargo run -p dylos-cli -- lab --help
+> ```
+
+### Troubleshooting
+
+- **Firecracker execution failure inside jailer chroot**:
+  If `lab up` fails with:
+  ```text
+  Failed to exec into Firecracker: No such file or directory
+  ```
+  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md) and set `DYLOS_FC_BIN_DIR` to their directory (for example `export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"`). Without `DYLOS_FC_BIN_DIR`, the CLI defaults to `/usr/bin/firecracker` and `/usr/bin/jailer` (unlike `just host-check`, which checks `~/.local/share/dylos/bin` by default).
+
+- **Cross-device link errors (`EXDEV`)**:
+  If reflink preflight fails, your rootfs image, lab store directory, or jail directory reside on different filesystem mounts. Ensure they are colocated on the same reflink-capable filesystem mount (or configure `DYLOS_LAB_DIR` and `DYLOS_JAIL_DIR` to point to that mount).
+
+- **Bug reports and feature requests**:
+  If you encounter issues or want to propose a task, file an issue using the [GitHub issue forms](.github/ISSUE_TEMPLATE/) ([Bug Report](.github/ISSUE_TEMPLATE/bug_report.yml), [Task](.github/ISSUE_TEMPLATE/task.md)). For contributor workflow and coding conventions, see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Contributing
 
-Work is tracked as `LYZ-xx` issues in Linear. Every change goes through a pull request against `main`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contributor guidelines and [`AGENTS.md`](AGENTS.md) for detailed rules. Reviews follow [`docs/agents/review.md`](docs/agents/review.md).
+Work is tracked as `LYZ-xx` issues in Linear. For bug reports and feature requests, use the GitHub [issue templates](.github/ISSUE_TEMPLATE/) ([Bug Report](.github/ISSUE_TEMPLATE/bug_report.yml) or [Task](.github/ISSUE_TEMPLATE/task.md)). Every change goes through a pull request against `main`. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contributor guidelines and [`AGENTS.md`](AGENTS.md) for detailed rules. Reviews follow [`docs/agents/review.md`](docs/agents/review.md).
 
 ## Security
 

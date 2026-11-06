@@ -18,6 +18,9 @@ use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 use futures_util::future::join_all;
 
+mod support;
+use support::test_tempdir;
+
 const A_V6: &str = "fd64:796c:6f73:1::2";
 const A_V4: &str = "10.0.1.2";
 const C_V6: &str = "fd64:796c:6f73:2::2";
@@ -258,6 +261,13 @@ fn backing_of(lab: &Lab) -> BTreeMap<String, Backing> {
         .collect()
 }
 
+async fn agent_cpu_ticks(lab: &Lab, node: &str) -> u64 {
+    let stat = guest(lab, node, "cat /proc/$(pidof dylos-agent)/stat").await;
+    let (_, fields) = stat.rsplit_once(')').expect("agent proc stat comm");
+    let fields: Vec<_> = fields.split_whitespace().collect();
+    fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+}
+
 async fn down(config: &LabConfig, lab: Lab) {
     let (id, socket) = (lab.id().to_owned(), lab.control_socket());
     let server = tokio::spawn(lab.supervise());
@@ -296,7 +306,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         eprintln!("SKIPPED fork_e2e: requires root, KVM and built images/binaries");
         return;
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
@@ -322,12 +332,43 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
 
     let result = std::panic::AssertUnwindSafe(async {
         dual_stack(&config, &original, "A", C_V6, C_V4).await;
+        // Age the running agents beyond the old 5 s retry cap before capture.
+        // This is a workload duration, not a readiness synchronization delay.
+        let mut cpu_before = Vec::new();
+        for node in ["A", "B", "C"] {
+            cpu_before.push(agent_cpu_ticks(&original, node).await);
+        }
+        let aged = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut aging = tokio::time::interval(Duration::from_millis(100));
+        while tokio::time::Instant::now() < aged {
+            aging.tick().await;
+        }
+        for (node, before) in ["A", "B", "C"].into_iter().zip(cpu_before) {
+            let ticks = agent_cpu_ticks(&original, node).await - before;
+            // Linux x86_64 proc stat uses USER_HZ=100: <= 100 ms CPU over 10 s.
+            assert!(
+                ticks <= 10,
+                "{node}: waiting agent consumed {ticks} CPU ticks"
+            );
+        }
         let manifest = original.snapshot("snap").await.unwrap();
         let snapshot = config.store.snapshot_dir("src", "snap");
         // Clones must not depend on the source lab.
         original.teardown().await.unwrap();
         assert!(!config.store.base.join("src").exists());
         assert!(!config.netns_dir.join("dylos-src").exists());
+
+        // Measure one three-VM clone without contention from nine other restores.
+        let clone = Lab::restore_with(&config, &snapshot, "latency")
+            .await
+            .unwrap();
+        let latency = clone.restore_latency().expect("netns to thaw latency");
+        eprintln!("Aged three-VM clone: netns to thaw = {latency:?}");
+        down(&config, clone).await;
+        assert!(
+            latency < Duration::from_millis(500),
+            "aged clone: {latency:?}"
+        );
 
         let clone_ids = Lab::generate_clone_ids("src", 10).unwrap();
         let expected: Vec<_> = (1..=10).map(|i| format!("src-c{i}")).collect();

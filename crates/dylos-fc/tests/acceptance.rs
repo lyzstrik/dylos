@@ -432,19 +432,29 @@ async fn span_records_duration() -> TestResult {
     let dir = tempdir()?;
     let (server, client, _) = server_and_client(&dir)?;
 
-    // Failed call with delay
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     server.set_reply_with_delay(hyper::StatusCode::NOT_FOUND, b"{}".to_vec(), notify.clone());
 
-    let notify_clone = notify.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        notify_clone.notify_one();
-    });
-
     let start = std::time::Instant::now();
-    let err_res = client.get::<Value>("/nothing").await;
-    let _elapsed = start.elapsed();
+    let minimum_duration = std::time::Duration::from_millis(5);
+    let (err_res, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::try_join!(
+            // Keep the expected 404 inside Ok so it cannot abort the server branch.
+            async { Ok::<_, Box<dyn StdError>>(client.get::<Value>("/nothing").await) },
+            async {
+                server.wait_for_request().await?;
+                // The client uses the real monotonic clock, unaffected by Tokio's paused time.
+                let received_at = std::time::Instant::now();
+                while received_at.elapsed() < minimum_duration {
+                    tokio::task::yield_now().await;
+                }
+                notify.notify_one();
+                Ok(())
+            },
+        )
+    })
+    .await??;
+    let elapsed = start.elapsed();
     assert!(err_res.is_err(), "Expected an error");
 
     server.shutdown().await;
@@ -467,7 +477,15 @@ async fn span_records_duration() -> TestResult {
         .parse()
         .map_err(|e| format!("duration not numeric: {e}"))?;
     assert_eq!(dur_field.0, "duration_ms");
-    assert!(dur_val >= 100, "duration {dur_val} is less than 100ms");
+    assert!(span.closed, "duration span never closed");
+    assert!(
+        u128::from(dur_val) >= minimum_duration.as_millis(),
+        "duration {dur_val}ms is shorter than the response hold {minimum_duration:?}"
+    );
+    assert!(
+        u128::from(dur_val) <= elapsed.as_millis(),
+        "duration {dur_val}ms exceeds total elapsed time {elapsed:?}"
+    );
 
     Ok(())
 }
@@ -680,7 +698,7 @@ async fn fake_server_raii_drops_socket() -> TestResult {
         if start.elapsed() > std::time::Duration::from_millis(500) {
             return Err("Socket file was not removed by Drop".into());
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
     assert!(tokio::net::UnixStream::connect(&sock).await.is_err());

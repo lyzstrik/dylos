@@ -55,6 +55,13 @@ pub enum LabError {
         operation: Box<Self>,
         cleanup: Box<Self>,
     },
+    #[error("lab {lab}: socket path {path:?} ({len} bytes) exceeds limit of {limit} bytes")]
+    SocketPathTooLong {
+        lab: String,
+        path: PathBuf,
+        len: usize,
+        limit: usize,
+    },
 }
 
 impl LabError {
@@ -556,6 +563,14 @@ impl Lab {
 
     async fn bind_control_socket(&mut self) -> Result<()> {
         let socket = self.control_socket();
+        if let Err(len) = crate::jailer::validate_unix_socket_path(&socket) {
+            return Err(LabError::SocketPathTooLong {
+                lab: self.id.clone(),
+                path: socket,
+                len,
+                limit: crate::jailer::MAX_UNIX_SOCKET_PATH,
+            });
+        }
         self.listener = Some(UnixListener::bind(&socket).map_err(|e| io(&self.id, e))?);
         tokio::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
             .await
@@ -568,6 +583,12 @@ impl Lab {
         self.storage
             .as_ref()
             .map_or(Path::new(""), dylos_store::Lab::root)
+    }
+
+    /// Returns the host path of a lab control socket under the given store base.
+    #[must_use]
+    pub fn control_socket_path(store_base: &Path, lab_id: &str) -> PathBuf {
+        store_base.join(lab_id).join("control.sock")
     }
 
     #[must_use]
@@ -1014,6 +1035,15 @@ fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {
         ));
     }
     spec.validate()?;
+    let control_socket = Lab::control_socket_path(&config.store.base, id);
+    if let Err(len) = crate::jailer::validate_unix_socket_path(&control_socket) {
+        return Err(LabError::SocketPathTooLong {
+            lab: id.into(),
+            path: control_socket,
+            len,
+            limit: crate::jailer::MAX_UNIX_SOCKET_PATH,
+        });
+    }
     for node in &spec.nodes {
         if node.vcpus == 0
             || node.vcpus > 32
@@ -1296,7 +1326,9 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
             if Instant::now() >= deadline {
                 return Err(invalid(id, "cgroup remained populated after kill"));
             }
-            std::thread::yield_now();
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
     Ok(())

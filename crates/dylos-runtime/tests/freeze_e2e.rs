@@ -9,6 +9,9 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig};
 use serde_json::Value;
 
+mod support;
+use support::test_tempdir;
+
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 async fn guest(lab: &Lab, node: &str, command: &str) -> String {
@@ -80,7 +83,7 @@ async fn wait_for_rx(lab: &Lab, before: u64) {
             if guest_rx(lab).await[3] > before + 100 {
                 break;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
@@ -267,8 +270,8 @@ async fn abc_fabric_freeze_under_real_traffic() {
             return;
         }
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     // Keep expected TAP-down errors separate from serial command sentinels.
     jailer.jailer = PathBuf::from("/bin/sh");
     jailer.launcher_args = vec![
