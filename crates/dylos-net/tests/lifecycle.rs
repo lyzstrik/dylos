@@ -139,7 +139,9 @@ fn wait_until_netns_gone(path: &Path) {
             "{} never removed",
             path.display()
         );
-        std::thread::yield_now();
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -238,7 +240,10 @@ fn teardown_deletes_devices_even_if_a_process_still_holds_the_netns() {
                 Instant::now() < deadline,
                 "child never entered the lab netns"
             );
-            std::thread::yield_now();
+            tokio::time::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .await;
         }
 
         net.teardown().await.unwrap();

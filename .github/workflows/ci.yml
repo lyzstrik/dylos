@@ -48,3 +48,26 @@ jobs:
 
       - name: Run checks
         run: just check
+
+  fuzz-check:
+    name: Fuzz check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: just@1.58.0,cargo-deny@0.20.2
+          fallback: none
+
+      - name: Install fuzz tools
+        working-directory: fuzz
+        run: |
+          rustup toolchain install nightly-2026-10-13 --profile minimal
+          cargo install --locked cargo-fuzz --version 0.13.2
+
+      - name: Build fuzz harnesses
+        run: just fuzz-check
