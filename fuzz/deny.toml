@@ -1,0 +1,36 @@
+[advisories]
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "ISC",
+    "0BSD",
+    "CC0-1.0",
+    "Zlib",
+]
+
+# NCSA is permissive and OSI-approved; libfuzzer-sys is fuzz-only, never shipped.
+[[licenses.exceptions]]
+allow = ["NCSA"]
+crate = "libfuzzer-sys"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+skip = [
+    { crate = "syn@2.0.119", reason = "transitive dependency of tracing-attributes 0.1.31" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
