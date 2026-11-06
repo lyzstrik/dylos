@@ -51,6 +51,8 @@ Check the host with:
 just host-check
 ```
 
+See [`docs/cli.md`](docs/cli.md) for the CLI reference and LabSpec format.
+
 ## Getting started
 
 ### 1. Obtain the source
