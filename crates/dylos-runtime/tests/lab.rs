@@ -3,14 +3,21 @@
 mod support;
 
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use dylos_core::{LabSpec, guest_net};
 use dylos_runtime::{Fleet, Lab, LabConfig, LabError, Timeouts};
 use support::{Mode, Sandbox};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::SubscriberExt;
 
 #[test]
 fn fake_jailer_entry() {
@@ -885,13 +892,28 @@ async fn fleet_signal_teardown_keeps_supervisor_failure_as_main_error_after_unex
     assert_lab_removed(&sandbox, &config, &["f1", "h1"]);
 }
 
+struct RequestProcessed(Arc<AtomicBool>);
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestProcessed {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message<'a>(&'a AtomicBool);
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message"
+                    && format!("{value:?}").starts_with("teardown request failed")
+                {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        event.record(&mut Message(&self.0));
+    }
+}
+
 async fn assert_signal_teardown_preserves_supervisor_failure_during_cleanup(remove_socket: bool) {
     let dir = tempfile::tempdir().unwrap();
     let f1_socket = dir.path().join("f1.sock");
-    let sync_socket = dir.path().join("sync.sock");
 
     let f1_listener = tokio::net::UnixListener::bind(&f1_socket).unwrap();
-    let sync_listener = tokio::net::UnixListener::bind(&sync_socket).unwrap();
 
     let mut config = LabConfig::default();
     config.store.base = dir.path().to_path_buf();
@@ -899,7 +921,6 @@ async fn assert_signal_teardown_preserves_supervisor_failure_during_cleanup(remo
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (cleanup_gate_tx, cleanup_gate_rx) = tokio::sync::oneshot::channel();
-    let (sync_teardown_tx, sync_teardown_rx) = tokio::sync::oneshot::channel();
     let (in_join_tx, in_join_rx) = tokio::sync::oneshot::channel();
 
     // Supervisor for f1: simulates unexpected VM exit followed by teardown.
@@ -923,34 +944,41 @@ async fn assert_signal_teardown_preserves_supervisor_failure_during_cleanup(remo
         })
     });
 
-    // Supervisor for sync: coordinates with the test to prove that Fleet::shutdown
-    // has completed its request loop and is waiting in the join phase.
-    fleet.spawn_supervisor("sync".into(), sync_socket, async move {
-        let _ = sync_teardown_rx.await;
-        let _ = in_join_tx.send(());
-        Ok(())
+    // Observe Fleet's own error processing, then signal only after its poll returns.
+    // This also covers an unconditional abort: cancellation is requested before
+    // cleanup can be released, regardless of when the supervisor is scheduled.
+    let processed = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(RequestProcessed(processed.clone()));
+    let run = tokio::spawn(async move {
+        let run = fleet
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .with_subscriber(subscriber);
+        tokio::pin!(run);
+        let mut in_join_tx = Some(in_join_tx);
+        std::future::poll_fn(move |cx| {
+            let result = run.as_mut().poll(cx);
+            if processed.load(Ordering::SeqCst)
+                && let Some(tx) = in_join_tx.take()
+            {
+                tx.send(()).unwrap();
+            }
+            result
+        })
+        .await
     });
 
-    // Handle teardown request for sync.
-    let sync_teardown_task = tokio::spawn(async move {
-        let (mut stream, _) = sync_listener.accept().await.unwrap();
-        let mut cmd = [0u8; 9];
-        stream.read_exact(&mut cmd).await.unwrap();
-        assert_eq!(&cmd, b"teardown\n");
-        stream.write_all(b"ok\n").await.unwrap();
-        drop(stream);
-        let _ = sync_teardown_tx.send(());
-    });
-
-    let run = tokio::spawn(fleet.run(async move {
-        let _ = shutdown_rx.await;
-    }));
-
-    // Wait until Fleet::shutdown has processed teardown requests and entered the join phase.
-    in_join_rx.await.unwrap();
-    sync_teardown_task.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), in_join_rx)
+        .await
+        .expect("Fleet did not process the failed teardown request")
+        .unwrap();
 
     // Prove the supervisor was NOT aborted and remains running while cleanup is pending.
+    assert!(
+        !cleanup_gate_tx.is_closed(),
+        "supervisor dropped cleanup gate"
+    );
     assert!(
         !run.is_finished(),
         "supervisor must not be aborted while cleanup is pending"
