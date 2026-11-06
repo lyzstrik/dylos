@@ -550,7 +550,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         }
     }
     if mode == "Echo" || mode.starts_with("Lab") {
-        spawn_echo_responder(mode);
+        spawn_echo_responder(mode, sandbox);
     }
     let mut stalled = Vec::new();
     let mut oversized_sent = false;
@@ -1177,12 +1177,23 @@ fn is_fix_no_prompt(line: &str) -> bool {
     false
 }
 
-fn spawn_echo_responder(mode: &str) {
+fn spawn_echo_responder(mode: &str, sandbox: &Path) {
     let mode = mode.to_string();
+    let sandbox = sandbox.to_path_buf();
     std::thread::spawn(move || {
         use std::io::{BufRead, Write};
         let stdin = std::io::stdin();
         for line in stdin.lock().lines().map_while(Result::ok) {
+            let _ = std::fs::write(sandbox.join("exec-lock-acquired"), b"1");
+            if sandbox.join("exec-gate").exists() {
+                let _ = std::fs::remove_file(sandbox.join("exec-gate"));
+                let release = sandbox.join("exec-release");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !release.exists() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let _ = std::fs::remove_file(&release);
+            }
             let cmd = if mode.starts_with("Lab") && line.contains("ping ") {
                 line.replace("ping ", ": ")
             } else {
