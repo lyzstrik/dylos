@@ -671,7 +671,8 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
     if !supported(&config, &spec).unwrap() {
         return;
     }
-    let mut fleet = Fleet::new(&config, Duration::from_millis(500));
+    let timeout = Duration::from_secs(30);
+    let mut fleet = Fleet::new(&config, timeout);
     // Holds the lab and its bound socket but never answers: the request times out.
     let stalled = Lab::up_with(&config, &spec, "f1").await.unwrap();
     let socket = stalled.control_socket();
@@ -682,9 +683,32 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
     let unreachable = Lab::up_with(&config, &spec, "f2").await.unwrap();
     fs::remove_file(unreachable.control_socket()).unwrap();
     fleet.spawn(unreachable);
-    fleet.spawn(Lab::up_with(&config, &spec, "f3").await.unwrap());
+    let healthy = Lab::up_with(&config, &spec, "f3").await.unwrap();
+    let (healthy_done, mut healthy_stopped) = tokio::sync::oneshot::channel();
+    fleet.spawn_supervisor("f3".into(), healthy.control_socket(), async move {
+        let result = healthy.supervise().await;
+        healthy_done.send(()).unwrap();
+        result
+    });
 
-    let failures = fleet.run(std::future::ready(())).await.unwrap_err().0;
+    // A real 500 ms fleet deadline races host cleanup (VM cleanup alone allows 2 s).
+    // Keep time frozen until the healthy response, then expire only the stalled request.
+    tokio::time::pause();
+    let shutdown = tokio::spawn(fleet.run(std::future::ready(())));
+    let started = std::time::Instant::now();
+    loop {
+        match healthy_stopped.try_recv() {
+            Ok(()) => break,
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            Err(error) => panic!("healthy supervisor dropped completion signal: {error}"),
+        }
+        assert!(started.elapsed() < timeout, "healthy teardown stalled");
+        // Remaining runnable prevents Tokio from automatically advancing paused time.
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(timeout).await;
+    tokio::time::resume();
+    let failures = shutdown.await.unwrap().unwrap_err().0;
     assert_eq!(failures.len(), 2, "{failures:?}");
     for failure in &failures {
         let kind = match failure.lab.as_str() {
