@@ -863,3 +863,40 @@ async fn preflight_rejects_bad_image_before_creating_resources() {
     assert!(!config.store.base.exists());
     assert_removed(&sandbox, &config);
 }
+
+#[tokio::test]
+async fn condition_polling_backs_off_until_success() {
+    let start = std::time::Instant::now();
+    let mut polls = 0;
+    support::wait_until("backoff", Duration::from_secs(5), || {
+        polls += 1;
+        start.elapsed() >= Duration::from_millis(35)
+    })
+    .await;
+    assert!(polls <= 5, "condition was polled {polls} times");
+
+    let start = std::time::Instant::now();
+    let mut polls = 0;
+    support::wait_until_async("async backoff", Duration::from_secs(5), || {
+        polls += 1;
+        std::future::ready(start.elapsed() >= Duration::from_millis(35))
+    })
+    .await;
+    assert!(polls <= 5, "async condition was polled {polls} times");
+}
+
+#[tokio::test]
+async fn condition_polling_still_times_out() {
+    let task = tokio::spawn(support::wait_until(
+        "never ready",
+        Duration::from_millis(25),
+        || false,
+    ));
+    assert!(task.await.unwrap_err().is_panic());
+    let task = tokio::spawn(support::wait_until_async(
+        "never ready asynchronously",
+        Duration::from_millis(25),
+        || std::future::ready(false),
+    ));
+    assert!(task.await.unwrap_err().is_panic());
+}

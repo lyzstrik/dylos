@@ -137,7 +137,7 @@ impl Sandbox {
 pub async fn wait_until(what: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
     let res = tokio::time::timeout(timeout, async {
         while !condition() {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
@@ -152,7 +152,7 @@ pub async fn wait_until_async<F: Future<Output = bool>>(
 ) {
     let res = tokio::time::timeout(timeout, async {
         while !condition().await {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await;
@@ -800,7 +800,7 @@ pub async fn readiness_case(
             let timeout = Duration::from_secs(5);
             tokio::time::timeout(timeout, async {
                 while !vm.output().iter().any(|entry| entry == line) {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await

@@ -110,7 +110,7 @@ async fn progress(lab: &Lab, family: &str, previous: u64) -> u64 {
             if count > previous + 65536 {
                 return count;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
