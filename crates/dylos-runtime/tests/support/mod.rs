@@ -54,6 +54,128 @@ pub enum Mode {
     LabSnapshot,
 }
 
+/// Returns a short temporary directory suitable for test jails and stores.
+///
+/// Reflinks (used for microVM images and snapshots) require the image,
+/// lab store, and jail directory to reside on the same filesystem mount.
+/// On systems where `/tmp` is on a different mount from the workspace
+/// (such as GitHub Actions runners with a loop-mounted XFS filesystem or
+/// hosts with a tmpfs `/tmp`), `/tmp` cannot be used for reflinks.
+///
+/// To keep Unix domain socket paths comfortably below Linux's 108-byte `sockaddr_un`
+/// limit even on deep checkout paths, this helper selects a short, operator-controlled
+/// location on the required filesystem independently of checkout depth:
+/// 1. `DYLOS_TEST_TMPDIR` if set by the operator.
+/// 2. `/tmp` if on the same mount as the workspace.
+/// 3. `/var/tmp` if on the same mount as the workspace.
+/// 4. An operator-controlled `.t` directory under `$HOME` if on the same mount.
+/// 5. A `.t` directory at the mount root or the shallowest writable ancestor
+///    on the same mount (never descending into deep checkout trees).
+pub fn test_tempdir() -> tempfile::TempDir {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    test_tempdir_for(&workspace)
+}
+
+pub fn test_tempdir_for(workspace: &Path) -> tempfile::TempDir {
+    test_tempdir_with_tmp(workspace, Path::new("/tmp"))
+}
+
+pub fn test_tempdir_with_tmp(workspace: &Path, tmp_dir: &Path) -> tempfile::TempDir {
+    if let Some(custom) = std::env::var_os("DYLOS_TEST_TMPDIR").filter(|s| !s.is_empty()) {
+        let base = PathBuf::from(custom);
+        std::fs::create_dir_all(&base).unwrap();
+        return tempfile::Builder::new()
+            .prefix("")
+            .tempdir_in(&base)
+            .unwrap();
+    }
+
+    let base = select_test_temp_base(workspace, tmp_dir);
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix("")
+        .tempdir_in(&base)
+        .unwrap()
+}
+
+fn is_writable_dir(path: &Path) -> bool {
+    path.is_dir()
+        && tempfile::Builder::new()
+            .prefix(".probe")
+            .tempfile_in(path)
+            .is_ok()
+}
+
+fn try_temp_base(path: &Path) -> bool {
+    std::fs::create_dir_all(path).is_ok() && is_writable_dir(path)
+}
+
+pub fn select_test_temp_base(workspace: &Path, tmp_dir: &Path) -> PathBuf {
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let ws_dev = match std::fs::metadata(&canonical_ws) {
+        Ok(m) => m.dev(),
+        Err(_) => return tmp_dir.to_path_buf(),
+    };
+
+    // 1. Probe candidate standard temporary locations
+    if std::fs::metadata(tmp_dir).is_ok_and(|meta| meta.dev() == ws_dev && is_writable_dir(tmp_dir))
+    {
+        return tmp_dir.to_path_buf();
+    }
+
+    let var_tmp = Path::new("/var/tmp");
+    if std::fs::metadata(var_tmp).is_ok_and(|meta| meta.dev() == ws_dev && is_writable_dir(var_tmp))
+    {
+        return var_tmp.to_path_buf();
+    }
+
+    // 2. Probe operator's home directory if on the same mount
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && std::fs::metadata(&home).is_ok_and(|meta| meta.dev() == ws_dev)
+    {
+        let candidate = home.join(".t");
+        if try_temp_base(&candidate) {
+            return candidate;
+        }
+    }
+
+    // 3. Find the mount root of the required filesystem
+    let mut mount_root = canonical_ws.clone();
+    while let Some(parent) = mount_root.parent() {
+        if std::fs::metadata(parent).is_ok_and(|meta| meta.dev() == ws_dev) {
+            mount_root = parent.to_path_buf();
+            continue;
+        }
+        break;
+    }
+
+    let mount_t = mount_root.join(".t");
+    if try_temp_base(&mount_t) {
+        return mount_t;
+    }
+
+    // 4. Walk down from mount_root along ancestors towards canonical_ws,
+    // selecting the shallowest writable ancestor
+    if let Ok(rel) = canonical_ws.strip_prefix(&mount_root) {
+        let mut current = mount_root;
+        for component in rel.components() {
+            current.push(component);
+            let candidate = current.join(".t");
+            if try_temp_base(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    // Fallback if none of the ancestors were writable
+    canonical_ws.join(".t")
+}
+
 pub struct Sandbox {
     pub dir: tempfile::TempDir,
     pub config: JailerConfig,
@@ -61,14 +183,11 @@ pub struct Sandbox {
 
 impl Sandbox {
     pub fn new(mode: Mode) -> Self {
-        Self::with_dir(mode, tempfile::tempdir().unwrap())
+        Self::with_dir(mode, test_tempdir())
     }
 
     pub fn in_target(mode: Mode) -> Self {
-        Self::with_dir(
-            mode,
-            tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
-        )
+        Self::new(mode)
     }
 
     fn with_dir(mode: Mode, dir: tempfile::TempDir) -> Self {
