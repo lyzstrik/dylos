@@ -1045,11 +1045,7 @@ fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {
         });
     }
     for node in &spec.nodes {
-        if node.vcpus == 0
-            || node.vcpus > 32
-            || (node.vcpus != 1 && node.vcpus % 2 != 0)
-            || node.memory == 0
-        {
+        if !crate::vm::validate_resources(node.vcpus, node.memory) {
             return Err(invalid(id, "invalid VM vCPU or memory configuration"));
         }
         JailPaths::new(&config.jailer, &jail_identity(id), &node.name)?;

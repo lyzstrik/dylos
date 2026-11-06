@@ -65,6 +65,12 @@ pub enum Error {
     CleanupFailed { id: String, message: String },
     #[error("VM {id}: metrics_poll must not be zero")]
     ZeroMetricsPoll { id: String },
+    #[error("VM {id}: invalid vCPU count ({vcpu_count}) or memory size ({mem_size_mib} MiB)")]
+    InvalidResources {
+        id: String,
+        vcpu_count: u32,
+        mem_size_mib: u32,
+    },
     #[error("VM {id}: process still alive {timeout:?} after SIGKILL")]
     KillTimeout { id: String, timeout: Duration },
     #[error("VM {id}: exec failed: {message}")]

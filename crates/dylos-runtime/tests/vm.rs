@@ -313,6 +313,108 @@ async fn zero_metrics_poll_is_refused_before_spawning() {
 }
 
 #[tokio::test]
+async fn launch_rejects_zero_vcpu_count_before_spawning() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut spec = spec(&sandbox);
+    spec.vcpu_count = 0;
+    let err = Vm::launch(&sandbox.config, &spec).await.err().unwrap();
+    assert!(
+        matches!(
+            err,
+            Error::InvalidResources {
+                vcpu_count: 0,
+                mem_size_mib: 128,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn launch_rejects_vcpu_count_exceeding_32_before_spawning() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut spec = spec(&sandbox);
+    spec.vcpu_count = 33;
+    let err = Vm::launch(&sandbox.config, &spec).await.err().unwrap();
+    assert!(
+        matches!(
+            err,
+            Error::InvalidResources {
+                vcpu_count: 33,
+                mem_size_mib: 128,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn launch_rejects_odd_vcpu_count_above_1_before_spawning() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    for odd_vcpus in [3, 5, 7, 31] {
+        let mut spec = spec(&sandbox);
+        spec.vcpu_count = odd_vcpus;
+        let err = Vm::launch(&sandbox.config, &spec).await.err().unwrap();
+        assert!(
+            matches!(
+                err,
+                Error::InvalidResources {
+                    vcpu_count,
+                    mem_size_mib: 128,
+                    ..
+                } if vcpu_count == u32::from(odd_vcpus)
+            ),
+            "{err}"
+        );
+        sandbox.assert_no_jail_left();
+    }
+}
+
+#[tokio::test]
+async fn launch_rejects_zero_memory_size_before_spawning() {
+    let sandbox = Sandbox::new(Mode::Serve);
+    let mut spec = spec(&sandbox);
+    spec.mem_size_mib = 0;
+    let err = Vm::launch(&sandbox.config, &spec).await.err().unwrap();
+    assert!(
+        matches!(
+            err,
+            Error::InvalidResources {
+                vcpu_count: 1,
+                mem_size_mib: 0,
+                ..
+            }
+        ),
+        "{err}"
+    );
+    sandbox.assert_no_jail_left();
+}
+
+#[test]
+fn validate_resources_accepts_valid_and_rejects_invalid() {
+    use dylos_runtime::validate_resources;
+
+    // Valid: 1 vCPU, even vCPUs up to 32, non-zero memory
+    assert!(validate_resources(1, 128));
+    assert!(validate_resources(2, 128));
+    assert!(validate_resources(4, 256));
+    assert!(validate_resources(32, 1024));
+
+    // Invalid: vcpu == 0, vcpu > 32, odd vcpu > 1, mem == 0
+    assert!(!validate_resources(0, 128));
+    assert!(!validate_resources(33, 128));
+    assert!(!validate_resources(34, 128));
+    assert!(!validate_resources(3, 128));
+    assert!(!validate_resources(5, 128));
+    assert!(!validate_resources(1, 0));
+    assert!(!validate_resources(0, 0));
+}
+
+#[tokio::test]
 #[allow(clippy::panic)]
 async fn launch_fails_during_start_and_includes_output() {
     let sandbox = Sandbox::new(Mode::FailDuringStart);

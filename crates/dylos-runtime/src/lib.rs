@@ -28,4 +28,4 @@ pub use jailer::{MAX_UNIX_SOCKET_PATH, SUN_PATH_LEN, validate_unix_socket_path};
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
 pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms, verify_snapshot};
-pub use vm::{ExecOutput, ProcessState, Timeouts, Vm, VmSpec};
+pub use vm::{ExecOutput, ProcessState, Timeouts, Vm, VmSpec, validate_resources};
