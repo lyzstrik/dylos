@@ -31,7 +31,7 @@ async fn progress(lab: &Lab, previous: u64) -> u64 {
             if size > previous {
                 return size;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await

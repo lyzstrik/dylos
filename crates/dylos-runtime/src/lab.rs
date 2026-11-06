@@ -1326,7 +1326,9 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
             if Instant::now() >= deadline {
                 return Err(invalid(id, "cgroup remained populated after kill"));
             }
-            std::thread::yield_now();
+            std::thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
     }
     Ok(())
