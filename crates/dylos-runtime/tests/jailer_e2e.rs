@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod support;
+use support::test_tempdir;
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -93,7 +94,7 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
         eprintln!("SKIPPED real_jailer e2e test: {reason}");
         return;
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let bin = binaries_dir().unwrap();
     let mut config = JailerConfig::new(dir.path(), NOBODY, NOBODY);
     config.jailer = bin.join("jailer");

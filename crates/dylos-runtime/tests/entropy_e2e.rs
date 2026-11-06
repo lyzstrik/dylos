@@ -9,6 +9,9 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
+mod support;
+use support::test_tempdir;
+
 async fn exec(lab: &Lab, node: &str, command: &str) -> String {
     let result = lab
         .exec(node, command, Duration::from_secs(10))
@@ -45,7 +48,7 @@ async fn clones_reseed_kernel_rng_via_vmgenid() {
         eprintln!("SKIPPED entropy_e2e: requires root, KVM and built images/binaries");
         return;
     }
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
