@@ -117,7 +117,7 @@ async fn run_lab(terminal_sigint: bool) {
             assert_eq!(*state.borrow(), ProcessState::Running);
         }
     }
-    Lab::request_teardown(&socket, Duration::from_secs(60))
+    Lab::request_teardown(id, &socket, Duration::from_secs(60))
         .await
         .unwrap();
     server.await.unwrap().unwrap();

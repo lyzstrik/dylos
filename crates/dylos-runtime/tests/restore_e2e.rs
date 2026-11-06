@@ -175,7 +175,7 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
             .collect();
         let socket = clone.control_socket();
         let server = tokio::spawn(clone.supervise());
-        Lab::request_teardown(&socket, Duration::from_secs(60))
+        Lab::request_teardown("dst", &socket, Duration::from_secs(60))
             .await
             .unwrap();
         server.await.unwrap().unwrap();

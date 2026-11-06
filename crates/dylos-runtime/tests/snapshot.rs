@@ -933,9 +933,10 @@ async fn snapshot_via_control_socket() {
     }
 
     // 5. Successful snapshot returns snapshot ID
-    let snap_id = Lab::request_snapshot(&socket, Some("snap-socket"), Duration::from_secs(10))
-        .await
-        .unwrap();
+    let snap_id =
+        Lab::request_snapshot("lc", &socket, Some("snap-socket"), Duration::from_secs(10))
+            .await
+            .unwrap();
     assert_eq!(snap_id, "snap-socket");
 
     let snap_dir = config.store.snapshot_dir("lc", "snap-socket");
@@ -946,7 +947,7 @@ async fn snapshot_via_control_socket() {
     assert_eq!(manifest.vms.len(), 3);
 
     // 6. Teardown
-    Lab::request_teardown(&socket, Duration::from_secs(5))
+    Lab::request_teardown("lc", &socket, Duration::from_secs(5))
         .await
         .unwrap();
     supervisor.await.unwrap().unwrap();

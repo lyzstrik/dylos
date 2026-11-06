@@ -418,12 +418,14 @@ async fn lab_down(args: DownArgs) -> Result<()> {
     let teardown_res = match pinned {
         Ok(socket_file) => {
             let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket_file.as_raw_fd()));
-            let res = Lab::request_teardown(&socket_path, timeout).await;
+            let res = Lab::request_teardown(&args.id, &socket_path, timeout).await;
             drop(socket_file);
             res
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(LabError::Io {
             lab: args.id.clone(),
+            operation: "pin control socket",
+            path: Lab::control_socket_path(&config.store.base, &args.id),
             source: err,
         }),
         Err(err) => {
@@ -486,7 +488,8 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     };
 
     let socket_path = PathBuf::from(format!("/proc/self/fd/{}", socket_file.as_raw_fd()));
-    let res = Lab::request_snapshot(&socket_path, args.snapshot_id.as_deref(), timeout).await;
+    let res =
+        Lab::request_snapshot(&args.id, &socket_path, args.snapshot_id.as_deref(), timeout).await;
     drop(socket_file);
 
     let snap_id = match res {

@@ -98,9 +98,10 @@ pub async fn inject_entropy<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 pub(crate) fn listeners(
+    lab: &str,
     vms: &[crate::Vm],
     config: &crate::jailer::JailerConfig,
-) -> Result<Vec<tokio::net::UnixListener>, std::io::Error> {
+) -> Result<Vec<tokio::net::UnixListener>, crate::LabError> {
     use std::os::unix::fs::PermissionsExt;
     vms.iter()
         .map(|vm| {
@@ -108,13 +109,16 @@ pub(crate) fn listeners(
                 .paths()
                 .root
                 .join(format!("vsock.sock_{}", dylos_agent::AGENT_VSOCK_PORT));
-            let listener = tokio::net::UnixListener::bind(&path)?;
+            let listener = tokio::net::UnixListener::bind(&path)
+                .map_err(|e| crate::lab::io(lab, "bind agent socket", &path, e))?;
             nix::unistd::chown(
                 &path,
                 Some(nix::unistd::Uid::from_raw(config.uid)),
                 Some(nix::unistd::Gid::from_raw(config.gid)),
-            )?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+            )
+            .map_err(|e| crate::lab::io(lab, "change agent socket owner", &path, e.into()))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| crate::lab::io(lab, "set agent socket permissions", &path, e))?;
             Ok(listener)
         })
         .collect()
