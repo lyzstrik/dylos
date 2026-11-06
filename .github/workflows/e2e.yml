@@ -129,7 +129,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/images/rootfs.ext4
-          key: rootfs-${{ runner.os }}-${{ hashFiles('xtask/images/**', 'Cargo.lock', 'rust-toolchain.toml', 'crates/dylos-agent/**') }}
+          key: rootfs-${{ runner.os }}-${{ hashFiles('xtask/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'crates/dylos-agent/**') }}
 
       - name: Build rootfs image
         if: steps.cache-rootfs.outputs.cache-hit != 'true'
