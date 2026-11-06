@@ -37,10 +37,14 @@ if grep -q "write_churn=1" /proc/cmdline; then
                 fail create
             dd if=/dev/urandom of="$dir/file_$slot.tmp" bs=4k count=2 conv=notrunc oflag=append 2>/dev/null ||
                 fail append
+            sync "$dir/file_$slot.tmp" || fail fsync
             mv "$dir/file_$slot.tmp" "$dir/file_$slot.dat" || fail rename
+            sync "$dir" || fail dirsync
             i=$(( i + 1 ))
-            echo "$i" >"$dir/cycles.tmp" && mv "$dir/cycles.tmp" "$dir/cycles" || fail record
-            sync || fail sync
+            echo "$i" >"$dir/cycles.tmp" || fail record
+            sync "$dir/cycles.tmp" || fail fsync
+            mv "$dir/cycles.tmp" "$dir/cycles" || fail rename
+            sync "$dir" || fail dirsync
             if [ $(( i % 8 )) -eq 0 ]; then
                 echo "dylos: alloc-cycles $i" >/dev/console
             fi

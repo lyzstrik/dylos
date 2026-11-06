@@ -9,6 +9,9 @@ use dylos_runtime::jailer::JailerConfig;
 use dylos_runtime::{Lab, LabConfig, ProcessState};
 use futures_util::future::join_all;
 
+mod support;
+use support::test_tempdir;
+
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
@@ -52,7 +55,7 @@ async fn run_lab(terminal_sigint: bool) {
     // Install before sending to the isolated supervisor group, as the CLI does.
     let mut interrupt =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
-    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = test_tempdir();
     let Some(config) = lab_config(&dir) else {
         return;
     };
@@ -169,7 +172,7 @@ fn lab_config(dir: &tempfile::TempDir) -> Option<LabConfig> {
             return None;
         }
     }
-    let mut jailer = JailerConfig::new(dir.path().join("jails"), 65534, 65534);
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");
     let config = LabConfig {
