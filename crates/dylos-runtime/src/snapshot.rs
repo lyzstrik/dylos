@@ -349,7 +349,9 @@ async fn run_snapshot_steps(
         let api = vm.client.clone();
         let lab_id_for_api = job.lab_id.clone();
         let handle = tokio::spawn(async move {
-            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem");
+            // Captured files are synced after thaw, before manifest publication.
+            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
+                .with_sync_snapshot_files(false);
             api.create_snapshot(&params)
                 .await
                 .map_err(|source| LabError::Api {

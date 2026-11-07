@@ -469,7 +469,7 @@ impl Snapshot {
         self.save_vm_source_impl(source, node, file_name, true)
     }
 
-    /// Captures an isolated state or memory file without hashing it.
+    /// Captures an isolated state or memory file without hashing or syncing it.
     /// # Errors
     /// Enforces the same source and size checks as `save_vm_source`.
     pub fn capture_vm_source(
@@ -529,15 +529,26 @@ impl Snapshot {
             ));
         }
 
-        match reflink(&source_file, &dest_file) {
+        // FICLONE flushes dirty source pages before remapping extents. Deferred
+        // capture uses buffered copy to defer explicit writeback until after thaw.
+        let capture = if hash {
+            reflink(&source_file, &dest_file)
+        } else {
+            copy_bounded(&source_file, &mut dest_file, max_bytes)
+        };
+        match capture {
             Ok(()) => {}
+            Err(err) if !hash => return Err(contextual(&dest_path, fail(err))),
             Err(err)
-                if matches!(
-                    err.raw_os_error(),
-                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
-                ) =>
+                if hash
+                    && matches!(
+                        err.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+                    ) =>
             {
-                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
+                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes)
+                    .and_then(|()| dest_file.sync_all())
+                {
                     return Err(contextual(&dest_path, fail(copy_err)));
                 }
             }
@@ -589,7 +600,7 @@ impl Snapshot {
         ))
     }
 
-    /// Hashes a captured file using its captured size as an upper bound.
+    /// Hashes and syncs a captured file using its captured size as an upper bound.
     /// # Errors
     /// Rejects missing files and changes in captured size.
     pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
@@ -610,6 +621,8 @@ impl Snapshot {
                 io::ErrorKind::InvalidData.into(),
             ));
         }
+        file.sync_all()
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         meta.sha256 = sha256;
         Ok(())
     }
@@ -1140,7 +1153,6 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
         }
         dest.write_all(&buffer[..n])?;
     }
-    dest.sync_all()?;
     Ok(())
 }
 

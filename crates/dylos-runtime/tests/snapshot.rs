@@ -219,6 +219,11 @@ async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
     }
 
     for vm in &lab.vms {
+        let request = fs::read_to_string(vm.paths().root.join("snapshot-request")).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let params: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(params["sync_snapshot_files"], false);
+        assert_eq!(params["snapshot_type"], "Full");
         assert!(
             sandbox
                 .dir

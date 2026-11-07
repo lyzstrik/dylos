@@ -120,12 +120,13 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     let verify_ms = verify_start.elapsed().as_millis();
 
     eprintln!(
-        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
+        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms capture={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
         total_ms,
         timings.freeze_to_thaw_ms,
         manifest.step_durations_ms.freeze,
         manifest.step_durations_ms.pause,
         timings.api_snapshot_ms,
+        timings.storage_ms,
         timings.fsync_ms,
         timings.reflink_ms,
         timings.hash_ms,
@@ -133,6 +134,14 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         manifest.step_durations_ms.resume,
         manifest.step_durations_ms.thaw,
         verify_ms,
+    );
+
+    assert!(
+        timings.freeze_to_thaw_ms < 1000,
+        "5-VM pause must stay below 1 second, got {}ms (API={}ms, capture={}ms)",
+        timings.freeze_to_thaw_ms,
+        timings.api_snapshot_ms,
+        timings.storage_ms,
     );
 
     // Firecracker memory snapshot I/O depends on the runner's disk. Bound only the

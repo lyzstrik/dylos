@@ -733,6 +733,7 @@ async fn fake_firecracker(mode: &str, sandbox: &Path, sock: PathBuf, metrics: Pa
         }
         if request.starts_with("PUT /snapshot/create ") {
             let root = sock.parent().unwrap().parent().unwrap();
+            std::fs::write(root.join("snapshot-request"), &request).unwrap();
             if root.join("stall-snapshot").exists() {
                 std::fs::write(root.join("snapshot-started"), b"").unwrap();
                 wait_until("snapshot stall released", Duration::from_secs(5), || {
