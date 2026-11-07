@@ -299,6 +299,7 @@ dependencies = [
  "dylos-core",
  "dylos-runtime",
  "nix 0.31.3",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
