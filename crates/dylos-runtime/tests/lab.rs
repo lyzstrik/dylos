@@ -3,14 +3,21 @@
 mod support;
 
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use dylos_core::{LabSpec, guest_net};
 use dylos_runtime::{Fleet, Lab, LabConfig, LabError, Timeouts};
 use support::{Mode, Sandbox};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::SubscriberExt;
 
 #[test]
 fn fake_jailer_entry() {
@@ -765,11 +772,22 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
             "f2" => std::io::ErrorKind::NotFound,
             other => panic!("unexpected failure of {other}"),
         };
-        assert_eq!(failure.errors.len(), 1, "{failure}");
+        let expected_count = match failure.lab.as_str() {
+            // f2 is allowed bounded completion; because it never stops, it times out at the deadline.
+            "f2" => 2,
+            _ => 1,
+        };
+        assert_eq!(failure.errors.len(), expected_count, "{failure}");
         assert!(
             matches!(&failure.errors[0], LabError::Io { source, .. } if source.kind() == kind),
             "{failure}"
         );
+        if failure.lab == "f2" {
+            assert!(
+                matches!(&failure.errors[1], LabError::Invalid { message, .. } if message.contains("supervisor did not stop")),
+                "{failure}"
+            );
+        }
     }
     assert_lab_removed(&sandbox, &config, &["f1", "f2", "f3"]);
 }
@@ -801,6 +819,246 @@ async fn fleet_reports_the_recovery_error_with_the_operation_error() {
     assert!(config.store.base.join("f1").exists());
     kept.teardown().await.unwrap();
     assert_lab_removed(&sandbox, &config, &["f1"]);
+}
+
+#[tokio::test]
+async fn fleet_signal_teardown_keeps_supervisor_failure_as_main_error_after_unexpected_vm_exit() {
+    if !sandboxed(
+        "fleet_signal_teardown_keeps_supervisor_failure_as_main_error_after_unexpected_vm_exit",
+    ) {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabCrashOnFlush);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut fleet = Fleet::new(&config, Duration::from_secs(5));
+    let failing = Lab::up_with(&config, &spec, "f1").await.unwrap();
+    let socket = failing.control_socket();
+    let client = crash(&failing);
+    fleet.spawn(failing);
+    let healthy = Lab::up_with(&config, &spec, "h1").await.unwrap();
+    fleet.spawn(healthy);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let run = tokio::spawn(fleet.run(async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    // Trigger unexpected VM exit on f1.
+    flush(&client).await;
+
+    // Wait until f1's supervisor removes control.sock after unexpected VM exit.
+    support::wait_until(
+        "supervisor removed control socket",
+        Duration::from_secs(10),
+        || !socket.exists(),
+    )
+    .await;
+
+    // Signal arrives (SIGINT / SIGTERM) while h1 is still running.
+    shutdown_tx.send(()).unwrap();
+
+    let failures = run.await.unwrap().unwrap_err().0;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let failure = &failures[0];
+    assert_eq!(failure.lab, "f1");
+
+    // Supervisor failure MUST be the main error (index 0).
+    assert!(
+        failure.errors[0]
+            .to_string()
+            .contains("VM exited unexpectedly"),
+        "expected supervisor failure as main error, got: {failure}"
+    );
+
+    // If connection error is present, it must be secondary context.
+    if failure.errors.len() > 1 {
+        assert!(
+            matches!(
+                &failure.errors[1],
+                LabError::Io { source, .. }
+                    if matches!(
+                        source.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::NotFound
+                    )
+            ),
+            "expected connection error as secondary context, got: {failure}"
+        );
+    }
+
+    assert_lab_removed(&sandbox, &config, &["f1", "h1"]);
+}
+
+struct RequestProcessed(Arc<AtomicBool>);
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RequestProcessed {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message<'a>(&'a AtomicBool);
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message"
+                    && format!("{value:?}").starts_with("teardown request failed")
+                {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+        event.record(&mut Message(&self.0));
+    }
+}
+
+async fn assert_signal_teardown_preserves_supervisor_failure_during_cleanup(remove_socket: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let f1_socket = dir.path().join("f1.sock");
+
+    let f1_listener = tokio::net::UnixListener::bind(&f1_socket).unwrap();
+
+    let mut config = LabConfig::default();
+    config.store.base = dir.path().to_path_buf();
+    let mut fleet = Fleet::new(&config, Duration::from_secs(5));
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let (cleanup_gate_tx, cleanup_gate_rx) = tokio::sync::oneshot::channel();
+    let (in_join_tx, in_join_rx) = tokio::sync::oneshot::channel();
+
+    // Supervisor for f1: simulates unexpected VM exit followed by teardown.
+    fleet.spawn_supervisor("f1".into(), f1_socket.clone(), async move {
+        // Drop or unlink the control socket before signal arrives, simulating
+        // teardown having closed the listener or removed storage.
+        drop(f1_listener);
+        if remove_socket {
+            std::fs::remove_file(&f1_socket).unwrap();
+        }
+
+        // Trigger signal teardown.
+        shutdown_tx.send(()).unwrap();
+
+        // Hold cleanup until the failed teardown request has been processed.
+        let _ = cleanup_gate_rx.await;
+
+        Err(LabError::Invalid {
+            lab: "f1".into(),
+            message: "VM exited unexpectedly".into(),
+        })
+    });
+
+    // Observe Fleet's own error processing, then signal only after its poll returns.
+    // This also covers an unconditional abort: cancellation is requested before
+    // cleanup can be released, regardless of when the supervisor is scheduled.
+    let processed = Arc::new(AtomicBool::new(false));
+    let subscriber = tracing_subscriber::registry().with(RequestProcessed(processed.clone()));
+    let run = tokio::spawn(async move {
+        let run = fleet
+            .run(async move {
+                let _ = shutdown_rx.await;
+            })
+            .with_subscriber(subscriber);
+        tokio::pin!(run);
+        let mut in_join_tx = Some(in_join_tx);
+        std::future::poll_fn(move |cx| {
+            let result = run.as_mut().poll(cx);
+            if processed.load(Ordering::SeqCst)
+                && let Some(tx) = in_join_tx.take()
+            {
+                tx.send(()).unwrap();
+            }
+            result
+        })
+        .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), in_join_rx)
+        .await
+        .expect("Fleet did not process the failed teardown request")
+        .unwrap();
+
+    // Prove the supervisor was NOT aborted and remains running while cleanup is pending.
+    assert!(
+        !cleanup_gate_tx.is_closed(),
+        "supervisor dropped cleanup gate"
+    );
+    assert!(
+        !run.is_finished(),
+        "supervisor must not be aborted while cleanup is pending"
+    );
+
+    // Release cleanup gate: supervisor finishes its teardown and returns its exit error.
+    cleanup_gate_tx.send(()).unwrap();
+
+    let failures = run.await.unwrap().unwrap_err().0;
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    let failure = &failures[0];
+    assert_eq!(failure.lab, "f1");
+
+    // Supervisor failure must be the main error (index 0).
+    assert!(
+        failure.errors[0]
+            .to_string()
+            .contains("VM exited unexpectedly"),
+        "expected supervisor failure as main error, got: {failure}"
+    );
+
+    // Teardown request connection/not-found error must follow as secondary context.
+    assert!(
+        failure.errors.len() >= 2
+            && matches!(
+                &failure.errors[1],
+                LabError::Io { source, .. }
+                    if if remove_socket {
+                        source.kind() == std::io::ErrorKind::NotFound
+                    } else {
+                        matches!(
+                            source.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        )
+                    }
+            ),
+        "expected secondary connection context (remove_socket={remove_socket}), got: {failure}"
+    );
+}
+
+#[tokio::test]
+async fn fleet_signal_teardown_during_supervisor_cleanup_preserves_failure_as_main_error() {
+    assert_signal_teardown_preserves_supervisor_failure_during_cleanup(false).await;
+}
+
+#[tokio::test]
+async fn fleet_signal_teardown_when_socket_not_found_preserves_supervisor_failure() {
+    assert_signal_teardown_preserves_supervisor_failure_during_cleanup(true).await;
+}
+
+#[tokio::test]
+async fn fleet_clean_signal_teardown_is_unchanged_when_supervision_has_not_failed() {
+    if !sandboxed("fleet_clean_signal_teardown_is_unchanged_when_supervision_has_not_failed") {
+        return;
+    }
+    let (sandbox, config, spec) = setup(Mode::LabReady);
+    if !supported(&config, &spec).unwrap() {
+        return;
+    }
+    let mut fleet = Fleet::new(&config, Duration::from_secs(5));
+    let healthy = Lab::up_with(&config, &spec, "h1").await.unwrap();
+    fleet.spawn(healthy);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let run = tokio::spawn(fleet.run(async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    // Trigger signal teardown without any supervision failure.
+    shutdown_tx.send(()).unwrap();
+
+    let result = run.await.unwrap();
+    assert!(
+        result.is_ok(),
+        "clean signal teardown must succeed: {result:?}"
+    );
+
+    assert_lab_removed(&sandbox, &config, &["h1"]);
 }
 
 /// Leftovers of a lab whose rollback failed are only removable once the blocker is gone.
