@@ -413,6 +413,7 @@ pub struct SnapshotStages {
     pub freeze_ms: MetricSamples,
     pub pause_ms: MetricSamples,
     pub api_snapshot_ms: MetricSamples,
+    pub storage_ms: MetricSamples,
     pub resume_ms: MetricSamples,
     pub thaw_ms: MetricSamples,
     pub hash_ms: MetricSamples,
@@ -420,11 +421,12 @@ pub struct SnapshotStages {
 }
 
 impl SnapshotStages {
-    pub fn as_slice(&self) -> [(&'static str, &MetricSamples); 7] {
+    pub fn as_slice(&self) -> [(&'static str, &MetricSamples); 8] {
         [
             ("freeze", &self.freeze_ms),
             ("pause", &self.pause_ms),
             ("API snapshot", &self.api_snapshot_ms),
+            ("storage", &self.storage_ms),
             ("resume", &self.resume_ms),
             ("thaw", &self.thaw_ms),
             ("hashing", &self.hash_ms),
@@ -1007,6 +1009,7 @@ struct SnapshotMetrics {
     pause: MetricSamples,
     skew: MetricSamples,
     api_snapshot: MetricSamples,
+    storage: MetricSamples,
     resume: MetricSamples,
     thaw: MetricSamples,
     freeze_to_thaw: MetricSamples,
@@ -1087,6 +1090,7 @@ impl Bench<'_> {
             let pause = timings.pause_ms as f64;
             let skew = timings.pause_skew_us as f64 / 1000.0;
             let api_snapshot = timings.api_snapshot_ms as f64;
+            let storage = timings.storage_ms as f64;
             let resume = timings.resume_ms as f64;
             let thaw = timings.thaw_ms as f64;
             let freeze_to_thaw = timings.freeze_to_thaw_ms as f64;
@@ -1098,6 +1102,7 @@ impl Bench<'_> {
             metrics.pause.add(pause);
             metrics.skew.add(skew);
             metrics.api_snapshot.add(api_snapshot);
+            metrics.storage.add(storage);
             metrics.resume.add(resume);
             metrics.thaw.add(thaw);
             metrics.freeze_to_thaw.add(freeze_to_thaw);
@@ -1336,6 +1341,7 @@ async fn measure_into(
             freeze_ms: snapshot.freeze,
             pause_ms: snapshot.pause,
             api_snapshot_ms: snapshot.api_snapshot,
+            storage_ms: snapshot.storage,
             resume_ms: snapshot.resume,
             thaw_ms: snapshot.thaw,
             hash_ms: snapshot.hash,
@@ -1553,6 +1559,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
     let stage_freeze = stat(Some(&results.snapshot_stages.freeze_ms), 1.0, 1, "ms");
     let stage_pause = stat(Some(&results.snapshot_stages.pause_ms), 1.0, 1, "ms");
     let stage_api = stat(Some(&results.snapshot_stages.api_snapshot_ms), 1.0, 1, "ms");
+    let stage_storage = stat(Some(&results.snapshot_stages.storage_ms), 1.0, 1, "ms");
     let stage_resume = stat(Some(&results.snapshot_stages.resume_ms), 1.0, 1, "ms");
     let stage_thaw = stat(Some(&results.snapshot_stages.thaw_ms), 1.0, 1, "ms");
     let stage_hash = stat(Some(&results.snapshot_stages.hash_ms), 1.0, 1, "ms");
@@ -1567,7 +1574,8 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 | :--- | :--- | :--- | :--- |
 | Freeze | {stage_freeze_med} | {stage_freeze_p95} | Network fabric freeze |
 | Pause | {stage_pause_med} | {stage_pause_p95} | VM pause API |
-| API snapshot | {stage_api_med} | {stage_api_p95} | Memory & state serialization, disk reflink |
+| API snapshot | {stage_api_med} | {stage_api_p95} | Memory & state serialization |
+| Storage | {stage_storage_med} | {stage_storage_p95} | Disk reflink & file capture |
 | Resume | {stage_resume_med} | {stage_resume_p95} | VM resume API |
 | Thaw | {stage_thaw_med} | {stage_thaw_p95} | Network fabric thaw |
 | Hashing | {stage_hash_med} | {stage_hash_p95} | SHA-256 integrity hashing (post-thaw) |
@@ -1579,6 +1587,8 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
         stage_pause_p95 = stage_pause.1,
         stage_api_med = stage_api.0,
         stage_api_p95 = stage_api.1,
+        stage_storage_med = stage_storage.0,
+        stage_storage_p95 = stage_storage.1,
         stage_resume_med = stage_resume.0,
         stage_resume_p95 = stage_resume.1,
         stage_thaw_med = stage_thaw.0,
@@ -1616,7 +1626,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 
 ## Analysis & Findings
 
-1. **Snapshot:** pause window (freeze to thaw) p95 {snap_pause_p95} (limit 1000 ms), pause skew p95 {skew_p95}, total snapshot until published p95 {snap_total_p95}. Per-stage breakdown (p95): freeze {stage_freeze_p95}, pause {stage_pause_p95}, API snapshot {stage_api_p95}, resume {stage_resume_p95}, thaw {stage_thaw_p95}, hashing {stage_hash_p95}, manifest write {stage_manifest_p95}. Dominant stage: {dominant}.
+1. **Snapshot:** pause window (freeze to thaw) p95 {snap_pause_p95} (limit 1000 ms), pause skew p95 {skew_p95}, total snapshot until published p95 {snap_total_p95}. Per-stage breakdown (p95): freeze {stage_freeze_p95}, pause {stage_pause_p95}, API snapshot {stage_api_p95}, storage {stage_storage_p95}, resume {stage_resume_p95}, thaw {stage_thaw_p95}, hashing {stage_hash_p95}, manifest write {stage_manifest_p95}. Dominant stage: {dominant}.
 2. **Fork:** {forks}.
 3. **Memory:** per-clone PSS after settling: {pss_text}. PSS alone does not prove copy-on-write sharing: lazy, largely untouched guest memory also produces low PSS. A sharing / private-dirty measurement is required for that claim.
 4. **Cold boot comparison:** cold boot of 5 microVMs has a median of {cold_boot}; the fork end-to-end median for n = 1 is {fork_n1}.
@@ -1631,6 +1641,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
         stage_freeze_p95 = stage_freeze.1,
         stage_pause_p95 = stage_pause.1,
         stage_api_p95 = stage_api.1,
+        stage_storage_p95 = stage_storage.1,
         stage_resume_p95 = stage_resume.1,
         stage_thaw_p95 = stage_thaw.1,
         stage_hash_p95 = stage_hash.1,

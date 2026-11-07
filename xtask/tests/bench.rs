@@ -53,6 +53,7 @@ fn passing() -> BenchResults {
             freeze_ms: samples(&[2.0]),
             pause_ms: samples(&[80.0]),
             api_snapshot_ms: samples(&[650.0]),
+            storage_ms: samples(&[30.0]),
             resume_ms: samples(&[20.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[5000.0]),
@@ -296,6 +297,7 @@ fn passing_pause_with_slow_publication_is_go_and_shows_dominant_stage() {
             freeze_ms: samples(&[2.0]),
             pause_ms: samples(&[70.0]),
             api_snapshot_ms: samples(&[600.0]),
+            storage_ms: samples(&[40.0]),
             resume_ms: samples(&[20.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[25_000.0]),
@@ -329,6 +331,7 @@ fn failing_pause_is_no_go_regardless_of_publication_time() {
             freeze_ms: samples(&[2.0]),
             pause_ms: samples(&[100.0]),
             api_snapshot_ms: samples(&[1100.0]),
+            storage_ms: samples(&[30.0]),
             resume_ms: samples(&[25.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[700.0]),
@@ -348,6 +351,35 @@ fn failing_pause_is_no_go_regardless_of_publication_time() {
         "Snapshot pause window, freeze to thaw (5 VMs) | < 1000 ms | 1250.0 ms | 1250.0 ms | NO-GO"
     ));
     assert!(report.contains("Dominant stage: API snapshot (p95: 1100.0 ms)"));
+}
+
+#[test]
+fn storage_dominant_stage_is_identified_and_reported() {
+    let r = BenchResults {
+        snapshot_freeze_to_thaw_ms: samples(&[850.0]),
+        snapshot_total_ms: samples(&[1500.0]),
+        snapshot_stages: SnapshotStages {
+            freeze_ms: samples(&[2.0]),
+            pause_ms: samples(&[50.0]),
+            api_snapshot_ms: samples(&[150.0]),
+            storage_ms: samples(&[600.0]),
+            resume_ms: samples(&[20.0]),
+            thaw_ms: samples(&[2.0]),
+            hash_ms: samples(&[300.0]),
+            manifest_ms: samples(&[15.0]),
+        },
+        ..passing()
+    };
+    assert_eq!(r.snapshot_verdict(), "GO");
+    assert_eq!(r.snapshot_stages.dominant_stage(), Some(("storage", 600.0)));
+
+    let report = render_markdown_report(&r);
+    assert!(report.contains("Dominant stage: storage (p95: 600.0 ms)"));
+    assert!(report.contains("| Storage | 600.0 ms | 600.0 ms | Disk reflink & file capture |"));
+    assert!(
+        report.contains("| API snapshot | 150.0 ms | 150.0 ms | Memory & state serialization |")
+    );
+    assert!(!report.contains("Memory & state serialization, disk reflink"));
 }
 
 fn fast() -> SettleParams {
