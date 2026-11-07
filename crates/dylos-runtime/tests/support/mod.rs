@@ -176,6 +176,8 @@ pub fn select_test_temp_base(workspace: &Path, tmp_dir: &Path) -> PathBuf {
     canonical_ws.join(".t")
 }
 
+const STATIC_BINARY_FIXTURE: &[u8] = include_bytes!("../fixtures/elf/static_binary");
+
 pub struct Sandbox {
     pub dir: tempfile::TempDir,
     pub config: JailerConfig,
@@ -193,7 +195,9 @@ impl Sandbox {
     fn with_dir(mode: Mode, dir: tempfile::TempDir) -> Self {
         let meta = std::fs::metadata(dir.path()).unwrap();
         let exec = dir.path().join("firecracker");
-        std::fs::write(&exec, format!("{mode:?}")).unwrap();
+        let mut content = STATIC_BINARY_FIXTURE.to_vec();
+        content.extend_from_slice(format!("{mode:?}").as_bytes());
+        std::fs::write(&exec, content).unwrap();
         let mut config = JailerConfig::new(dir.path().join("jails"), meta.uid(), meta.gid());
         config.cgroup_root = dir.path().join("cgroup");
         config.jailer = std::env::current_exe().unwrap();
@@ -306,7 +310,14 @@ pub fn run_fake_jailer_if_requested() {
         let cgroup = Path::new(&base).parent().unwrap().join("cgroup");
         std::fs::create_dir_all(cgroup.join(parent).join(&id)).unwrap();
     }
-    let mode = std::fs::read_to_string(&exec).unwrap();
+    let raw = std::fs::read(&exec).unwrap();
+    let mode = if raw.starts_with(STATIC_BINARY_FIXTURE) {
+        std::str::from_utf8(&raw[STATIC_BINARY_FIXTURE.len()..])
+            .unwrap()
+            .to_string()
+    } else {
+        String::from_utf8(raw).unwrap()
+    };
     // A mount point inside the jail makes the lab's teardown fail with EBUSY.
     if Path::new(&base)
         .parent()

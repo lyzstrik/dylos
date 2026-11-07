@@ -5,6 +5,7 @@ mod support;
 use std::fs;
 use std::future::Future;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
     Arc,
@@ -1305,6 +1306,96 @@ async fn up_rejects_api_socket_exceeding_sun_len_before_creating_resources() {
     assert!(
         !config.store.base.exists(),
         "store base should not be created"
+    );
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn up_rejects_dynamic_firecracker_before_creating_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::Serve);
+    let dynamic =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    config.jailer.firecracker = dynamic.clone();
+    let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+    match &err {
+        LabError::DynamicFirecracker { path } => {
+            assert_eq!(path, &dynamic);
+            let msg = err.to_string();
+            assert!(msg.contains("dynamically linked"), "{msg}");
+            assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
+            assert!(msg.contains("docs/host.md"), "{msg}");
+            assert!(msg.contains(&dynamic.display().to_string()), "{msg}");
+        }
+        other => panic!("expected DynamicFirecracker, got {other:?}"),
+    }
+    assert!(
+        !config.store.base.exists(),
+        "store base should not be created"
+    );
+    assert!(
+        !config.jailer.chroot_base_dir.exists(),
+        "jail dir should not be created"
+    );
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn restore_rejects_dynamic_firecracker_before_creating_resources() {
+    let (sandbox, mut config, _spec) = setup(Mode::Serve);
+    let dynamic =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    config.jailer.firecracker = dynamic.clone();
+    let snapshot_dir = sandbox.dir.path().join("fake-snapshot");
+    let err = Lab::restore_with(&config, &snapshot_dir, "restored")
+        .await
+        .err()
+        .unwrap();
+    match &err {
+        LabError::DynamicFirecracker { path } => {
+            assert_eq!(path, &dynamic);
+            let msg = err.to_string();
+            assert!(msg.contains("dynamically linked"), "{msg}");
+            assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
+            assert!(msg.contains("docs/host.md"), "{msg}");
+        }
+        other => panic!("expected DynamicFirecracker, got {other:?}"),
+    }
+    assert!(
+        !config.store.base.join("labs/restored").exists(),
+        "no restored lab dir created"
+    );
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn fork_rejects_dynamic_firecracker_before_creating_resources() {
+    let (sandbox, mut config, _spec) = setup(Mode::Serve);
+    let dynamic =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    config.jailer.firecracker = dynamic.clone();
+    let snapshot_dir = sandbox.dir.path().join("fake-snapshot");
+    let clone_ids = vec!["fork-c1".to_string(), "fork-c2".to_string()];
+    let err = Lab::fork_with(&config, &snapshot_dir, &clone_ids)
+        .await
+        .err()
+        .unwrap();
+    match &err {
+        LabError::DynamicFirecracker { path } => {
+            assert_eq!(path, &dynamic);
+            let msg = err.to_string();
+            assert!(msg.contains("dynamically linked"), "{msg}");
+            assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
+            assert!(msg.contains("docs/host.md"), "{msg}");
+        }
+        other => panic!("expected DynamicFirecracker, got {other:?}"),
+    }
+    assert!(
+        !config.store.base.join("labs/fork-c1").exists(),
+        "no clone dir created"
+    );
+    assert!(
+        !config.store.base.join("labs/fork-c2").exists(),
+        "no clone dir created"
     );
     assert_removed(&sandbox, &config);
 }

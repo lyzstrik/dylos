@@ -1,6 +1,7 @@
 mod support;
 
 use std::os::unix::process::ExitStatusExt;
+use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -165,6 +166,27 @@ async fn launcher_that_cannot_spawn_leaves_nothing() {
         .err()
         .unwrap();
     assert!(matches!(err, Error::Spawn { .. }), "{err}");
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn launch_rejects_dynamic_firecracker_before_preparing_chroot() {
+    let mut sandbox = Sandbox::new(Mode::Serve);
+    let dynamic =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    sandbox.config.firecracker = dynamic.clone();
+    let err = Vm::launch(&sandbox.config, &spec(&sandbox))
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(&err, Error::DynamicFirecracker { path } if path == &dynamic),
+        "{err:?}"
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("dynamically linked"), "{msg}");
+    assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
+    assert!(msg.contains("docs/host.md"), "{msg}");
     sandbox.assert_no_jail_left();
 }
 
@@ -451,7 +473,7 @@ async fn cancelled_shutdown_retries_and_waits_for_cleanup() {
     let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
     sandbox.config.cleanup_barrier = Some(barrier.clone());
     let mut test_spec = spec(&sandbox);
-    test_spec.timeouts.kill = Duration::from_millis(100);
+    test_spec.timeouts.kill = Duration::from_millis(500);
     let mut vm = Vm::launch(&sandbox.config, &test_spec).await.unwrap();
     let cancelled = tokio::select! {
         biased;
