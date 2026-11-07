@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 pub mod agent;
+pub mod diff;
 pub mod error;
 pub mod fleet;
 pub mod jailer;
@@ -22,6 +23,7 @@ pub mod pause;
 pub mod snapshot;
 pub mod vm;
 
+pub use diff::diff_snapshots;
 pub use error::{Error, Result};
 pub use fleet::{Fleet, FleetError, LabFailure};
 pub use jailer::{

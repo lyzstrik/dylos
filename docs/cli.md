@@ -247,6 +247,57 @@ Exits with `0` when cleanly stopped. Exits with `2` on argument parsing errors (
 
 ---
 
+### `dylos lab diff`
+
+Compare two snapshots of a lab to identify topology changes and per-VM file differences.
+
+```text
+Usage: dylos lab diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
+```
+
+#### Arguments & Options
+
+- `<SNAPSHOT_A>`: Path to the first snapshot directory containing `manifest.json`. Required.
+- `<SNAPSHOT_B>`: Path to the second snapshot directory containing `manifest.json`. Required.
+- `--json`: Emit stable machine-readable JSON format on `stdout`.
+- `-h, --help`: Print help and exit `0`.
+
+#### Behavior
+
+- **Read-only**: `dylos lab diff` creates, modifies, and deletes nothing on the host or in storage.
+- **Verification first**: Both snapshots are verified (manifest validity, file sizes, inventory, and the fs-verity digest for sealed files or SHA-256 for unsealed files) before comparison. A corrupted or tampered snapshot is treated as a fatal verification error, never as a diff. Unsealed verification reads all bytes (O(total unsealed size)); sealed verification measures kernel digests without rehashing file contents. Identity uses size and the verified digest; mixed sealed/unsealed pairs conservatively report `changed`.
+- **Topology comparison**: Compares `LabSpec` definitions across segments (added, removed, IP prefix changes), nodes (added, removed, image/vCPU/memory/route changes), and per-node interfaces (added, removed, segment/IP changes).
+- **Per-VM file comparison**: Compares VM state, memory, and disk files, reporting presence status (`identical`, `changed`, `added`, `removed`), with sizes in snapshot A and snapshot B (missing side reported as `null`).
+
+#### Standard Output
+
+Default human output lists topology changes and each VM's state, memory and disk status with byte sizes.
+When `--json` is supplied, a structured JSON document is emitted:
+```json
+{
+  "topology": {
+    "segments": {"added": [], "removed": [], "changed": []},
+    "nodes": {"added": [], "removed": [], "changed": []},
+    "interfaces": {"added": [], "removed": [], "changed": []}
+  },
+  "vms": {
+    "vm1": {
+      "status": "identical",
+      "state": {"status": "identical", "size_a": 13, "size_b": 13},
+      "memory": {"status": "identical", "size_a": 33, "size_b": 33},
+      "disks": [{"path": "vms/vm1/rootfs.ext4", "status": "identical", "size_a": 4, "size_b": 4}]
+    }
+  }
+}
+```
+All keys are emitted; unchanged topology fields are `null` and missing file sizes are `null`.
+
+#### Exit Status
+
+Exits with `0` on success. Exits with `2` on command-line argument parsing errors. Exits with `1` if either snapshot directory cannot be accessed, contains corrupted files, fails manifest validation, or encounters I/O errors during reading.
+
+---
+
 ## Environment Variables
 
 | Variable | Description | Default |
