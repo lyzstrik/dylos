@@ -56,21 +56,117 @@ else
     echo -e "\e[33m[WARNING]\e[0m $DOC_HOST not found, skipping checksum check."
 fi
 
-# 3. Check reflink support in the repo (~/dylos/labs)
+# 3. Check reflink support across lab store, image location, and jail directory
 echo "==> Checking reflink support..."
-TARGET_DIR="${REPO_ROOT}/labs"
-mkdir -p "$TARGET_DIR"
 
-TMP_SRC=$(mktemp "$TARGET_DIR/reflink_test_src.XXXXXX")
-TMP_DST=$(mktemp -u "$TARGET_DIR/reflink_test_dst.XXXXXX")
-
-trap 'rm -f "$TMP_SRC" "$TMP_DST"' EXIT
-
-echo "test-reflink" > "$TMP_SRC"
-
-if ! cp --reflink=always "$TMP_SRC" "$TMP_DST" 2>/dev/null; then
-    fail "Filesystem on $TARGET_DIR does not support --reflink=always."
+LAB_DIR="${DYLOS_LAB_DIR:-${REPO_ROOT}/target/labs}"
+if [ -n "${DYLOS_JAIL_DIR:-}" ]; then
+    JAIL_DIR="$DYLOS_JAIL_DIR"
+else
+    JAIL_DIR="$(dirname "$LAB_DIR")/jails"
 fi
 
-echo "  - Tested directory : $TARGET_DIR (reflink operational)"
+if [ -n "${DYLOS_IMAGE_DIR:-}" ]; then
+    IMAGE_DIR="$DYLOS_IMAGE_DIR"
+elif [ -n "${DYLOS_IMAGE:-}" ]; then
+    if [ -d "$DYLOS_IMAGE" ]; then
+        IMAGE_DIR="$DYLOS_IMAGE"
+    else
+        IMAGE_DIR="$(dirname "$DYLOS_IMAGE")"
+    fi
+else
+    IMAGE_DIR="${REPO_ROOT}/target/images"
+fi
+
+echo "  - Lab store      : $LAB_DIR"
+echo "  - Image location : $IMAGE_DIR"
+echo "  - Jail directory : $JAIL_DIR"
+
+mkdir -p "$LAB_DIR" || fail "Cannot create or access lab store directory at $LAB_DIR"
+mkdir -p "$IMAGE_DIR" || fail "Cannot create or access image directory at $IMAGE_DIR"
+mkdir -p "$JAIL_DIR" || fail "Cannot create or access jail directory at $JAIL_DIR"
+
+PROBE_FILES=()
+cleanup_probes() {
+    for f in "${PROBE_FILES[@]}"; do
+        rm -f "$f"
+    done
+}
+trap cleanup_probes EXIT INT TERM
+
+probe_reflink_direction() {
+    local src_dir="$1"
+    local dst_dir="$2"
+    local src_file
+    local dst_file
+
+    if ! src_file="$(mktemp "$src_dir/.reflink_probe_src.XXXXXX" 2>/dev/null)"; then
+        return 1
+    fi
+    if ! dst_file="$(mktemp -u "$dst_dir/.reflink_probe_dst.XXXXXX" 2>/dev/null)"; then
+        rm -f "$src_file"
+        return 1
+    fi
+    PROBE_FILES+=("$src_file" "$dst_file")
+
+    if ! echo "test-reflink" > "$src_file" 2>/dev/null; then
+        rm -f "$src_file" "$dst_file"
+        return 1
+    fi
+    if ! cp --reflink=always "$src_file" "$dst_file" 2>/dev/null; then
+        rm -f "$src_file" "$dst_file"
+        return 1
+    fi
+
+    rm -f "$src_file" "$dst_file"
+    return 0
+}
+
+probe_reflink_pair() {
+    local dir_a="$1"
+    local dir_b="$2"
+
+    if ! probe_reflink_direction "$dir_a" "$dir_b"; then
+        return 1
+    fi
+    if [ "$dir_a" != "$dir_b" ]; then
+        if ! probe_reflink_direction "$dir_b" "$dir_a"; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+FAILED_PAIRS=()
+
+if probe_reflink_pair "$LAB_DIR" "$IMAGE_DIR"; then
+    echo "  - Reflink probe  : OK (lab store <-> image location)"
+else
+    echo "  - Reflink probe  : FAIL (lab store <-> image location)"
+    FAILED_PAIRS+=("lab store ($LAB_DIR) and image location ($IMAGE_DIR)")
+fi
+
+if probe_reflink_pair "$LAB_DIR" "$JAIL_DIR"; then
+    echo "  - Reflink probe  : OK (lab store <-> jail directory)"
+else
+    echo "  - Reflink probe  : FAIL (lab store <-> jail directory)"
+    FAILED_PAIRS+=("lab store ($LAB_DIR) and jail directory ($JAIL_DIR)")
+fi
+
+if probe_reflink_pair "$IMAGE_DIR" "$JAIL_DIR"; then
+    echo "  - Reflink probe  : OK (image location <-> jail directory)"
+else
+    echo "  - Reflink probe  : FAIL (image location <-> jail directory)"
+    FAILED_PAIRS+=("image location ($IMAGE_DIR) and jail directory ($JAIL_DIR)")
+fi
+
+if [ ${#FAILED_PAIRS[@]} -gt 0 ]; then
+    ERR_MSG="Reflink probe failed for the following pair(s):\n"
+    for pair in "${FAILED_PAIRS[@]}"; do
+        ERR_MSG="${ERR_MSG}  - ${pair}\n"
+    done
+    ERR_MSG="${ERR_MSG}Image, lab store and jail directory must share a reflink-compatible mount (see docs/host.md)."
+    fail "$ERR_MSG"
+fi
+
 echo -e "\e[32m[SUCCESS]\e[0m All host prerequisites are met."
