@@ -143,6 +143,21 @@ fn manifest_verifies_through_public_descriptor_opener() {
     let opener = SnapshotOpener::new(tmp.path()).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
     opener.verify(&manifest).unwrap();
+    let manifest_path = tmp.path().join("manifest.json");
+    fs::write(&manifest_path, manifest.to_json_string().unwrap()).unwrap();
+    assert_eq!(opener.load_manifest().unwrap().vms.len(), 1);
+    let mut invalid: serde_json::Value =
+        serde_json::from_str(&manifest.to_json_string().unwrap()).unwrap();
+    invalid["vms"]["undeclared"] = invalid["vms"]["router"].clone();
+    fs::write(&manifest_path, serde_json::to_string(&invalid).unwrap()).unwrap();
+    assert!(
+        opener
+            .load_manifest()
+            .unwrap_err()
+            .to_string()
+            .contains("manifest VMs do not match lab spec nodes")
+    );
+    fs::remove_file(&manifest_path).unwrap();
     fs::write(tmp.path().join("file"), "wrong bytes").unwrap();
     assert!(manifest.verify(opener.verify_opener()).is_err());
     assert!(opener.verify(&manifest).is_err());
