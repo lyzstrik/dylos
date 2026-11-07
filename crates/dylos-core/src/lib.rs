@@ -13,6 +13,7 @@
 //! (like `tokio`, `nix`, `libc`, or `rtnetlink`).
 #![forbid(unsafe_code)]
 
+pub mod diff;
 pub mod error;
 pub mod guest_net;
 pub mod mac;

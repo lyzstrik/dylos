@@ -40,7 +40,7 @@ pub struct Interface {
     pub ipv4: Option<Ipv4Net>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct StaticRoute {
     pub destination: IpNet,
