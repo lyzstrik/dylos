@@ -82,6 +82,15 @@ echo "  - Lab store      : $LAB_DIR"
 echo "  - Image location : $IMAGE_DIR"
 echo "  - Jail directory : $JAIL_DIR"
 
+# Resolve symlinks and missing path components before creating any directory.
+TRACKED_LABS="$(realpath -m "$REPO_ROOT/labs")"
+for location in "$LAB_DIR" "$IMAGE_DIR" "$JAIL_DIR"; do
+    resolved="$(realpath -m "$location")" || fail "Cannot resolve probe location $location"
+    case "$resolved/" in
+        "$TRACKED_LABS/"*) fail "Probe location must not resolve inside tracked labs/: $location" ;;
+    esac
+done
+
 mkdir -p "$LAB_DIR" || fail "Cannot create or access lab store directory at $LAB_DIR"
 mkdir -p "$IMAGE_DIR" || fail "Cannot create or access image directory at $IMAGE_DIR"
 mkdir -p "$JAIL_DIR" || fail "Cannot create or access jail directory at $JAIL_DIR"
@@ -92,7 +101,9 @@ cleanup_probes() {
         rm -f "$f"
     done
 }
-trap cleanup_probes EXIT INT TERM
+trap cleanup_probes EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 probe_reflink_direction() {
     local src_dir="$1"
@@ -103,11 +114,12 @@ probe_reflink_direction() {
     if ! src_file="$(mktemp "$src_dir/.reflink_probe_src.XXXXXX" 2>/dev/null)"; then
         return 1
     fi
-    if ! dst_file="$(mktemp -u "$dst_dir/.reflink_probe_dst.XXXXXX" 2>/dev/null)"; then
+    PROBE_FILES+=("$src_file")
+    if ! dst_file="$(mktemp "$dst_dir/.reflink_probe_dst.XXXXXX" 2>/dev/null)"; then
         rm -f "$src_file"
         return 1
     fi
-    PROBE_FILES+=("$src_file" "$dst_file")
+    PROBE_FILES+=("$dst_file")
 
     if ! echo "test-reflink" > "$src_file" 2>/dev/null; then
         rm -f "$src_file" "$dst_file"
