@@ -7,7 +7,7 @@
 
 ## Firecracker
 - Version : v1.17.0
-- Binaries : `~/.local/share/dylos/bin/firecracker`, `~/.local/share/dylos/bin/jailer` (override the directory with `DYLOS_FC_BIN_DIR`)
+- Binaries : `~/.local/share/dylos/bin/firecracker`, `~/.local/share/dylos/bin/jailer` (default CLI search location; can also be placed in `/usr/local/lib/dylos/bin`, or overridden with `DYLOS_FC_BIN_DIR`)
 - Source : upstream release [v1.17.0](https://github.com/firecracker-microvm/firecracker/releases/tag/v1.17.0), `firecracker-v1.17.0-x86_64.tgz`
 - SHA-256 archive : 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558 (checked against the published `.sha256.txt`)
 - SHA-256 firecracker : 99ad0f5cd0514a88aad0e9ae8cfdb3cc3b4ab9d190e1194602406c786b5de7a5
