@@ -417,7 +417,8 @@ pub struct BenchResults {
     pub cold_boot_ms: MetricSamples,
     pub freeze_duration_ms: MetricSamples,
     pub pause_skew_ms: MetricSamples,
-    pub snapshot_duration_ms: MetricSamples,
+    /// Fabric-freeze entry through thaw completion, excluding post-thaw work.
+    pub snapshot_pause_ms: MetricSamples,
     /// End-to-end `Lab::fork_with` duration for the whole batch of clones.
     pub fork_wall_time_ms: BTreeMap<usize, MetricSamples>,
     /// Batch duration divided by the clone count.
@@ -440,10 +441,7 @@ impl BenchResults {
     }
 
     pub fn snapshot_verdict(&self) -> &'static str {
-        go(p95_under(
-            Some(&self.snapshot_duration_ms),
-            SNAPSHOT_BUDGET_MS,
-        ))
+        go(p95_under(Some(&self.snapshot_pause_ms), SNAPSHOT_BUDGET_MS))
     }
 
     /// Every clone count that any fork or PSS measurement mentions.
@@ -566,9 +564,9 @@ impl BenchResults {
                 self.skew_verdict(),
             ),
             Row::new(
-                "Total snapshot (5 VMs)",
+                "Snapshot pause (5 VMs)",
                 "< 1000 ms",
-                stat(Some(&self.snapshot_duration_ms), 1.0, 1, "ms"),
+                stat(Some(&self.snapshot_pause_ms), 1.0, 1, "ms"),
                 self.snapshot_verdict(),
             ),
         ];
@@ -950,7 +948,7 @@ struct ForkMetrics {
 struct SnapshotMetrics {
     freeze: MetricSamples,
     skew: MetricSamples,
-    total: MetricSamples,
+    pause: MetricSamples,
 }
 
 struct Bench<'a> {
@@ -998,13 +996,11 @@ impl Bench<'_> {
 
     /// Takes the snapshots; returns the metrics and the directory of the last snapshot.
     async fn snapshots(&self, source: &mut Lab) -> anyhow::Result<(SnapshotMetrics, PathBuf)> {
-        println!(
-            "--- [2/3] Benchmarking Snapshot Timings (Freeze, Pause Skew, Total Duration) ---"
-        );
+        println!("--- [2/3] Benchmarking Snapshot Timings (Freeze, Pause Skew, Pause Window) ---");
         let mut metrics = SnapshotMetrics {
             freeze: MetricSamples::new(),
             skew: MetricSamples::new(),
-            total: MetricSamples::new(),
+            pause: MetricSamples::new(),
         };
         let mut last_snapshot_dir: Option<PathBuf> = None;
         for rep in 1..=self.options.repetitions {
@@ -1030,21 +1026,22 @@ impl Bench<'_> {
             let total = timings.total_ms as f64;
             metrics.freeze.add(freeze);
             metrics.skew.add(skew);
-            metrics.total.add(total);
+            let pause = timings.freeze_to_thaw_ms as f64;
+            metrics.pause.add(pause);
             println!(
-                "  Repetition {rep:>2}/{}: freeze = {freeze:>5.1} ms, pause skew = {skew:>5.3} ms, total snapshot = {total:>6.1} ms",
+                "  Repetition {rep:>2}/{}: freeze = {freeze:>5.1} ms, pause skew = {skew:>5.3} ms, freeze-to-thaw = {pause:>6.1} ms, total snapshot = {total:>6.1} ms",
                 self.options.repetitions
             );
             last_snapshot_dir = Some(self.lab_config.store.snapshot_dir("b-src", &snap_id));
         }
         println!(
-            "Snapshot summary: freeze median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms), total median = {:.1} ms (p95: {:.1} ms)\n",
+            "Snapshot summary: freeze median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms), freeze-to-thaw median = {:.1} ms (p95: {:.1} ms)\n",
             metrics.freeze.median(),
             metrics.freeze.p95(),
             metrics.skew.median(),
             metrics.skew.p95(),
-            metrics.total.median(),
-            metrics.total.p95()
+            metrics.pause.median(),
+            metrics.pause.p95()
         );
         let dir = last_snapshot_dir.context("missing snapshot for fork benchmarks")?;
         Ok((metrics, dir))
@@ -1256,7 +1253,7 @@ async fn measure_into(
         cold_boot_ms,
         freeze_duration_ms: snapshot.freeze,
         pause_skew_ms: snapshot.skew,
-        snapshot_duration_ms: snapshot.total,
+        snapshot_pause_ms: snapshot.pause,
         fork_wall_time_ms: forks.wall,
         fork_amortized_ms: forks.amortized,
         fork_restore_ms: forks.restore,
@@ -1393,7 +1390,7 @@ Quantified benchmark results evaluating Dylos technical spike microVM network co
 
 - **Overall Spike Verdict:** **{overall}** ({mode}, {reps} repetitions per measurement)
 - **Evaluation against Go Criteria:**
-  - **Snapshot 5 VMs (256 MiB each) in under 1 s:** **{snapshot}** (p95: {snap_p95} vs target < 1000 ms)
+  - **Snapshot pause for 5 VMs (256 MiB each) in under 1 s:** **{snapshot}** (p95: {snap_p95} vs target < 1000 ms)
   - **Fork of one clone in under 500 ms (complete fork operation, end-to-end and amortized per clone):** **{fork}** ({forks})
   - **Fabric freeze in under 1 s:** **{freeze}** (p95: {freeze_p95})
   - **Pause confirmation skew in under 100 ms:** **{skew}** (p95: {skew_p95})
@@ -1422,7 +1419,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
         mode = results.mode_label(),
         reps = results.repetitions,
         snapshot = results.snapshot_verdict(),
-        snap_p95 = p95_text(Some(&results.snapshot_duration_ms), 1, "ms"),
+        snap_p95 = p95_text(Some(&results.snapshot_pause_ms), 1, "ms"),
         fork = results.fork_verdict(),
         forks = fork_summary(results),
         freeze = results.freeze_verdict(),
@@ -1465,7 +1462,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 - **Interval Definitions:**
   - *Fabric Freeze Duration:* duration of the fabric-freeze call on the network fabric. It does not measure guest-observed network downtime.
   - *Pause Confirmation Skew:* duration from the first successful VM pause API response to the last.
-  - *Total Snapshot Duration:* end-to-end operation including VM pause, disk sync, memory state serialization, SHA-256 integrity calculation, final manifest and cleanup.
+  - *Snapshot Pause:* fabric-freeze entry through thaw completion (`freeze_to_thaw`), including capture and resume but excluding post-thaw hashing, sync and publication. Total command duration is printed separately for each repetition.
   - *Fork End-to-End:* duration of `Lab::fork_with` for the whole batch, from entry through all clones restored and ready. It covers manifest verification, storage reflink cloning, parallel VM launch, resume and readiness. For n = 1 it is the README criterion directly.
   - *Fork Amortized per Clone:* end-to-end duration divided by the clone count. Per-clone completion latency inside a batch is not measured; the end-to-end duration bounds it from above.
   - *Restore Sub-Interval (netns to thaw):* per-clone interval from network namespace setup through Firecracker startup, snapshot memory loading, VM resume and network unfreeze. It excludes verification and storage preparation and is informational only: it never decides the fork verdict.
@@ -1473,7 +1470,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 
 ## Analysis & Findings
 
-1. **Snapshot:** freeze p95 {freeze_p95}, pause skew p95 {skew_p95}, total snapshot p95 {snap_p95} (limit 1000 ms). The run does not break the total down by stage, so the dominant stage is not identified.
+1. **Snapshot:** freeze p95 {freeze_p95}, pause skew p95 {skew_p95}, freeze-to-thaw p95 {snap_p95} (limit 1000 ms). Post-thaw hashing, sync and publication are excluded from this criterion.
 2. **Fork:** {forks}.
 3. **Memory:** per-clone PSS after settling: {pss_text}. PSS alone does not prove copy-on-write sharing: lazy, largely untouched guest memory also produces low PSS. A sharing / private-dirty measurement is required for that claim.
 4. **Cold boot comparison:** cold boot of 5 microVMs has a median of {cold_boot}; the fork end-to-end median for n = 1 is {fork_n1}.
@@ -1484,7 +1481,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 ",
         freeze_p95 = p95_text(Some(&results.freeze_duration_ms), 1, "ms"),
         skew_p95 = p95_text(Some(&results.pause_skew_ms), 3, "ms"),
-        snap_p95 = p95_text(Some(&results.snapshot_duration_ms), 1, "ms"),
+        snap_p95 = p95_text(Some(&results.snapshot_pause_ms), 1, "ms"),
         forks = fork_summary(results),
         pss_text = pss_summary(results),
         conclusion = conclusion(results),

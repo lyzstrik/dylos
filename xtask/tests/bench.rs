@@ -47,7 +47,7 @@ fn passing() -> BenchResults {
         cold_boot_ms: samples(&[1400.0]),
         freeze_duration_ms: samples(&[2.0]),
         pause_skew_ms: samples(&[0.5]),
-        snapshot_duration_ms: samples(&[800.0]),
+        snapshot_pause_ms: samples(&[800.0]),
         fork_wall_time_ms: by_count(&[(1, &[300.0]), (10, &[4000.0])]),
         fork_amortized_ms: by_count(&[(1, &[300.0]), (10, &[400.0])]),
         fork_restore_ms: by_count(&[(1, &[30.0]), (10, &[40.0])]),
@@ -61,7 +61,7 @@ fn empty() -> BenchResults {
         cold_boot_ms: MetricSamples::new(),
         freeze_duration_ms: MetricSamples::new(),
         pause_skew_ms: MetricSamples::new(),
-        snapshot_duration_ms: MetricSamples::new(),
+        snapshot_pause_ms: MetricSamples::new(),
         fork_wall_time_ms: BTreeMap::new(),
         fork_amortized_ms: BTreeMap::new(),
         fork_restore_ms: BTreeMap::new(),
@@ -190,7 +190,7 @@ fn missing_restore_breakdown_is_not_go() {
 fn one_failing_criterion_does_not_mask_another() {
     let r = BenchResults {
         is_quick: true,
-        snapshot_duration_ms: samples(&[20_000.0]),
+        snapshot_pause_ms: samples(&[20_000.0]),
         fork_wall_time_ms: by_count(&[(1, &[32_000.0]), (10, &[4000.0])]),
         pss_unsettled: BTreeMap::from([(1, 0), (10, 3)]),
         ..passing()
@@ -591,4 +591,12 @@ fn control_socket_path_fits_sun_len() {
         sock.display()
     );
     fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn snapshot_report_defines_the_pause_window() {
+    let report = render_markdown_report(&passing());
+    assert!(report.contains("Snapshot pause (5 VMs)"));
+    assert!(report.contains("fabric-freeze entry through thaw completion"));
+    assert!(report.contains("excluding post-thaw hashing, sync and publication"));
 }
