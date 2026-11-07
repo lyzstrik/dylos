@@ -61,6 +61,32 @@ Subcommands that run microVM environments (`up`, `restore`, and `fork`) supervis
 
 ---
 
+### `dylos lab list`
+
+List persisted labs without creating, changing or removing files or host resources:
+
+```text
+dylos lab list
+<id>\t<state>\t<VM count>\t<directory>
+```
+
+Output is sorted by lab ID, one tab-separated line per lab, without a header.
+`running` means the supervisor holds the lab directory lock, its namespace exists,
+and every configured VM has a process in its jailer cgroup. `stopped` means no
+supervisor, namespace or VM processes remain. All mismatched combinations are
+`orphaned`, including a supervisor without its resources. Observations can race
+with startup and teardown. Snapshot directories are excluded; an absent store
+prints nothing and remains absent. Normal teardown removes lab directories, so
+stopped entries represent retained lab state rather than a historical inventory.
+
+Uses `DYLOS_LAB_DIR` and `DYLOS_JAIL_DIR` through the same configuration as other
+commands; process ownership is identified by jailer cgroups rather than stale
+jail files or saved PIDs. No root operation is performed. The caller needs read
+access to the store, namespace directory and procfs cgroup membership files;
+unreadable or malformed state returns an error instead of a false stopped state.
+
+---
+
 ### `dylos lab up`
 
 Bring up a microVM lab topology and supervise it until teardown.
