@@ -417,6 +417,16 @@ async fn run_snapshot_steps(
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
 
         let handle = tokio::task::spawn_blocking(move || {
+            // Finish disk sync before memory copying adds dirty page-cache pressure.
+            let mut disks = Vec::new();
+            let mut fsync_ms = 0u64;
+            let mut reflink_ms = 0u64;
+            if let Some(disk_path) = disk_src {
+                let (disk_meta, timings) = snap.capture_disk(&disk_path, &node, "rootfs.ext4")?;
+                disks.push(disk_meta);
+                fsync_ms = timings.fsync_ms;
+                reflink_ms = timings.reflink_ms;
+            }
             let (state_file, _) = snap.capture_vm_source(
                 dylos_store::VmFileSource::open(&state_src, state_max_bytes)?,
                 &node,
@@ -427,15 +437,6 @@ async fn run_snapshot_steps(
                 &node,
                 "vm.mem",
             )?;
-            let mut disks = Vec::new();
-            let mut fsync_ms = 0u64;
-            let mut reflink_ms = 0u64;
-            if let Some(disk_path) = disk_src {
-                let (disk_meta, timings) = snap.capture_disk(&disk_path, &node, "rootfs.ext4")?;
-                disks.push(disk_meta);
-                fsync_ms = timings.fsync_ms;
-                reflink_ms = timings.reflink_ms;
-            }
             Ok::<_, LabError>((
                 node,
                 VmManifest {
