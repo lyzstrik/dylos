@@ -71,6 +71,7 @@ fn setup(mode: Mode) -> (Sandbox, LabConfig, LabSpec) {
         },
         boot_timeout: Duration::from_millis(200),
         extra_boot_args: None,
+        chaos: std::collections::BTreeMap::new(),
     };
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
     (sandbox, config, spec)

@@ -14,7 +14,7 @@ struct SavedTap {
 #[derive(Debug, Default)]
 pub(crate) struct State {
     saved: Option<Vec<SavedTap>>,
-    frozen: bool,
+    pub(crate) frozen: bool,
 }
 
 pub(crate) async fn initially_frozen(plan: &FabricPlan, handle: &Handle) -> Result<State, Error> {

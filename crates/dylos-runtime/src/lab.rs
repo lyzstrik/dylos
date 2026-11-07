@@ -98,6 +98,8 @@ pub struct LabConfig {
     pub timeouts: Timeouts,
     pub boot_timeout: Duration,
     pub extra_boot_args: Option<String>,
+    /// Profiles keyed by restored clone identifier; never applied during fresh boot.
+    pub chaos: std::collections::BTreeMap<String, dylos_net::ChaosProfile>,
 }
 
 impl Default for LabConfig {
@@ -112,6 +114,7 @@ impl Default for LabConfig {
             timeouts: Timeouts::default(),
             boot_timeout: Duration::from_secs(30),
             extra_boot_args: None,
+            chaos: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -574,6 +577,11 @@ impl Lab {
     async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
         let listeners = crate::agent::listeners(&self.id, &self.vms, &config.jailer)?;
         self.load_restored().await?;
+        if let Some(profile) = config.chaos.get(&self.id)
+            && let Some(network) = self.network.as_mut()
+        {
+            network.apply_chaos(*profile).await?;
+        }
         crate::resume_all(&self.id, &self.vms).await?;
         crate::agent::resync_all(&self.vms, &listeners)
             .await
