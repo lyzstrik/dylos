@@ -248,6 +248,117 @@ Exits with `0` when cleanly stopped. Exits with `2` on argument parsing errors (
 
 ---
 
+### `dylos lab diff`
+
+Compare two snapshots of a lab to identify topology changes and per-VM file differences.
+
+```text
+Usage: dylos lab diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
+```
+
+#### Arguments & Options
+
+- `<SNAPSHOT_A>`: Path to the first snapshot directory containing `manifest.json`. Required.
+- `<SNAPSHOT_B>`: Path to the second snapshot directory containing `manifest.json`. Required.
+- `--json`: Emit stable machine-readable JSON format on `stdout`.
+- `-h, --help`: Print help and exit `0`.
+
+#### Behavior
+
+- **Read-only**: `dylos lab diff` creates, modifies, and deletes nothing on the host or in storage.
+- **Verification first**: Both snapshots are verified (manifest integrity, SHA-256 hashes, file sizes, and inventory) before comparison. A corrupted or tampered snapshot is treated as a fatal verification error, never as a diff.
+- **Topology comparison**: Compares `LabSpec` definitions across segments (added, removed, IP prefix changes), nodes (added, removed, image/vCPU/memory changes), and per-node interfaces (added, removed, segment/IP changes).
+- **Per-VM file comparison**: Compares VM state, memory, and disk files, reporting whether each artifact is identical or changed, with sizes in snapshot A and snapshot B.
+
+#### Standard Output
+
+Default human-readable format:
+```text
+Topology:
+  Segments:
+    + wan
+    - old-lan
+    ~ lan1: ipv6: fd64::1/64 -> fd64::10/64
+  Nodes:
+    + vm2
+    ~ vm1: vcpus: 1 -> 2, memory: 128 -> 256
+  Interfaces:
+    + vm2/eth0 (segment: lan1, ipv6: fd64::20/64)
+    ~ vm1/eth0: ipv6: fd64::2/64 -> fd64::3/64
+VMs:
+  vm1:
+    state:  identical (1024 bytes)
+    memory: changed (52428800 bytes -> 52428800 bytes)
+    disk "vms/vm1/rootfs.ext4": changed (104857600 bytes -> 104857600 bytes)
+```
+
+When `--json` is supplied, a structured JSON document is emitted:
+```json
+{
+  "topology": {
+    "segments": {
+      "added": ["wan"],
+      "removed": ["old-lan"],
+      "changed": [
+        {
+          "name": "lan1",
+          "ipv6": { "from": "fd64::1/64", "to": "fd64::10/64" }
+        }
+      ]
+    },
+    "nodes": {
+      "added": ["vm2"],
+      "removed": [],
+      "changed": [
+        {
+          "name": "vm1",
+          "vcpus": { "from": 1, "to": 2 },
+          "memory": { "from": 128, "to": 256 }
+        }
+      ]
+    },
+    "interfaces": {
+      "added": [
+        {
+          "node": "vm2",
+          "interface": "eth0",
+          "segment": "lan1",
+          "ipv6": "fd64::20/64"
+        }
+      ],
+      "removed": [],
+      "changed": [
+        {
+          "node": "vm1",
+          "interface": "eth0",
+          "ipv6": { "from": "fd64::2/64", "to": "fd64::3/64" }
+        }
+      ]
+    }
+  },
+  "vms": {
+    "vm1": {
+      "state": { "identical": true, "size_a": 1024, "size_b": 1024 },
+      "memory": { "identical": false, "size_a": 52428800, "size_b": 52428800 },
+      "disks": [
+        {
+          "path": "vms/vm1/rootfs.ext4",
+          "identical": false,
+          "size_a": 104857600,
+          "size_b": 104857600
+        }
+      ]
+    }
+  }
+}
+```
+
+#### Exit Status
+
+Exits with `0` on success. Exits with `2` on command-line argument parsing errors. Exits with `1` if either snapshot directory cannot be accessed, contains corrupted files, fails manifest validation, or encounters I/O errors during streaming.
+
+---
+
 ## Environment Variables
 
 | Variable | Description | Default |

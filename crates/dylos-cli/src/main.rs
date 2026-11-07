@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
-use dylos_runtime::{Fleet, Lab, LabConfig, LabError};
+use dylos_core::diff::SnapshotDiff;
+use dylos_runtime::{Fleet, Lab, LabConfig, LabError, diff_snapshots};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 
@@ -105,6 +106,21 @@ enum LabCommands {
     Down(DownArgs),
     /// Snapshot a running lab's microVMs and disks
     Snapshot(SnapshotArgs),
+    /// Compare two snapshots of a lab
+    Diff(DiffArgs),
+}
+
+#[derive(Args, Debug)]
+struct DiffArgs {
+    /// First snapshot directory containing manifest.json
+    snapshot_a: PathBuf,
+
+    /// Second snapshot directory containing manifest.json
+    snapshot_b: PathBuf,
+
+    /// Output machine-readable JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -214,6 +230,7 @@ async fn main() -> Result<()> {
             LabCommands::Fork(args) => lab_fork(args).await,
             LabCommands::Down(down_args) => lab_down(down_args).await,
             LabCommands::Snapshot(snapshot_args) => lab_snapshot(snapshot_args).await,
+            LabCommands::Diff(diff_args) => lab_diff(diff_args).await,
         },
     }
 }
@@ -524,6 +541,171 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     };
     println!("lab {} snapshotted successfully as {}", args.id, snap_id);
     Ok(())
+}
+
+async fn lab_diff(args: DiffArgs) -> Result<()> {
+    let diff = diff_snapshots(&args.snapshot_a, &args.snapshot_b)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to diff snapshots '{}' and '{}'",
+                args.snapshot_a.display(),
+                args.snapshot_b.display()
+            )
+        })?;
+
+    if args.json {
+        let json =
+            serde_json::to_string_pretty(&diff).context("failed to serialize diff to JSON")?;
+        println!("{json}");
+    } else {
+        print_human_diff(&diff);
+    }
+    Ok(())
+}
+
+fn print_human_diff(diff: &SnapshotDiff) {
+    print_human_topology(&diff.topology);
+    print_human_vms(&diff.vms);
+}
+
+fn print_human_topology(topology: &dylos_core::diff::TopologyDiff) {
+    if topology.is_empty() {
+        println!("Topology: no changes");
+        return;
+    }
+    println!("Topology:");
+    if !topology.segments.is_empty() {
+        println!("  Segments:");
+        for added in &topology.segments.added {
+            println!("    + {added}");
+        }
+        for removed in &topology.segments.removed {
+            println!("    - {removed}");
+        }
+        for changed in &topology.segments.changed {
+            print!("    ~ {}:", changed.name);
+            if let Some(ref ipv6) = changed.ipv6 {
+                print!(" ipv6: {} -> {}", ipv6.from, ipv6.to);
+            }
+            if let Some(ref ipv4) = changed.ipv4 {
+                let from_s = ipv4
+                    .from
+                    .map_or_else(|| "none".to_string(), |v| v.to_string());
+                let to_s = ipv4
+                    .to
+                    .map_or_else(|| "none".to_string(), |v| v.to_string());
+                print!(" ipv4: {from_s} -> {to_s}");
+            }
+            println!();
+        }
+    }
+    if !topology.nodes.is_empty() {
+        println!("  Nodes:");
+        for added in &topology.nodes.added {
+            println!("    + {added}");
+        }
+        for removed in &topology.nodes.removed {
+            println!("    - {removed}");
+        }
+        for changed in &topology.nodes.changed {
+            print!("    ~ {}:", changed.name);
+            let mut parts = Vec::new();
+            if let Some(ref image) = changed.image {
+                parts.push(format!("image: {} -> {}", image.from, image.to));
+            }
+            if let Some(ref vcpus) = changed.vcpus {
+                parts.push(format!("vcpus: {} -> {}", vcpus.from, vcpus.to));
+            }
+            if let Some(ref memory) = changed.memory {
+                parts.push(format!("memory: {} -> {}", memory.from, memory.to));
+            }
+            if parts.is_empty() {
+                println!(" (properties unchanged)");
+            } else {
+                println!(" {}", parts.join(", "));
+            }
+        }
+    }
+    if !topology.interfaces.is_empty() {
+        println!("  Interfaces:");
+        for added in &topology.interfaces.added {
+            let v4 = added
+                .ipv4
+                .map_or_else(String::new, |v| format!(", ipv4: {v}"));
+            println!(
+                "    + {}/{} (segment: {}, ipv6: {}{v4})",
+                added.node, added.interface, added.segment, added.ipv6
+            );
+        }
+        for removed in &topology.interfaces.removed {
+            let v4 = removed
+                .ipv4
+                .map_or_else(String::new, |v| format!(", ipv4: {v}"));
+            println!(
+                "    - {}/{} (segment: {}, ipv6: {}{v4})",
+                removed.node, removed.interface, removed.segment, removed.ipv6
+            );
+        }
+        for changed in &topology.interfaces.changed {
+            print!("    ~ {}/{}:", changed.node, changed.interface);
+            let mut parts = Vec::new();
+            if let Some(ref seg) = changed.segment {
+                parts.push(format!("segment: {} -> {}", seg.from, seg.to));
+            }
+            if let Some(ref ipv6) = changed.ipv6 {
+                parts.push(format!("ipv6: {} -> {}", ipv6.from, ipv6.to));
+            }
+            if let Some(ref ipv4) = changed.ipv4 {
+                let from_s = ipv4
+                    .from
+                    .map_or_else(|| "none".to_string(), |v| v.to_string());
+                let to_s = ipv4
+                    .to
+                    .map_or_else(|| "none".to_string(), |v| v.to_string());
+                parts.push(format!("ipv4: {from_s} -> {to_s}"));
+            }
+            println!(" {}", parts.join(", "));
+        }
+    }
+}
+
+fn print_human_vms(vms: &std::collections::BTreeMap<String, dylos_core::diff::VmDiff>) {
+    if vms.is_empty() {
+        println!("VMs: no VMs declared");
+        return;
+    }
+    println!("VMs:");
+    for (vm_name, vm_diff) in vms {
+        println!("  {vm_name}:");
+        if vm_diff.state.identical {
+            println!("    state:  identical ({} bytes)", vm_diff.state.size_a);
+        } else {
+            println!(
+                "    state:  changed ({} bytes -> {} bytes)",
+                vm_diff.state.size_a, vm_diff.state.size_b
+            );
+        }
+        if vm_diff.memory.identical {
+            println!("    memory: identical ({} bytes)", vm_diff.memory.size_a);
+        } else {
+            println!(
+                "    memory: changed ({} bytes -> {} bytes)",
+                vm_diff.memory.size_a, vm_diff.memory.size_b
+            );
+        }
+        for disk in &vm_diff.disks {
+            let path_str = disk.path.display();
+            if disk.identical {
+                println!("    disk \"{path_str}\": identical ({} bytes)", disk.size_a);
+            } else {
+                println!(
+                    "    disk \"{path_str}\": changed ({} bytes -> {} bytes)",
+                    disk.size_a, disk.size_b
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
