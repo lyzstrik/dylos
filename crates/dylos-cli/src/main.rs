@@ -72,7 +72,7 @@ fn pin_control_socket(base: &Path, id: &str) -> std::io::Result<File> {
     name = "dylos",
     version,
     about = "Engine for reproducible microVM lab networks",
-    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
+    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries (defaults to search order: ~/.local/share/dylos/bin [resolving SUDO_USER under sudo], $HOME/.local/share/dylos/bin, /usr/local/lib/dylos/bin, /opt/dylos/bin)\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -156,7 +156,7 @@ struct DownArgs {
     id: String,
 }
 
-fn build_config() -> LabConfig {
+fn build_base_config() -> LabConfig {
     let mut config = LabConfig::default();
     if let Some(bin_dir) = std::env::var_os("DYLOS_FC_BIN_DIR").filter(|d| !d.is_empty()) {
         let bin = PathBuf::from(bin_dir);
@@ -173,6 +173,16 @@ fn build_config() -> LabConfig {
             PathBuf::from,
         );
     config
+}
+
+fn build_launch_config() -> Result<LabConfig> {
+    let mut config = build_base_config();
+    let env_bin = std::env::var_os("DYLOS_FC_BIN_DIR").filter(|d| !d.is_empty());
+    let resolved =
+        dylos_cli::binaries::resolve_firecracker_binaries(env_bin.as_deref().map(Path::new))?;
+    config.jailer.jailer = resolved.jailer;
+    config.jailer.firecracker = resolved.firecracker;
+    Ok(config)
 }
 
 fn init_tracing() {
@@ -193,7 +203,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Lab(lab_args) => match lab_args.command {
             LabCommands::List => {
-                let config = build_config();
+                let config = build_base_config();
                 let labs = tokio::task::spawn_blocking(move || {
                     dylos_cli::list_labs(&config, Path::new("/proc"))
                 })
@@ -243,21 +253,22 @@ async fn lab_up(args: UpArgs) -> Result<()> {
         .context("failed to register SIGTERM handler")?;
     tracing::info!(lab = %id, "registered termination signal handlers for bring-up");
 
-    let config = build_config();
     let up_future = async {
         let spec_content = tokio::fs::read_to_string(&args.spec)
             .await
             .with_context(|| format!("failed to read lab spec from {}", args.spec.display()))?;
         let spec = LabSpec::from_yaml_str(&spec_content)
             .with_context(|| format!("failed to parse lab spec from {}", args.spec.display()))?;
-        Lab::up_with(&config, &spec, &id)
+        let config = build_launch_config()?;
+        let lab = Lab::up_with(&config, &spec, &id)
             .await
-            .with_context(|| format!("failed to bring up lab '{id}'"))
+            .with_context(|| format!("failed to bring up lab '{id}'"))?;
+        Ok::<_, anyhow::Error>((lab, config))
     };
     tokio::pin!(up_future);
 
     let mut interrupted = false;
-    let lab = loop {
+    let (lab, config) = loop {
         tokio::select! {
             // Consume ready signals before a simultaneous bring-up error can exit.
             biased;
@@ -296,7 +307,7 @@ async fn lab_restore(args: RestoreArgs) -> Result<()> {
         .context("failed to register SIGINT handler")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
-    let config = build_config();
+    let config = build_launch_config()?;
     let restore = Lab::restore_with(&config, &args.snapshot, &id);
     tokio::pin!(restore);
     let mut interrupted = false;
@@ -363,7 +374,7 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
 
-    let config = build_config();
+    let config = build_launch_config()?;
     let fork_future = Lab::fork_with(&config, &args.snapshot, &clone_ids);
     tokio::pin!(fork_future);
 
@@ -430,7 +441,7 @@ async fn supervise(
 async fn lab_down(args: DownArgs) -> Result<()> {
     validate_lab_id(&args.id)?;
 
-    let config = build_config();
+    let config = build_base_config();
     let timeout = teardown_timeout();
 
     let pinned = pin_control_socket(&config.store.base, &args.id);
@@ -489,7 +500,7 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
             .map_err(|reason| anyhow!("invalid snapshot id '{snap_id}': {reason}"))?;
     }
 
-    let config = build_config();
+    let config = build_base_config();
     // Total deadline gives 60s budget beyond the 120s Firecracker API snapshot deadline
     let timeout = Duration::from_secs(180);
 

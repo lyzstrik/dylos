@@ -346,11 +346,15 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         assert!(!config.netns_dir.join("dylos-src").exists());
 
         // Measure one three-VM clone without contention from nine other restores.
+        let restore_started = Instant::now();
         let clone = Lab::restore_with(&config, &snapshot, "latency")
             .await
             .unwrap();
         let latency = clone.restore_latency().expect("netns to thaw latency");
-        eprintln!("Aged three-VM clone: netns to thaw = {latency:?}");
+        eprintln!(
+            "Aged three-VM clone: end-to-end = {:?}; netns to thaw = {latency:?}",
+            restore_started.elapsed()
+        );
         down(&config, clone).await;
         assert!(
             latency < Duration::from_millis(500),
@@ -526,6 +530,7 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
         assert!(left.is_empty(), "netns left: {left:?}");
         let opener = dylos_store::SnapshotOpener::new(&snapshot).unwrap();
         manifest.verify(opener.verify_opener()).unwrap();
+        refuse_changed_snapshot(&config, &snapshot).await;
     })
     .catch_unwind()
     .await;
@@ -538,5 +543,53 @@ async fn fork_ten_simultaneous_clones_independent_and_isolated() {
 
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
+    }
+}
+
+async fn refuse_changed_snapshot(config: &LabConfig, snapshot: &Path) {
+    use std::os::unix::fs::{FileExt, PermissionsExt};
+    for name in ["vm.mem", "rootfs.ext4", "vm.state"] {
+        let path = snapshot.join("vms/A").join(name);
+        let backup = snapshot.parent().unwrap().join("tamper-original");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::copy(&backup, &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut byte = [0];
+        writer.read_exact_at(&mut byte, 0).unwrap();
+        byte[0] ^= 1;
+        writer.write_all_at(&byte, 0).unwrap();
+        drop(writer);
+        assert!(
+            dylos_store::verity::enable(&std::fs::File::open(&path).unwrap())
+                .unwrap()
+                .is_some()
+        );
+        if name == "vm.mem" {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(
+            Lab::restore_with(config, snapshot, "bad-restore")
+                .await
+                .is_err(),
+            "{name}"
+        );
+        assert!(
+            Lab::fork_with(config, snapshot, &["bad-fork".into()])
+                .await
+                .is_err(),
+            "{name}"
+        );
+        for id in ["bad-restore", "bad-fork"] {
+            assert!(!config.store.base.join(id).exists());
+            assert!(!config.netns_dir.join(format!("dylos-{id}")).exists());
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(backup, path).unwrap();
+        eprintln!("Changed {name}: restore and fork refused; no resources left");
     }
 }
