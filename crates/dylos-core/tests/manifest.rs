@@ -26,8 +26,14 @@ fn hex_sha256_strategy() -> impl Strategy<Value = String> {
 }
 
 fn file_meta_strategy() -> impl Strategy<Value = FileMeta> {
-    (path_buf_strategy(), hex_sha256_strategy(), 0..1_000_000u64)
-        .prop_map(|(path, sha256, size)| FileMeta { path, sha256, size })
+    (path_buf_strategy(), hex_sha256_strategy(), 0..1_000_000u64).prop_map(
+        |(path, sha256, size)| FileMeta {
+            path,
+            sha256,
+            size,
+            fsverity: None,
+        },
+    )
 }
 
 fn vm_manifest_strategy() -> impl Strategy<Value = VmManifest> {
@@ -162,11 +168,13 @@ fn test_verify_integrity() {
                 "router".to_string(),
                 VmManifest {
                     state_file: FileMeta {
+                        fsverity: None,
                         path: PathBuf::from("state"),
                         sha256: sha256.clone(),
                         size,
                     },
                     memory_file: FileMeta {
+                        fsverity: None,
                         path: PathBuf::from("mem"),
                         sha256: sha256.clone(),
                         size,
@@ -236,11 +244,13 @@ fn test_verify_validates_paths_first() {
         "vm1".to_string(),
         VmManifest {
             state_file: FileMeta {
+                fsverity: None,
                 path: PathBuf::from("state1"),
                 sha256: sha256.clone(),
                 size,
             },
             memory_file: FileMeta {
+                fsverity: None,
                 path: PathBuf::from("mem1"),
                 sha256: sha256.clone(),
                 size,
@@ -254,11 +264,13 @@ fn test_verify_validates_paths_first() {
         "vm2".to_string(),
         VmManifest {
             state_file: FileMeta {
+                fsverity: None,
                 path: PathBuf::from("../outside"),
                 sha256: sha256.clone(),
                 size,
             },
             memory_file: FileMeta {
+                fsverity: None,
                 path: PathBuf::from("mem2"),
                 sha256: sha256.clone(),
                 size,
@@ -330,11 +342,13 @@ fn test_verify_interrupted() {
                 "router".to_string(),
                 VmManifest {
                     state_file: FileMeta {
+                        fsverity: None,
                         path: PathBuf::from("state"),
                         sha256: sha256.clone(),
                         size,
                     },
                     memory_file: FileMeta {
+                        fsverity: None,
                         path: PathBuf::from("mem"),
                         sha256: sha256.clone(),
                         size,

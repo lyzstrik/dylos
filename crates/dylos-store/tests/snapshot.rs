@@ -365,6 +365,7 @@ fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) 
                 fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
             }
             FileMeta {
+                fsverity: None,
                 path: PathBuf::from(format!("vms/{}/{name}", node.name)),
                 size: bytes.len() as u64,
                 sha256: dylos_core::manifest::sha256_hex(&Sha256::digest(bytes.as_bytes()).into()),
