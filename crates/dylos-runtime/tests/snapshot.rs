@@ -216,6 +216,10 @@ async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
         for vm in manifest.vms.values() {
             assert_eq!(vm.disks.len(), 1);
         }
+    } else {
+        eprintln!(
+            "SKIPPED snapshot_full_sequence_succeeds_and_creates_valid_manifest: disk assertions require storage reflink support"
+        );
     }
 
     for vm in &lab.vms {
@@ -446,7 +450,9 @@ async fn snapshot_fails_at_snapshot_create_cleans_up_and_resumes_all_vms() {
 async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfd").await;
     if lab.storage.as_ref().is_none() {
-        eprintln!("SKIP: disk clone test requires storage reflink support");
+        eprintln!(
+            "SKIPPED snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms: disk clone test requires storage reflink support"
+        );
         lab.teardown().await.unwrap();
         sandbox.assert_no_jail_left();
         return;
