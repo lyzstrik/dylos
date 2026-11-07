@@ -403,6 +403,14 @@ fn pool_command_argument_validation() {
         "clone count must be at least 1",
     );
     assert_status(
+        &run(
+            dir.path(),
+            &["lab", "fork", "missing", "-n", "1", "--pool", "0"],
+        ),
+        false,
+        "pool capacity must be at least 1",
+    );
+    assert_status(
         &run(dir.path(), &["lab", "pool", "--help"]),
         true,
         "--capacity",

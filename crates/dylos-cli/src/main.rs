@@ -405,6 +405,9 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
     if args.count == 0 {
         bail!("clone count must be at least 1");
     }
+    if args.pool == Some(0) {
+        bail!("pool capacity must be at least 1");
+    }
     let prefix = args
         .prefix
         .unwrap_or_else(|| derive_clone_prefix(&args.snapshot));
@@ -424,9 +427,6 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
 
     let mut interrupted = false;
     let labs = if let Some(capacity) = args.pool {
-        if capacity == 0 {
-            bail!("pool capacity must be at least 1");
-        }
         println!(
             "initializing pre-warmed restore pool (capacity: {capacity}) for snapshot '{}'...",
             args.snapshot.display()
@@ -487,10 +487,20 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
 }
 
 async fn lab_pool(args: PoolArgs) -> Result<()> {
+    if args.capacity == 0 {
+        bail!("pool capacity must be at least 1");
+    }
+    if args.count == 0 {
+        bail!("clone count must be at least 1");
+    }
+    let prefix = args
+        .prefix
+        .clone()
+        .unwrap_or_else(|| derive_clone_prefix(&args.snapshot));
+    validate_lab_id(&prefix)?;
+
     if args.bench {
         let config = build_launch_config()?;
-        let prefix = args.prefix.as_deref().unwrap_or("bench");
-        validate_lab_id(prefix)?;
         let cold_id = format!("{prefix}-cold");
         let start = Instant::now();
         let mut cold_lab = Lab::restore_with(&config, &args.snapshot, &cold_id).await?;
@@ -503,7 +513,7 @@ async fn lab_pool(args: PoolArgs) -> Result<()> {
     lab_fork(ForkArgs {
         snapshot: args.snapshot,
         count: args.count,
-        prefix: args.prefix,
+        prefix: Some(prefix),
         pool: Some(args.capacity),
     })
     .await
