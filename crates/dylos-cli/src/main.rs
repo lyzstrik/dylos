@@ -178,7 +178,8 @@ fn build_base_config() -> LabConfig {
 fn build_launch_config() -> Result<LabConfig> {
     let mut config = build_base_config();
     let env_bin = std::env::var_os("DYLOS_FC_BIN_DIR").filter(|d| !d.is_empty());
-    let resolved = dylos_cli::resolve_firecracker_binaries(env_bin.as_deref().map(Path::new))?;
+    let resolved =
+        dylos_cli::binaries::resolve_firecracker_binaries(env_bin.as_deref().map(Path::new))?;
     config.jailer.jailer = resolved.jailer;
     config.jailer.firecracker = resolved.firecracker;
     Ok(config)

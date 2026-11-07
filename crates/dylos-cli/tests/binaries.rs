@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use dylos_cli::{
+use dylos_cli::binaries::{
     PasswdUser, SecurityContext, candidate_search_dirs_with, check_binary_security,
     check_dir_security, resolve_firecracker_binaries_with, resolve_sudo_identity_with,
     validate_binary_path,
@@ -23,9 +23,7 @@ fn make_executable(path: &Path) {
 
 fn current_security_context() -> SecurityContext {
     SecurityContext {
-        orchestrator_uid: nix::unistd::geteuid().as_raw(),
         invoking_uid: nix::unistd::geteuid().as_raw(),
-        invoking_gid: nix::unistd::getegid().as_raw(),
     }
 }
 
@@ -182,8 +180,7 @@ fn sudo_identity_rejected_when_gid_mismatched() {
 
 #[test]
 fn security_context_from_resolved_trusts_root_only_on_inconsistent_identity() {
-    let ctx = SecurityContext::from_resolved(0, 0, None);
-    assert_eq!(ctx.orchestrator_uid, 0);
+    let ctx = SecurityContext::from_resolved(0, None);
     assert_eq!(ctx.invoking_uid, 0);
 }
 
@@ -195,8 +192,7 @@ fn security_context_from_resolved_trusts_invoking_uid_when_consistent() {
         gid: 1001,
         dir: PathBuf::from("/home/alice"),
     };
-    let ctx = SecurityContext::from_resolved(0, 0, Some(&user));
-    assert_eq!(ctx.orchestrator_uid, 0);
+    let ctx = SecurityContext::from_resolved(0, Some(&user));
     assert_eq!(ctx.invoking_uid, 1001);
 }
 
@@ -394,9 +390,7 @@ fn permission_check_rejects_untrusted_binary_owner() {
     make_executable(&bin);
 
     let ctx = SecurityContext {
-        orchestrator_uid: 0,
         invoking_uid: 99999, // untrusted uid
-        invoking_gid: 99999,
     };
     let err = check_binary_security(&bin, &ctx).unwrap_err();
     let msg = err.to_string();
@@ -410,9 +404,7 @@ fn permission_check_rejects_untrusted_binary_owner() {
 fn permission_check_rejects_untrusted_parent_directory_owner() {
     let temp = test_temp_dir();
     let ctx = SecurityContext {
-        orchestrator_uid: 0,
         invoking_uid: 99999, // untrusted uid
-        invoking_gid: 99999,
     };
     let err = check_dir_security(temp.path(), &ctx).unwrap_err();
     let msg = err.to_string();
@@ -431,9 +423,7 @@ fn permission_check_rejects_group_writable_binary_even_if_group_matches_invoking
 
     let real_gid = nix::unistd::getegid().as_raw();
     let ctx = SecurityContext {
-        orchestrator_uid: 0,
         invoking_uid: nix::unistd::geteuid().as_raw(),
-        invoking_gid: real_gid, // matches the file's gid!
     };
     if real_gid != 0 {
         let err = check_binary_security(&bin, &ctx).unwrap_err();
@@ -450,9 +440,7 @@ fn permission_check_rejects_group_writable_parent_directory() {
 
     let real_gid = nix::unistd::getegid().as_raw();
     let ctx = SecurityContext {
-        orchestrator_uid: 0,
         invoking_uid: nix::unistd::geteuid().as_raw(),
-        invoking_gid: real_gid,
     };
     if real_gid != 0 {
         let err = check_dir_security(&sub_dir, &ctx).unwrap_err();
@@ -477,9 +465,7 @@ fn permission_check_rejects_untrusted_symlink() {
     std::os::unix::fs::symlink(&target, &link).unwrap();
 
     let ctx = SecurityContext {
-        orchestrator_uid: 0,
         invoking_uid: 99999,
-        invoking_gid: 99999,
     };
     let err = validate_binary_path(&link, &ctx).unwrap_err();
     assert!(
@@ -522,5 +508,45 @@ fn resolution_fails_closed_when_candidate_fails_security() {
     let ctx = current_security_context();
     let err = resolve_firecracker_binaries_with(None, &ctx, std::slice::from_ref(&candidate))
         .unwrap_err();
+    assert!(err.to_string().contains("world-writable"), "{err}");
+}
+
+#[test]
+fn symlinked_ancestor_directory_is_accepted_when_canonical_target_is_secure() {
+    let temp = test_temp_dir();
+    let real_parent = temp.path().join("real_parent");
+    fs::create_dir(&real_parent).unwrap();
+    fs::set_permissions(&real_parent, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let real_bin = real_parent.join("firecracker");
+    make_executable(&real_bin);
+
+    let symlink_parent = temp.path().join("symlink_parent");
+    std::os::unix::fs::symlink(&real_parent, &symlink_parent).unwrap();
+
+    let bin_through_symlink = symlink_parent.join("firecracker");
+    let ctx = current_security_context();
+
+    let canonical = validate_binary_path(&bin_through_symlink, &ctx).unwrap();
+    assert_eq!(canonical, real_bin.canonicalize().unwrap());
+}
+
+#[test]
+fn symlinked_ancestor_directory_with_insecure_target_is_rejected() {
+    let temp = test_temp_dir();
+    let bad_parent = temp.path().join("bad_parent");
+    fs::create_dir(&bad_parent).unwrap();
+    fs::set_permissions(&bad_parent, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let real_bin = bad_parent.join("firecracker");
+    make_executable(&real_bin);
+
+    let symlink_parent = temp.path().join("symlink_parent");
+    std::os::unix::fs::symlink(&bad_parent, &symlink_parent).unwrap();
+
+    let bin_through_symlink = symlink_parent.join("firecracker");
+    let ctx = current_security_context();
+
+    let err = validate_binary_path(&bin_through_symlink, &ctx).unwrap_err();
     assert!(err.to_string().contains("world-writable"), "{err}");
 }

@@ -81,67 +81,60 @@ where
     Some(user)
 }
 
-/// Security context representing the effective and invoking user/group.
+/// Security context representing the invoking user identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecurityContext {
-    pub orchestrator_uid: u32,
     pub invoking_uid: u32,
-    pub invoking_gid: u32,
 }
 
 impl SecurityContext {
-    /// Determines the security context for the current process.
-    #[must_use]
-    #[allow(clippy::similar_names)]
-    pub fn current() -> Self {
-        let current_uid = nix::unistd::geteuid().as_raw();
-        let current_gid = nix::unistd::getegid().as_raw();
-        let sudo_user = std::env::var("SUDO_USER").ok();
-        let sudo_uid = std::env::var("SUDO_UID").ok();
-        let sudo_gid = std::env::var("SUDO_GID").ok();
-        let sudo = resolve_sudo_identity_with(
-            current_uid,
-            sudo_user.as_deref(),
-            sudo_uid.as_deref(),
-            sudo_gid.as_deref(),
-            PasswdUser::from_system,
-        );
-        Self::from_resolved(current_uid, current_gid, sudo.as_ref())
-    }
-
     /// Constructs a security context from resolved identity components.
     #[must_use]
-    #[allow(clippy::similar_names)]
-    pub fn from_resolved(
-        current_uid: u32,
-        current_gid: u32,
-        sudo_identity: Option<&PasswdUser>,
-    ) -> Self {
-        if current_uid == 0 {
-            if let Some(user) = sudo_identity {
-                Self {
-                    orchestrator_uid: current_uid,
-                    invoking_uid: user.uid,
-                    invoking_gid: user.gid,
-                }
-            } else {
-                Self {
-                    orchestrator_uid: 0,
-                    invoking_uid: 0,
-                    invoking_gid: current_gid,
-                }
-            }
+    pub fn from_resolved(current_uid: u32, sudo_identity: Option<&PasswdUser>) -> Self {
+        let invoking_uid = if current_uid == 0 {
+            sudo_identity.map_or(0, |u| u.uid)
         } else {
-            Self {
-                orchestrator_uid: current_uid,
-                invoking_uid: current_uid,
-                invoking_gid: current_gid,
-            }
-        }
+            current_uid
+        };
+        Self { invoking_uid }
     }
 }
 
+fn check_ownership_and_mode(desc: &str, meta: &fs::Metadata, invoking_uid: u32) -> Result<()> {
+    if meta.uid() != 0 && meta.uid() != invoking_uid {
+        bail!(
+            "{desc} is owned by uid {}, but orchestrator only trusts root (uid 0) and invoking owner (uid {})",
+            meta.uid(),
+            invoking_uid
+        );
+    }
+
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    if meta.mode() & 0o002 != 0 {
+        bail!(
+            "{desc} is world-writable (mode {:o}); refusing to execute",
+            meta.mode() & 0o7777
+        );
+    }
+
+    if (meta.mode() & 0o020 != 0) && meta.gid() != 0 {
+        bail!(
+            "{desc} is group-writable by non-root gid {} (mode {:o}); refusing to execute",
+            meta.gid(),
+            meta.mode() & 0o7777
+        );
+    }
+
+    Ok(())
+}
+
 /// Checks that a directory is not writable or owned by untrusted users.
+///
+/// Symlinked components are permitted if owned by root or the invoking owner; their canonical
+/// target directories are verified separately during the canonical path validation pass.
 ///
 /// # Errors
 /// Returns an error if the directory metadata cannot be read, if the directory is owned by an
@@ -150,34 +143,11 @@ impl SecurityContext {
 pub fn check_dir_security(dir: &Path, ctx: &SecurityContext) -> Result<()> {
     let meta = fs::symlink_metadata(dir)
         .with_context(|| format!("failed to read metadata of directory '{}'", dir.display()))?;
-
-    if meta.uid() != 0 && meta.uid() != ctx.invoking_uid {
-        bail!(
-            "parent directory '{}' of Firecracker binary is owned by uid {}, but orchestrator only trusts root (uid 0) and invoking owner (uid {})",
-            dir.display(),
-            meta.uid(),
-            ctx.invoking_uid
-        );
-    }
-
-    if meta.mode() & 0o002 != 0 {
-        bail!(
-            "parent directory '{}' of Firecracker binary is world-writable (mode {:o}); refusing to execute",
-            dir.display(),
-            meta.mode() & 0o7777
-        );
-    }
-
-    if (meta.mode() & 0o020 != 0) && meta.gid() != 0 {
-        bail!(
-            "parent directory '{}' of Firecracker binary is group-writable by non-root gid {} (mode {:o}); refusing to execute",
-            dir.display(),
-            meta.gid(),
-            meta.mode() & 0o7777
-        );
-    }
-
-    Ok(())
+    check_ownership_and_mode(
+        &format!("parent directory '{}' of Firecracker binary", dir.display()),
+        &meta,
+        ctx.invoking_uid,
+    )
 }
 
 /// Checks that an executable binary is not writable or owned by untrusted users.
@@ -205,33 +175,11 @@ pub fn check_binary_security(path: &Path, ctx: &SecurityContext) -> Result<()> {
         );
     }
 
-    if meta.uid() != 0 && meta.uid() != ctx.invoking_uid {
-        bail!(
-            "Firecracker binary '{}' is owned by uid {}, but orchestrator only trusts root (uid 0) and invoking owner (uid {})",
-            path.display(),
-            meta.uid(),
-            ctx.invoking_uid
-        );
-    }
-
-    if meta.mode() & 0o002 != 0 {
-        bail!(
-            "Firecracker binary '{}' is world-writable (mode {:o}); refusing to execute",
-            path.display(),
-            meta.mode() & 0o7777
-        );
-    }
-
-    if (meta.mode() & 0o020 != 0) && meta.gid() != 0 {
-        bail!(
-            "Firecracker binary '{}' is group-writable by non-root gid {} (mode {:o}); refusing to execute",
-            path.display(),
-            meta.gid(),
-            meta.mode() & 0o7777
-        );
-    }
-
-    Ok(())
+    check_ownership_and_mode(
+        &format!("Firecracker binary '{}'", path.display()),
+        &meta,
+        ctx.invoking_uid,
+    )
 }
 
 /// Validates binary path and all its ancestor directories against the security context.
@@ -253,16 +201,12 @@ pub fn validate_binary_path(path: &Path, ctx: &SecurityContext) -> Result<PathBu
 
     let symlink_meta = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect symlink metadata of '{}'", path.display()))?;
-    if symlink_meta.file_type().is_symlink()
-        && symlink_meta.uid() != 0
-        && symlink_meta.uid() != ctx.invoking_uid
-    {
-        bail!(
-            "symlink '{}' to Firecracker binary is owned by uid {}, but orchestrator only trusts root (uid 0) and invoking owner (uid {})",
-            path.display(),
-            symlink_meta.uid(),
-            ctx.invoking_uid
-        );
+    if symlink_meta.file_type().is_symlink() {
+        check_ownership_and_mode(
+            &format!("symlink '{}' to Firecracker binary", path.display()),
+            &symlink_meta,
+            ctx.invoking_uid,
+        )?;
     }
 
     let mut current = path.to_path_buf();
@@ -386,7 +330,6 @@ pub fn resolve_firecracker_binaries_with(
 #[allow(clippy::similar_names)]
 pub fn resolve_firecracker_binaries(env_bin_dir: Option<&Path>) -> Result<ResolvedBinaries> {
     let current_uid = nix::unistd::geteuid().as_raw();
-    let current_gid = nix::unistd::getegid().as_raw();
     let sudo_user = std::env::var("SUDO_USER").ok();
     let sudo_uid = std::env::var("SUDO_UID").ok();
     let sudo_gid = std::env::var("SUDO_GID").ok();
@@ -397,7 +340,7 @@ pub fn resolve_firecracker_binaries(env_bin_dir: Option<&Path>) -> Result<Resolv
         sudo_gid.as_deref(),
         PasswdUser::from_system,
     );
-    let ctx = SecurityContext::from_resolved(current_uid, current_gid, sudo_identity.as_ref());
+    let ctx = SecurityContext::from_resolved(current_uid, sudo_identity.as_ref());
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let candidates = candidate_search_dirs_with(
         sudo_identity.as_ref().map(|u| u.dir.as_path()),

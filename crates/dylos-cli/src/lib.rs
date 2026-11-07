@@ -3,8 +3,6 @@
 
 pub mod binaries;
 
-pub use binaries::*;
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
