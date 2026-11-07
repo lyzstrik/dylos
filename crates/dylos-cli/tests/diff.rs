@@ -26,6 +26,7 @@ fn cli_diff_help() {
     assert!(stdout.contains("<SNAPSHOT_A>"));
     assert!(stdout.contains("<SNAPSHOT_B>"));
     assert!(stdout.contains("--json"));
+    assert!(stdout.contains("--content"));
 }
 
 #[test]
@@ -270,4 +271,74 @@ fn cli_diff_escapes_untrusted_names_and_paths() {
     assert!(!stdout.contains("root\x1b[31mfs.ext4\n"));
     // Must be escaped
     assert!(stdout.contains(r"root\u{1b}[31mfs.ext4\n"));
+}
+
+#[test]
+fn cli_content_and_error_paths() {
+    let tmp = tempdir().unwrap();
+    let a = create_fixture_snapshot(&tmp.path().join("a"), &[0; 4096]);
+    let b = create_fixture_snapshot(&tmp.path().join("b\x1b[31m\n"), &[1; 4096]);
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_dylos"))
+            .args(["lab", "diff"])
+            .arg(&a)
+            .arg(&b)
+            .arg("--content")
+            .output()
+            .unwrap()
+    };
+    let output = run();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 blocks differ, 4096 changed bytes")
+    );
+    fs::write(b.join("manifest.json"), "invalid").unwrap();
+    let output = run();
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(!error.contains('\x1b'));
+    assert!(!error.contains("b\x1b[31m\n"));
+    assert!(error.contains("manifest.json"));
+}
+
+#[test]
+fn cli_topology_and_presence_rendering() {
+    let tmp = tempdir().unwrap();
+    let spec_a = dylos_core::LabSpec::from_yaml_str(include_str!(
+        "../../dylos-runtime/tests/fixtures/diff-topology-a.yaml"
+    ))
+    .unwrap();
+    let spec_b = dylos_core::LabSpec::from_yaml_str(include_str!(
+        "../../dylos-runtime/tests/fixtures/diff-topology-b.yaml"
+    ))
+    .unwrap();
+    let a = support::create_test_snapshot(&tmp.path().join("a"), spec_a, &[("vm1", b"disk")]);
+    let b = support::create_test_snapshot(
+        &tmp.path().join("b"),
+        spec_b,
+        &[("vm1", b"disk"), ("vm2", b"disk")],
+    );
+    for (from, to, sign, presence) in [(&a, &b, "+", "added"), (&b, &a, "-", "removed")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_dylos"))
+            .args(["lab", "diff"])
+            .arg(from)
+            .arg(to)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            format!("{sign} lan3"),
+            format!("{sign} vm2"),
+            format!("vm2 ({presence}):"),
+            "~ lan1:".into(),
+            "~ vm1:".into(),
+            "fd64:796c:6f73:10::".into(),
+            "10.0.10.".into(),
+            format!("{sign} vm1/eth1"),
+            format!("{presence} (4 bytes)"),
+        ] {
+            assert!(text.contains(&expected), "missing {expected}: {text}");
+        }
+    }
 }
