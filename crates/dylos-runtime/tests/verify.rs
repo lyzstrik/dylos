@@ -36,16 +36,19 @@ fn create_test_snapshot(dir: &Path, vm_names: &[&str]) -> (SnapshotOpener, Snaps
             (*vm_name).to_string(),
             VmManifest {
                 state_file: FileMeta {
+                    fsverity: None,
                     path: PathBuf::from(&state_path),
                     size: state_data.len() as u64,
                     sha256: sha(&state_data),
                 },
                 memory_file: FileMeta {
+                    fsverity: None,
                     path: PathBuf::from(&mem_path),
                     size: mem_data.len() as u64,
                     sha256: sha(&mem_data),
                 },
                 disks: vec![FileMeta {
+                    fsverity: None,
                     path: PathBuf::from(&disk_path),
                     size: disk_data.len() as u64,
                     sha256: sha(&disk_data),

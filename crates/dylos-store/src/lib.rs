@@ -14,6 +14,8 @@
 //! It depends on `dylos-core`, but must never depend on higher-level orchestration
 //! crates (like `dylos-runtime` or `dylos-cli`).
 
+pub mod verity;
+
 use dylos_core::LabSpec;
 use dylos_core::manifest::{FileMeta, SnapshotManifest};
 use nix::{
@@ -412,6 +414,7 @@ impl Snapshot {
         );
         Ok((
             FileMeta {
+                fsverity: None,
                 path: PathBuf::from(format!("vms/{node}/{disk_name}")),
                 sha256,
                 size,
@@ -592,6 +595,7 @@ impl Snapshot {
 
         Ok((
             FileMeta {
+                fsverity: None,
                 path: PathBuf::from(format!("vms/{node}/{file_name}")),
                 sha256,
                 size,
@@ -600,7 +604,8 @@ impl Snapshot {
         ))
     }
 
-    /// Hashes and syncs a captured file using its captured size as an upper bound.
+    /// Syncs captured content, seals it with fs-verity where supported, then hashes it.
+    /// The captured size is an upper bound; unsupported storage retains full hashing.
     /// # Errors
     /// Rejects missing files and changes in captured size.
     pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
@@ -613,6 +618,21 @@ impl Snapshot {
         let file = opener
             .open(&meta.path)
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        // Deferred captures are written back here, after thaw and before sealing.
+        file.sync_all()
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        // Enabling verity requires write permission even on an O_RDONLY descriptor.
+        // Captured memory is already read-only; restore its mode on every outcome.
+        let permissions = file
+            .metadata()
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?
+            .permissions();
+        file.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o200))
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        let sealed = verity::enable(&file);
+        file.set_permissions(permissions)
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        meta.fsverity = sealed.map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         let (sha256, size) = compute_file_sha256_and_size(&file, meta.size)
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         if size != meta.size {
@@ -621,8 +641,6 @@ impl Snapshot {
                 io::ErrorKind::InvalidData.into(),
             ));
         }
-        file.sync_all()
-            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         meta.sha256 = sha256;
         Ok(())
     }
@@ -1714,14 +1732,13 @@ fn normalize_rel_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn verify_manifest_files_parallel<F, R>(
+fn verify_manifest_files_parallel<F>(
     opener: &SnapshotOpener,
     manifest: &SnapshotManifest,
     open: F,
 ) -> Result<(), dylos_core::Error>
 where
-    F: Fn(&str, &FileMeta) -> io::Result<R> + Sync,
-    R: Read,
+    F: Fn(&str, &FileMeta) -> io::Result<File> + Sync,
 {
     opener.verify_inventory(manifest)?;
 
@@ -1767,7 +1784,28 @@ where
                             path: file.path.clone(),
                             source: e,
                         })
-                        .and_then(|reader| file.verify(node, reader));
+                        .and_then(|reader| {
+                            if let Some(expected) = &file.fsverity {
+                                let check = || -> io::Result<()> {
+                                    if reader.metadata()?.len() != file.size
+                                        || verity::measure(&reader)? != *expected
+                                    {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "snapshot fs-verity digest or size mismatch",
+                                        ));
+                                    }
+                                    Ok(())
+                                };
+                                check().map_err(|source| dylos_core::Error::Io {
+                                    vm: node.to_string(),
+                                    path: file.path.clone(),
+                                    source,
+                                })
+                            } else {
+                                file.verify(node, reader)
+                            }
+                        });
 
                     if let Err(err) = res {
                         has_error.store(true, std::sync::atomic::Ordering::Relaxed);

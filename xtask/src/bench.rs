@@ -1,8 +1,8 @@
 //! Benchmarks for Dylos technical spike.
 //!
-//! Measures cold boot latency, snapshot freeze/pause/total timings,
-//! parallel clone fork latencies (fork -n 1, 10, 20), and per-clone PSS once its reading
-//! settles, on a 5-VM lab (256 MiB each).
+//! Measures cold boot latency, snapshot freeze-to-thaw pause window, per-stage breakdown,
+//! total publication timing, parallel clone fork latencies (fork -n 1, 10, 20), and per-clone
+//! PSS once its reading settles, on a 5-VM lab (256 MiB each).
 #![forbid(unsafe_code)]
 #![allow(
     clippy::cast_precision_loss,
@@ -351,6 +351,7 @@ pub fn percentile(values: &[f64], pct: f64) -> f64 {
 
 /// README fork criterion: one clone ready in under this many milliseconds.
 const CLONE_BUDGET_MS: f64 = 500.0;
+/// README snapshot criterion: pause window (freeze to thaw) in under this many milliseconds.
 const SNAPSHOT_BUDGET_MS: f64 = 1000.0;
 const FREEZE_BUDGET_MS: f64 = 1000.0;
 const SKEW_BUDGET_MS: f64 = 100.0;
@@ -406,6 +407,44 @@ impl Row {
     }
 }
 
+/// Detailed stage breakdown for the snapshot operation across all 5 VMs.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotStages {
+    pub freeze_ms: MetricSamples,
+    pub pause_ms: MetricSamples,
+    pub api_snapshot_ms: MetricSamples,
+    pub storage_ms: MetricSamples,
+    pub resume_ms: MetricSamples,
+    pub thaw_ms: MetricSamples,
+    pub hash_ms: MetricSamples,
+    pub manifest_ms: MetricSamples,
+}
+
+impl SnapshotStages {
+    pub fn as_slice(&self) -> [(&'static str, &MetricSamples); 8] {
+        [
+            ("freeze", &self.freeze_ms),
+            ("pause", &self.pause_ms),
+            ("API snapshot", &self.api_snapshot_ms),
+            ("storage", &self.storage_ms),
+            ("resume", &self.resume_ms),
+            ("thaw", &self.thaw_ms),
+            ("hashing", &self.hash_ms),
+            ("manifest write", &self.manifest_ms),
+        ]
+    }
+
+    /// Returns the name and p95 duration of the stage with the largest p95 duration,
+    /// or None if all stage metrics are empty.
+    pub fn dominant_stage(&self) -> Option<(&'static str, f64)> {
+        self.as_slice()
+            .into_iter()
+            .filter(|(_, s)| !s.is_empty())
+            .max_by(|(_, a), (_, b)| a.p95().total_cmp(&b.p95()))
+            .map(|(name, s)| (name, s.p95()))
+    }
+}
+
 /// Aggregated benchmark results across all measurements.
 #[derive(Debug, Clone)]
 pub struct BenchResults {
@@ -417,8 +456,12 @@ pub struct BenchResults {
     pub cold_boot_ms: MetricSamples,
     pub freeze_duration_ms: MetricSamples,
     pub pause_skew_ms: MetricSamples,
-    /// Fabric-freeze entry through thaw completion, excluding post-thaw work.
-    pub snapshot_pause_ms: MetricSamples,
+    /// Wall time from starting fabric freeze through completing thaw, while VMs are paused and fabric is frozen.
+    pub snapshot_freeze_to_thaw_ms: MetricSamples,
+    /// Total time from starting snapshot until published and restorable.
+    pub snapshot_total_ms: MetricSamples,
+    /// Per-stage breakdown of the snapshot sequence.
+    pub snapshot_stages: SnapshotStages,
     /// End-to-end `Lab::fork_with` duration for the whole batch of clones.
     pub fork_wall_time_ms: BTreeMap<usize, MetricSamples>,
     /// Batch duration divided by the clone count.
@@ -440,8 +483,13 @@ impl BenchResults {
         pass(p95_under(Some(&self.pause_skew_ms), SKEW_BUDGET_MS))
     }
 
+    /// The README criterion is judged on the freeze-to-thaw pause window, not on the total time
+    /// including background hashing and publication.
     pub fn snapshot_verdict(&self) -> &'static str {
-        go(p95_under(Some(&self.snapshot_pause_ms), SNAPSHOT_BUDGET_MS))
+        go(p95_under(
+            Some(&self.snapshot_freeze_to_thaw_ms),
+            SNAPSHOT_BUDGET_MS,
+        ))
     }
 
     /// Every clone count that any fork or PSS measurement mentions.
@@ -564,10 +612,20 @@ impl BenchResults {
                 self.skew_verdict(),
             ),
             Row::new(
-                "Snapshot pause (5 VMs)",
+                "Snapshot pause window, freeze to thaw (5 VMs)",
                 "< 1000 ms",
-                stat(Some(&self.snapshot_pause_ms), 1.0, 1, "ms"),
+                stat(Some(&self.snapshot_freeze_to_thaw_ms), 1.0, 1, "ms"),
                 self.snapshot_verdict(),
+            ),
+            Row::new(
+                "Snapshot total until published (5 VMs)",
+                "informational",
+                stat(Some(&self.snapshot_total_ms), 1.0, 1, "ms"),
+                if self.snapshot_total_ms.is_empty() {
+                    "NO DATA"
+                } else {
+                    "INFO"
+                },
             ),
         ];
         for count in self.fork_counts() {
@@ -945,10 +1003,19 @@ struct ForkMetrics {
     pss_unsettled: BTreeMap<usize, usize>,
 }
 
+#[derive(Default)]
 struct SnapshotMetrics {
     freeze: MetricSamples,
-    skew: MetricSamples,
     pause: MetricSamples,
+    skew: MetricSamples,
+    api_snapshot: MetricSamples,
+    storage: MetricSamples,
+    resume: MetricSamples,
+    thaw: MetricSamples,
+    freeze_to_thaw: MetricSamples,
+    hash: MetricSamples,
+    manifest: MetricSamples,
+    total: MetricSamples,
 }
 
 struct Bench<'a> {
@@ -996,12 +1063,10 @@ impl Bench<'_> {
 
     /// Takes the snapshots; returns the metrics and the directory of the last snapshot.
     async fn snapshots(&self, source: &mut Lab) -> anyhow::Result<(SnapshotMetrics, PathBuf)> {
-        println!("--- [2/3] Benchmarking Snapshot Timings (Freeze, Pause Skew, Pause Window) ---");
-        let mut metrics = SnapshotMetrics {
-            freeze: MetricSamples::new(),
-            skew: MetricSamples::new(),
-            pause: MetricSamples::new(),
-        };
+        println!(
+            "--- [2/3] Benchmarking Snapshot Timings (Freeze-to-Thaw Pause, Skew, Total Publication) ---"
+        );
+        let mut metrics = SnapshotMetrics::default();
         let mut last_snapshot_dir: Option<PathBuf> = None;
         for rep in 1..=self.options.repetitions {
             // Only the last snapshot is forked from; drop the previous one outside the
@@ -1022,26 +1087,43 @@ impl Bench<'_> {
                 .await
                 .with_context(|| format!("snapshot failed on repetition {rep}"))?;
             let freeze = timings.freeze_ms as f64;
+            let pause = timings.pause_ms as f64;
             let skew = timings.pause_skew_us as f64 / 1000.0;
+            let api_snapshot = timings.api_snapshot_ms as f64;
+            let storage = timings.storage_ms as f64;
+            let resume = timings.resume_ms as f64;
+            let thaw = timings.thaw_ms as f64;
+            let freeze_to_thaw = timings.freeze_to_thaw_ms as f64;
+            let hash = timings.hash_ms as f64;
+            let manifest = timings.manifest_ms as f64;
             let total = timings.total_ms as f64;
+
             metrics.freeze.add(freeze);
-            metrics.skew.add(skew);
-            let pause = timings.freeze_to_thaw_ms as f64;
             metrics.pause.add(pause);
+            metrics.skew.add(skew);
+            metrics.api_snapshot.add(api_snapshot);
+            metrics.storage.add(storage);
+            metrics.resume.add(resume);
+            metrics.thaw.add(thaw);
+            metrics.freeze_to_thaw.add(freeze_to_thaw);
+            metrics.hash.add(hash);
+            metrics.manifest.add(manifest);
+            metrics.total.add(total);
+
             println!(
-                "  Repetition {rep:>2}/{}: freeze = {freeze:>5.1} ms, pause skew = {skew:>5.3} ms, freeze-to-thaw = {pause:>6.1} ms, total snapshot = {total:>6.1} ms",
+                "  Repetition {rep:>2}/{}: pause window (freeze-to-thaw) = {freeze_to_thaw:>5.1} ms, total until published = {total:>6.1} ms, pause skew = {skew:>5.3} ms",
                 self.options.repetitions
             );
             last_snapshot_dir = Some(self.lab_config.store.snapshot_dir("b-src", &snap_id));
         }
         println!(
-            "Snapshot summary: freeze median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms), freeze-to-thaw median = {:.1} ms (p95: {:.1} ms)\n",
-            metrics.freeze.median(),
-            metrics.freeze.p95(),
+            "Snapshot summary: pause window median = {:.1} ms (p95: {:.1} ms), total published median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms)\n",
+            metrics.freeze_to_thaw.median(),
+            metrics.freeze_to_thaw.p95(),
+            metrics.total.median(),
+            metrics.total.p95(),
             metrics.skew.median(),
-            metrics.skew.p95(),
-            metrics.pause.median(),
-            metrics.pause.p95()
+            metrics.skew.p95()
         );
         let dir = last_snapshot_dir.context("missing snapshot for fork benchmarks")?;
         Ok((metrics, dir))
@@ -1251,9 +1333,20 @@ async fn measure_into(
         is_quick: options.quick,
         ci_runner: std::env::var_os("GITHUB_ACTIONS").is_some() || std::env::var_os("CI").is_some(),
         cold_boot_ms,
-        freeze_duration_ms: snapshot.freeze,
+        freeze_duration_ms: snapshot.freeze.clone(),
         pause_skew_ms: snapshot.skew,
-        snapshot_pause_ms: snapshot.pause,
+        snapshot_freeze_to_thaw_ms: snapshot.freeze_to_thaw,
+        snapshot_total_ms: snapshot.total,
+        snapshot_stages: SnapshotStages {
+            freeze_ms: snapshot.freeze,
+            pause_ms: snapshot.pause,
+            api_snapshot_ms: snapshot.api_snapshot,
+            storage_ms: snapshot.storage,
+            resume_ms: snapshot.resume,
+            thaw_ms: snapshot.thaw,
+            hash_ms: snapshot.hash,
+            manifest_ms: snapshot.manifest,
+        },
         fork_wall_time_ms: forks.wall,
         fork_amortized_ms: forks.amortized,
         fork_restore_ms: forks.restore,
@@ -1309,6 +1402,18 @@ pub fn print_results_table(results: &BenchResults) {
             "{:<52} {:>12} {:>12} {:>16} {:>10}",
             row.label, row.median, row.p95, row.threshold, row.verdict
         );
+    }
+    if !results.snapshot_stages.freeze_ms.is_empty() {
+        println!("\nSnapshot Stage Breakdown (5 VMs):");
+        println!("{:<32} {:>12} {:>12}", "Stage", "Median", "p95");
+        println!("{:-<32} {:-<12} {:-<12}", "", "", "");
+        for (label, s) in results.snapshot_stages.as_slice() {
+            let (median, p95) = stat(Some(s), 1.0, 1, "ms");
+            println!("{label:<32} {median:>12} {p95:>12}");
+        }
+        if let Some((dom_name, dom_p95)) = results.snapshot_stages.dominant_stage() {
+            println!("Dominant stage: {dom_name} ({dom_p95:.1} ms p95)");
+        }
     }
     println!("================================================================================");
     println!(
@@ -1380,6 +1485,7 @@ fn conclusion(results: &BenchResults) -> String {
 pub fn render_markdown_report(results: &BenchResults) -> String {
     let host = &results.host;
     let mut out = String::new();
+    let snap_pause_p95 = p95_text(Some(&results.snapshot_freeze_to_thaw_ms), 1, "ms");
     let _ = write!(
         out,
         "# Technical Spike: Benchmark Report & Go / No-Go Decision
@@ -1390,7 +1496,7 @@ Quantified benchmark results evaluating Dylos technical spike microVM network co
 
 - **Overall Spike Verdict:** **{overall}** ({mode}, {reps} repetitions per measurement)
 - **Evaluation against Go Criteria:**
-  - **Snapshot pause for 5 VMs (256 MiB each) in under 1 s:** **{snapshot}** (p95: {snap_p95} vs target < 1000 ms)
+  - **Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **{snapshot}** (p95: {snap_pause_p95} vs target < 1000 ms)
   - **Fork of one clone in under 500 ms (complete fork operation, end-to-end and amortized per clone):** **{fork}** ({forks})
   - **Fabric freeze in under 1 s:** **{freeze}** (p95: {freeze_p95})
   - **Pause confirmation skew in under 100 ms:** **{skew}** (p95: {skew_p95})
@@ -1419,7 +1525,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
         mode = results.mode_label(),
         reps = results.repetitions,
         snapshot = results.snapshot_verdict(),
-        snap_p95 = p95_text(Some(&results.snapshot_pause_ms), 1, "ms"),
+        snap_pause_p95 = snap_pause_p95,
         fork = results.fork_verdict(),
         forks = fork_summary(results),
         freeze = results.freeze_verdict(),
@@ -1450,8 +1556,57 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
         );
     }
 
+    let stage_freeze = stat(Some(&results.snapshot_stages.freeze_ms), 1.0, 1, "ms");
+    let stage_pause = stat(Some(&results.snapshot_stages.pause_ms), 1.0, 1, "ms");
+    let stage_api = stat(Some(&results.snapshot_stages.api_snapshot_ms), 1.0, 1, "ms");
+    let stage_storage = stat(Some(&results.snapshot_stages.storage_ms), 1.0, 1, "ms");
+    let stage_resume = stat(Some(&results.snapshot_stages.resume_ms), 1.0, 1, "ms");
+    let stage_thaw = stat(Some(&results.snapshot_stages.thaw_ms), 1.0, 1, "ms");
+    let stage_hash = stat(Some(&results.snapshot_stages.hash_ms), 1.0, 1, "ms");
+    let stage_manifest = stat(Some(&results.snapshot_stages.manifest_ms), 1.0, 1, "ms");
+
+    let _ = write!(
+        out,
+        "
+### Snapshot Stage Breakdown
+
+| Stage | Median | p95 | Description |
+| :--- | :--- | :--- | :--- |
+| Freeze | {stage_freeze_med} | {stage_freeze_p95} | Network fabric freeze |
+| Pause | {stage_pause_med} | {stage_pause_p95} | VM pause API |
+| API snapshot | {stage_api_med} | {stage_api_p95} | Memory & state serialization |
+| Storage | {stage_storage_med} | {stage_storage_p95} | Disk reflink & file capture |
+| Resume | {stage_resume_med} | {stage_resume_p95} | VM resume API |
+| Thaw | {stage_thaw_med} | {stage_thaw_p95} | Network fabric thaw |
+| Hashing | {stage_hash_med} | {stage_hash_p95} | SHA-256 integrity hashing (post-thaw) |
+| Manifest write | {stage_manifest_med} | {stage_manifest_p95} | Manifest write & atomic publication |
+",
+        stage_freeze_med = stage_freeze.0,
+        stage_freeze_p95 = stage_freeze.1,
+        stage_pause_med = stage_pause.0,
+        stage_pause_p95 = stage_pause.1,
+        stage_api_med = stage_api.0,
+        stage_api_p95 = stage_api.1,
+        stage_storage_med = stage_storage.0,
+        stage_storage_p95 = stage_storage.1,
+        stage_resume_med = stage_resume.0,
+        stage_resume_p95 = stage_resume.1,
+        stage_thaw_med = stage_thaw.0,
+        stage_thaw_p95 = stage_thaw.1,
+        stage_hash_med = stage_hash.0,
+        stage_hash_p95 = stage_hash.1,
+        stage_manifest_med = stage_manifest.0,
+        stage_manifest_p95 = stage_manifest.1,
+    );
+
     let cold_boot = stat(Some(&results.cold_boot_ms), 1.0, 1, "ms").0;
     let fork_n1 = stat(results.fork_wall_time_ms.get(&1), 1.0, 1, "ms").0;
+    let snap_total_p95 = p95_text(Some(&results.snapshot_total_ms), 1, "ms");
+    let dominant = results.snapshot_stages.dominant_stage().map_or_else(
+        || "no data".into(),
+        |(name, p95)| format!("{name} (p95: {p95:.1} ms)"),
+    );
+
     let _ = write!(
         out,
         "
@@ -1462,7 +1617,8 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 - **Interval Definitions:**
   - *Fabric Freeze Duration:* duration of the fabric-freeze call on the network fabric. It does not measure guest-observed network downtime.
   - *Pause Confirmation Skew:* duration from the first successful VM pause API response to the last.
-  - *Snapshot Pause:* fabric-freeze entry through thaw completion (`freeze_to_thaw`), including capture and resume but excluding post-thaw hashing, sync and publication. Total command duration is printed separately for each repetition.
+  - *Snapshot Pause Window (freeze to thaw):* duration from starting fabric freeze through completing thaw, while VMs are paused and fabric is frozen. This is the go/no-go snapshot criterion.
+  - *Snapshot Total Until Published:* end-to-end operation including VM pause, disk sync, memory state serialization, VM resume, fabric thaw, SHA-256 integrity calculation, final manifest write and atomic publication. VMs are resumed and working during hashing and publication.
   - *Fork End-to-End:* duration of `Lab::fork_with` for the whole batch, from entry through all clones restored and ready. It covers manifest verification, storage reflink cloning, parallel VM launch, resume and readiness. For n = 1 it is the README criterion directly.
   - *Fork Amortized per Clone:* end-to-end duration divided by the clone count. Per-clone completion latency inside a batch is not measured; the end-to-end duration bounds it from above.
   - *Restore Sub-Interval (netns to thaw):* per-clone interval from network namespace setup through Firecracker startup, snapshot memory loading, VM resume and network unfreeze. It excludes verification and storage preparation and is informational only: it never decides the fork verdict.
@@ -1470,7 +1626,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 
 ## Analysis & Findings
 
-1. **Snapshot:** freeze p95 {freeze_p95}, pause skew p95 {skew_p95}, freeze-to-thaw p95 {snap_p95} (limit 1000 ms). Post-thaw hashing, sync and publication are excluded from this criterion.
+1. **Snapshot:** pause window (freeze to thaw) p95 {snap_pause_p95} (limit 1000 ms), pause skew p95 {skew_p95}, total snapshot until published p95 {snap_total_p95}. Per-stage breakdown (p95): freeze {stage_freeze_p95}, pause {stage_pause_p95}, API snapshot {stage_api_p95}, storage {stage_storage_p95}, resume {stage_resume_p95}, thaw {stage_thaw_p95}, hashing {stage_hash_p95}, manifest write {stage_manifest_p95}. Dominant stage: {dominant}.
 2. **Fork:** {forks}.
 3. **Memory:** per-clone PSS after settling: {pss_text}. PSS alone does not prove copy-on-write sharing: lazy, largely untouched guest memory also produces low PSS. A sharing / private-dirty measurement is required for that claim.
 4. **Cold boot comparison:** cold boot of 5 microVMs has a median of {cold_boot}; the fork end-to-end median for n = 1 is {fork_n1}.
@@ -1479,11 +1635,22 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 
 {conclusion}
 ",
-        freeze_p95 = p95_text(Some(&results.freeze_duration_ms), 1, "ms"),
+        snap_pause_p95 = snap_pause_p95,
         skew_p95 = p95_text(Some(&results.pause_skew_ms), 3, "ms"),
-        snap_p95 = p95_text(Some(&results.snapshot_pause_ms), 1, "ms"),
+        snap_total_p95 = snap_total_p95,
+        stage_freeze_p95 = stage_freeze.1,
+        stage_pause_p95 = stage_pause.1,
+        stage_api_p95 = stage_api.1,
+        stage_storage_p95 = stage_storage.1,
+        stage_resume_p95 = stage_resume.1,
+        stage_thaw_p95 = stage_thaw.1,
+        stage_hash_p95 = stage_hash.1,
+        stage_manifest_p95 = stage_manifest.1,
+        dominant = dominant,
         forks = fork_summary(results),
         pss_text = pss_summary(results),
+        cold_boot = cold_boot,
+        fork_n1 = fork_n1,
         conclusion = conclusion(results),
     );
     out

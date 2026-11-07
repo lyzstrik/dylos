@@ -360,6 +360,7 @@ fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) 
                 fs::set_permissions(&file_path, fs::Permissions::from_mode(0o444)).unwrap();
             }
             FileMeta {
+                fsverity: None,
                 path: PathBuf::from(format!("vms/{}/{name}", node.name)),
                 size: bytes.len() as u64,
                 sha256: dylos_core::manifest::sha256_hex(&Sha256::digest(bytes.as_bytes()).into()),
@@ -673,4 +674,81 @@ fn deferred_capture_preserves_zero_chunks_and_trailing_holes() {
         meta.sha256,
         dylos_core::manifest::sha256_hex(&sha2::Sha256::digest(&bytes).into())
     );
+}
+
+#[test]
+fn restore_and_verify_refuse_changed_state_memory_and_disk() {
+    for name in ["vm.mem", "rootfs.ext4", "vm.state"] {
+        let (_temp, store, spec) = setup();
+        let (path, mut manifest) = restore_fixture(&store, spec);
+        for vm in manifest.vms.values_mut() {
+            for meta in [&mut vm.memory_file, &mut vm.state_file]
+                .into_iter()
+                .chain(vm.disks.iter_mut())
+            {
+                let full = path.join(&meta.path);
+                let permissions = fs::metadata(&full).unwrap().permissions();
+                fs::set_permissions(&full, fs::Permissions::from_mode(0o600)).unwrap();
+                meta.fsverity =
+                    dylos_store::verity::enable(&fs::File::open(&full).unwrap()).unwrap();
+                fs::set_permissions(full, permissions).unwrap();
+            }
+        }
+        fs::write(
+            path.join("manifest.json"),
+            manifest.to_json_string().unwrap(),
+        )
+        .unwrap();
+        let opener = SnapshotOpener::new(&path).unwrap();
+        opener.verify(&manifest).unwrap();
+        match store.restore("intact", &path) {
+            Ok((mut clone, _)) => {
+                clone.remove().unwrap();
+                clone.remove().unwrap();
+            }
+            Err(dylos_store::Error::Reflink { source, .. })
+                if matches!(
+                    source.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
+                ) =>
+            {
+                assert!(!store.base.join("intact").exists());
+            }
+            Err(error) => panic!("sealed restore failed: {error}"),
+        }
+        let changed = path.join("vms/a").join(name);
+        let mut bytes = fs::read(&changed).unwrap();
+        bytes[0] ^= 1;
+        // Verity prevents in-place writes even as root; replace the inode and
+        // re-seal the changed bytes to exercise a measured digest mismatch.
+        fs::remove_file(&changed).unwrap();
+        fs::write(&changed, bytes).unwrap();
+        dylos_store::verity::enable(&fs::File::open(&changed).unwrap()).unwrap();
+        if name == "vm.mem" {
+            fs::set_permissions(&changed, fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        assert!(opener.verify(&manifest).is_err(), "{name}");
+        assert!(store.restore("changed", &path).is_err(), "{name}");
+        assert!(!store.base.join("changed").exists());
+    }
+}
+
+#[test]
+fn declared_verity_on_unsealed_files_fails_closed() {
+    let (_temp, store, spec) = setup();
+    let (path, mut manifest) = restore_fixture(&store, spec);
+    manifest.vms.get_mut("a").unwrap().state_file.fsverity = Some("00".repeat(32));
+    fs::write(
+        path.join("manifest.json"),
+        manifest.to_json_string().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        SnapshotOpener::new(&path)
+            .unwrap()
+            .verify(&manifest)
+            .is_err()
+    );
+    assert!(store.restore("unproven", &path).is_err());
+    assert!(!store.base.join("unproven").exists());
 }

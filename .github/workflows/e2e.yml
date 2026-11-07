@@ -49,12 +49,12 @@ jobs:
       - name: Set up reflink-capable lab storage
         run: |
           mkdir -p "$GITHUB_WORKSPACE"
-          if ! command -v mkfs.xfs >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y xfsprogs
+          if ! command -v mkfs.btrfs >/dev/null 2>&1 || ! command -v fsverity >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y btrfs-progs fsverity
           fi
-          sudo truncate -s 10G /mnt/dylos-xfs.img
-          sudo mkfs.xfs -m reflink=1 /mnt/dylos-xfs.img
-          sudo mount -o loop /mnt/dylos-xfs.img "$GITHUB_WORKSPACE"
+          sudo truncate -s 10G /mnt/dylos-btrfs.img
+          sudo mkfs.btrfs -f /mnt/dylos-btrfs.img
+          sudo mount -o loop,compress=zstd:3 /mnt/dylos-btrfs.img "$GITHUB_WORKSPACE"
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
           # Verify reflink support on the mounted workspace
@@ -63,6 +63,16 @@ jobs:
           echo "test-reflink" > "$TMP_SRC"
           cp --reflink=always "$TMP_SRC" "$TMP_DST"
           rm -f "$TMP_SRC" "$TMP_DST"
+
+          # Prove the runner supports verity reads, reflink sources and shared mappings.
+          VERITY_SRC=$(mktemp "$GITHUB_WORKSPACE/verity.XXXXXX")
+          printf 'verity probe\n' > "$VERITY_SRC"
+          fsverity enable "$VERITY_SRC"
+          fsverity measure "$VERITY_SRC"
+          cp --reflink=always "$VERITY_SRC" "$VERITY_SRC.clone"
+          cmp "$VERITY_SRC" "$VERITY_SRC.clone"
+          python3 -c 'import mmap,sys; f=open(sys.argv[1], "rb"); m=mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY); assert m[:] == b"verity probe\n"' "$VERITY_SRC"
+          rm -f "$VERITY_SRC" "$VERITY_SRC.clone"
 
           # Enable cgroup v2 controllers on host for jailer cgroups
           if [ -f /sys/fs/cgroup/cgroup.subtree_control ]; then
