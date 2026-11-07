@@ -1132,6 +1132,7 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
     reader.seek(SeekFrom::Start(0))?;
     dest.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
+    let zeros = vec![0u8; buffer.len()];
     let mut copied = 0u64;
     loop {
         let n = match reader.read(&mut buffer) {
@@ -1151,8 +1152,15 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
                 ),
             ));
         }
-        dest.write_all(&buffer[..n])?;
+        // Guest memory commonly has large untouched regions. Keep zero chunks
+        // sparse instead of dirtying a second set of page-cache pages.
+        if buffer[..n] == zeros[..n] {
+            dest.seek(SeekFrom::Start(copied))?;
+        } else {
+            dest.write_all(&buffer[..n])?;
+        }
     }
+    dest.set_len(copied)?;
     Ok(())
 }
 

@@ -640,3 +640,37 @@ fn staged_publication_never_replaces_existing_snapshot() {
             .exists()
     );
 }
+
+#[test]
+fn deferred_capture_preserves_zero_chunks_and_trailing_holes() {
+    use sha2::Digest;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    let (temp, store, _spec) = setup();
+    let snapshot = store.stage_snapshot("lab", "sparse").unwrap();
+    let source = temp.path().join("memory");
+    let mut file = fs::File::create(&source).unwrap();
+    let size = 3 * 1024 * 1024;
+    file.set_len(size).unwrap();
+    file.write_all(b"captured").unwrap();
+    let (mut meta, _) = snapshot
+        .capture_vm_source(
+            VmFileSource::open(&source, size).unwrap(),
+            "node1",
+            "vm.mem",
+        )
+        .unwrap();
+    let captured = snapshot.root().join(&meta.path);
+    let metadata = fs::metadata(&captured).unwrap();
+    assert_eq!(metadata.len(), size);
+    assert!(metadata.blocks() * 512 < size);
+    let bytes = fs::read(&captured).unwrap();
+    assert_eq!(&bytes[..8], b"captured");
+    assert!(bytes[8..].iter().all(|byte| *byte == 0));
+    snapshot.hash_file(&mut meta).unwrap();
+    assert_eq!(meta.size, size);
+    assert_eq!(
+        meta.sha256,
+        dylos_core::manifest::sha256_hex(&sha2::Sha256::digest(&bytes).into())
+    );
+}
