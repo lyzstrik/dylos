@@ -64,7 +64,9 @@ fn snapshot_clone_disk_save_vm_file_and_manifest_verify() {
                 Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
             ) =>
         {
-            eprintln!("SKIP: reflinks unsupported in this test environment: {source}");
+            eprintln!(
+                "SKIPPED snapshot_clone_disk_save_vm_file_and_manifest_verify: reflinks unsupported in this test environment: {source}"
+            );
             return;
         }
         Err(e) => panic!("clone_disk failed: {e}"),
@@ -230,6 +232,9 @@ fn save_vm_file_fails_closed_on_exdev_without_copying() {
 
     let shm_dir = std::path::Path::new("/dev/shm");
     if !shm_dir.exists() {
+        eprintln!(
+            "SKIPPED save_vm_file_fails_closed_on_exdev_without_copying: /dev/shm unavailable"
+        );
         return;
     }
     let shm_file = shm_dir.join(format!("dylos-test-exdev-{}", std::process::id()));
@@ -410,7 +415,9 @@ fn restore_verifies_before_creation_and_reflinks_independent_files() {
             ) =>
         {
             assert!(!store.base.join("clone").exists());
-            eprintln!("SKIPPED restore store test: reflinks unsupported: {source}");
+            eprintln!(
+                "SKIPPED restore_verifies_before_creation_and_reflinks_independent_files: reflinks unsupported: {source}"
+            );
             return;
         }
         Err(e) => panic!("restore failed: {e}"),
@@ -546,7 +553,9 @@ fn deferred_hash_reads_isolated_capture_despite_source_writer() {
                 Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
             ) =>
         {
-            eprintln!("SKIP disk isolation: reflinks unavailable: {source}");
+            eprintln!(
+                "SKIPPED deferred_hash_reads_isolated_capture_despite_source_writer: reflinks unavailable: {source}"
+            );
             return;
         }
         Err(error) => panic!("disk capture failed: {error}"),
