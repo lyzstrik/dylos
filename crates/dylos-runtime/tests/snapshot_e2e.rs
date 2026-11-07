@@ -270,8 +270,15 @@ async fn continuous_disk_writes_cloned_disk_consistent() {
         "cloned rootfs missing: {}",
         cloned_disk.display()
     );
-    let snapshot_stale = recover_and_verify(&cloned_disk, "cloned disk");
-    let captured_cycles = recorded_allocation_cycles(&cloned_disk);
+    // Journal replay writes the image; keep published verity content unchanged.
+    let recovered_disk = dir.path().join("recovered-rootfs.ext4");
+    fs::copy(&cloned_disk, &recovered_disk).unwrap();
+    let snapshot_stale = recover_and_verify(&recovered_disk, "cloned disk");
+    let captured_cycles = recorded_allocation_cycles(&recovered_disk);
+    SnapshotOpener::new(&snap_dir)
+        .unwrap()
+        .verify(&manifest)
+        .unwrap();
     assert!(
         captured_cycles >= alloc_at_capture,
         "cloned disk records {captured_cycles} allocation cycles, but {alloc_at_capture} were durable before capture"
