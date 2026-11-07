@@ -7,12 +7,12 @@
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
-use dylos_runtime::{Fleet, Lab, LabConfig, LabError, diff_snapshots};
+use dylos_runtime::{Fleet, Lab, LabConfig, LabError, RestorePool, diff_snapshots};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 
@@ -107,6 +107,30 @@ enum LabCommands {
     Snapshot(SnapshotArgs),
     /// Compare two snapshots of a lab
     Diff(DiffArgs),
+    /// Maintain a pool of pre-warmed clones for instant fork hand-out
+    Pool(PoolArgs),
+}
+
+#[derive(Args, Debug)]
+struct PoolArgs {
+    /// Snapshot directory containing manifest.json
+    snapshot: PathBuf,
+
+    /// Number of pre-restored clones to keep in the pool
+    #[arg(short = 'c', long = "capacity", default_value = "2")]
+    capacity: usize,
+
+    /// Number of clones to hand out from the pool
+    #[arg(short = 'n', long = "count", default_value = "1")]
+    count: usize,
+
+    /// Base prefix for clone identifiers (defaults to snapshot directory name or lab name)
+    #[arg(long, visible_alias = "id")]
+    prefix: Option<String>,
+
+    /// Compare pre-warmed hand-out latency against a cold restore
+    #[arg(long)]
+    bench: bool,
 }
 
 #[derive(Args, Debug)]
@@ -134,6 +158,10 @@ struct ForkArgs {
     /// Base prefix for clone identifiers (defaults to snapshot directory name or lab name)
     #[arg(long, visible_alias = "id")]
     prefix: Option<String>,
+
+    /// Use a pre-warmed restore pool with the given capacity
+    #[arg(long)]
+    pool: Option<usize>,
 }
 
 #[derive(Args, Debug)]
@@ -240,6 +268,7 @@ async fn main() -> Result<()> {
             LabCommands::Down(down_args) => lab_down(down_args).await,
             LabCommands::Snapshot(snapshot_args) => lab_snapshot(snapshot_args).await,
             LabCommands::Diff(diff_args) => lab_diff(diff_args).await,
+            LabCommands::Pool(pool_args) => lab_pool(pool_args).await,
         },
     }
 }
@@ -391,17 +420,41 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
         .context("failed to register SIGTERM handler")?;
 
     let config = build_launch_config()?;
-    let fork_future = Lab::fork_with(&config, &args.snapshot, &clone_ids);
-    tokio::pin!(fork_future);
+    let mut pool_guard = None;
 
     let mut interrupted = false;
-    let labs = loop {
-        tokio::select! {
-            biased;
-            _ = sigint.recv() => interrupted = true,
-            _ = sigterm.recv() => interrupted = true,
-            res = &mut fork_future => {
-                break res.with_context(|| format!("failed to fork snapshot '{}'", args.snapshot.display()))?;
+    let labs = if let Some(capacity) = args.pool {
+        if capacity == 0 {
+            bail!("pool capacity must be at least 1");
+        }
+        println!(
+            "initializing pre-warmed restore pool (capacity: {capacity}) for snapshot '{}'...",
+            args.snapshot.display()
+        );
+        let mut pool = RestorePool::new(&config, &args.snapshot, &prefix, capacity)
+            .await
+            .context("failed to initialize restore pool")?;
+        let mut handed_out = Vec::with_capacity(args.count);
+        for _ in 0..args.count {
+            handed_out.push(
+                pool.take()
+                    .await
+                    .context("failed to hand out clone from pool")?,
+            );
+        }
+        pool_guard = Some(pool);
+        handed_out
+    } else {
+        let fork_future = Lab::fork_with(&config, &args.snapshot, &clone_ids);
+        tokio::pin!(fork_future);
+        loop {
+            tokio::select! {
+                biased;
+                _ = sigint.recv() => interrupted = true,
+                _ = sigterm.recv() => interrupted = true,
+                res = &mut fork_future => {
+                    break res.with_context(|| format!("failed to fork snapshot '{}'", args.snapshot.display()))?;
+                }
             }
         }
     };
@@ -426,7 +479,34 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
             labs.len()
         );
     }
-    supervise(&config, labs, interrupted, &mut sigint, &mut sigterm).await
+    let res = supervise(&config, labs, interrupted, &mut sigint, &mut sigterm).await;
+    if let Some(mut pool) = pool_guard {
+        let _ = pool.teardown().await;
+    }
+    res
+}
+
+async fn lab_pool(args: PoolArgs) -> Result<()> {
+    if args.bench {
+        let config = build_launch_config()?;
+        let prefix = args.prefix.as_deref().unwrap_or("bench");
+        validate_lab_id(prefix)?;
+        let cold_id = format!("{prefix}-cold");
+        let start = Instant::now();
+        let mut cold_lab = Lab::restore_with(&config, &args.snapshot, &cold_id).await?;
+        let cold_ms = cold_lab
+            .restore_latency()
+            .map_or_else(|| start.elapsed().as_millis(), |d| d.as_millis());
+        println!("cold restore: {cold_ms} ms");
+        cold_lab.teardown().await?;
+    }
+    lab_fork(ForkArgs {
+        snapshot: args.snapshot,
+        count: args.count,
+        prefix: args.prefix,
+        pool: Some(args.capacity),
+    })
+    .await
 }
 
 /// Supervises `labs` until each is torn down, or tears all of them down on a signal, or at once

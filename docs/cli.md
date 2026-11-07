@@ -218,6 +218,7 @@ Usage: dylos lab fork [OPTIONS] --count <COUNT> <SNAPSHOT>
 - `<SNAPSHOT>`: Path to the snapshot directory containing `manifest.json`. Required.
 - `-n, --count <COUNT>`: Number of clone labs to fork. Required. Must be an integer between 1 and 1024 inclusive.
 - `--prefix <PREFIX>`: Base prefix for clone identifiers (alias: `--id`). Optional. Defaults to snapshot directory or source lab name. Generates `<prefix>-c1` through `<prefix>-c<count>`. Each generated identifier must not exceed 32 characters.
+- `--pool <CAPACITY>`: Use a pre-warmed restore pool with the given capacity. Optional.
 - `-h, --help`: Print help and exit `0`.
 
 #### Behavior
@@ -244,6 +245,25 @@ all <count> clones ready, press Ctrl+C or run `dylos lab down <clone>`
 #### Exit Status
 
 Exits with `0` when cleanly stopped. Exits with `2` on argument parsing errors (e.g. non-integer `--count`). Exits with `1` if `count` is 0 or greater than 1024, if a generated clone identifier exceeds 32 characters, if manifest verification fails, or if bring-up fails.
+
+---
+
+### `dylos lab pool`
+
+Maintain a pool of pre-warmed clones for instant fork hand-out.
+
+```text
+Usage: dylos lab pool [OPTIONS] <SNAPSHOT>
+```
+
+#### Arguments & Options
+
+- `<SNAPSHOT>`: Path to snapshot directory containing `manifest.json`. Required.
+- `-c, --capacity <CAPACITY>`: Number of pre-restored paused clones to keep ready in the pool (default: 2).
+- `-n, --count <COUNT>`: Number of clones to hand out from the pool (default: 1).
+- `--prefix <PREFIX>`: Base prefix for clone identifiers (defaults to snapshot directory name).
+- `--bench`: Compare pre-warmed hand-out latency against a cold restore.
+- `-h, --help`: Print help and exit `0`.
 
 ---
 

@@ -387,3 +387,25 @@ fn fork_command_requires_snapshot_and_count_and_rejects_invalid_id() {
         "--count",
     );
 }
+
+#[test]
+fn pool_command_argument_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_status(&run(dir.path(), &["lab", "pool"]), false, "<SNAPSHOT>");
+    assert_status(
+        &run(dir.path(), &["lab", "pool", "missing", "-c", "0"]),
+        false,
+        "pool capacity must be at least 1",
+    );
+    assert_status(
+        &run(dir.path(), &["lab", "pool", "missing", "-n", "0"]),
+        false,
+        "clone count must be at least 1",
+    );
+    assert_status(
+        &run(dir.path(), &["lab", "pool", "--help"]),
+        true,
+        "--capacity",
+    );
+    assert_status(&run(dir.path(), &["lab", "fork", "--help"]), true, "--pool");
+}

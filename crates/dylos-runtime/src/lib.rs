@@ -20,6 +20,7 @@ pub mod fleet;
 pub mod jailer;
 pub mod lab;
 pub mod pause;
+pub mod pool;
 pub mod snapshot;
 pub mod vm;
 
@@ -32,5 +33,6 @@ pub use jailer::{
 };
 pub use lab::{Lab, LabConfig, LabError};
 pub use pause::{pause_all, resume_all};
+pub use pool::RestorePool;
 pub use snapshot::{SnapshotRequest, SnapshotSlot, SnapshotTimings, snapshot_vms, verify_snapshot};
 pub use vm::{ExecOutput, ProcessState, Timeouts, Vm, VmSpec, validate_resources};

@@ -202,7 +202,7 @@ impl Lab {
                 snapshots: SnapshotSlot::default(),
                 restore_latency: None,
             };
-            let result = lab.bring_up(config, spec, plan, false).await;
+            let result = lab.bring_up(config, spec, plan, BringUpMode::Boot).await;
             if let Err(operation) = result {
                 return match lab.teardown().await {
                     Ok(()) => Err(operation),
@@ -232,8 +232,28 @@ impl Lab {
             })?
     }
 
+    /// Restores a verified snapshot into a fresh lab with microVMs loaded and paused,
+    /// network fabric frozen, and control socket unbound.
+    /// # Errors
+    /// Rejects invalid snapshots or ids and rolls back all owned resources on failure.
+    pub async fn restore_paused_with(
+        config: &LabConfig,
+        snapshot: &Path,
+        lab_id: &str,
+    ) -> Result<Self> {
+        let (config, snapshot, lab_id) = (config.clone(), snapshot.to_owned(), lab_id.to_owned());
+        tokio::spawn(async move {
+            Self::restore_owned_internal(&config, &snapshot, &lab_id, true, true).await
+        })
+        .await
+        .map_err(|source| LabError::Task {
+            lab: "restore_paused".into(),
+            source,
+        })?
+    }
+
     async fn restore_owned(config: &LabConfig, snapshot: &Path, lab_id: &str) -> Result<Self> {
-        Self::restore_owned_internal(config, snapshot, lab_id, true).await
+        Self::restore_owned_internal(config, snapshot, lab_id, true, false).await
     }
 
     async fn restore_owned_internal(
@@ -241,6 +261,7 @@ impl Lab {
         snapshot: &Path,
         lab_id: &str,
         check_fc: bool,
+        pause: bool,
     ) -> Result<Self> {
         if check_fc {
             validate_firecracker(config).await?;
@@ -266,8 +287,13 @@ impl Lab {
             restore_latency: None,
         };
         let started = Instant::now();
+        let mode = if pause {
+            BringUpMode::RestorePaused
+        } else {
+            BringUpMode::RestoreAndResume
+        };
         if let Err(operation) = lab
-            .bring_up(config, &spec, plan, true)
+            .bring_up(config, &spec, plan, mode)
             .instrument(span)
             .await
         {
@@ -365,7 +391,7 @@ impl Lab {
             let snapshot = snapshot.to_path_buf();
             let id = id.clone();
             handles.push(tokio::spawn(async move {
-                Self::restore_owned_internal(&config, &snapshot, &id, false).await
+                Self::restore_owned_internal(&config, &snapshot, &id, false, false).await
             }));
         }
 
@@ -437,15 +463,25 @@ impl Lab {
         let ids = Self::generate_clone_ids(prefix, count)?;
         Self::fork_with(config, snapshot, &ids).await
     }
+}
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum BringUpMode {
+    Boot,
+    RestoreAndResume,
+    RestorePaused,
+}
+
+impl Lab {
     #[allow(clippy::too_many_lines)]
     async fn bring_up(
         &mut self,
         config: &LabConfig,
         spec: &LabSpec,
         plan: FabricPlan,
-        restoring: bool,
+        mode: BringUpMode,
     ) -> Result<()> {
+        let restoring = mode != BringUpMode::Boot;
         let root = self.root().to_owned();
         let id = self.id.clone();
         self.lock = Some(blocking(&self.id, move || lock_directory(&id, &root)).await?);
@@ -509,9 +545,25 @@ impl Lab {
             duration_ms = started.elapsed().as_millis(),
             "all VM APIs ready"
         );
-        if restoring {
-            self.resume_restored(config, netns_started).await?;
-            return Ok(());
+        match mode {
+            BringUpMode::RestorePaused => {
+                self.load_restored().await?;
+                return Ok(());
+            }
+            BringUpMode::RestoreAndResume => {
+                self.load_restored().await?;
+                self.activate(config).await?;
+                let latency = netns_started.elapsed();
+                self.restore_latency = Some(latency);
+                tracing::info!(
+                    lab = %self.id,
+                    latency_ms = latency.as_millis(),
+                    target_ms = 500,
+                    "clone restored and thawed (netns to thaw)"
+                );
+                return Ok(());
+            }
+            BringUpMode::Boot => {}
         }
         let started = Instant::now();
         complete(
@@ -571,9 +623,17 @@ impl Lab {
         Ok(())
     }
 
-    async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
+    /// Activates a pre-restored paused lab by resuming its microVMs, resynchronizing guest entropy
+    /// and wall-clock time via the guest agent (ADR-0003), thawing the network fabric, and binding
+    /// the control socket.
+    ///
+    /// Returns the hand-out activation latency.
+    ///
+    /// # Errors
+    /// Returns an error if VM resumption, agent resync, network unfreeze, or control socket binding fails.
+    pub async fn activate(&mut self, config: &LabConfig) -> Result<Duration> {
+        let started = Instant::now();
         let listeners = crate::agent::listeners(&self.id, &self.vms, &config.jailer)?;
-        self.load_restored().await?;
         crate::resume_all(&self.id, &self.vms).await?;
         crate::agent::resync_all(&self.vms, &listeners)
             .await
@@ -581,16 +641,15 @@ impl Lab {
         if let Some(network) = self.network.as_mut() {
             network.thaw().await?;
         }
-        let latency = netns_started.elapsed();
+        let latency = started.elapsed();
         self.restore_latency = Some(latency);
         tracing::info!(
             lab = %self.id,
             latency_ms = latency.as_millis(),
-            target_ms = 500,
-            "clone restored and thawed (netns to thaw)"
+            "pre-warmed clone activated and thawed"
         );
         self.bind_control_socket().await?;
-        Ok(())
+        Ok(latency)
     }
 
     async fn load_restored(&self) -> Result<()> {
