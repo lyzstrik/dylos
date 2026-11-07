@@ -14,6 +14,8 @@
 //! It depends on `dylos-core`, but must never depend on higher-level orchestration
 //! crates (like `dylos-runtime` or `dylos-cli`).
 
+pub mod verity;
+
 use dylos_core::LabSpec;
 use dylos_core::manifest::{FileMeta, SnapshotManifest};
 use nix::{
@@ -412,6 +414,7 @@ impl Snapshot {
         );
         Ok((
             FileMeta {
+                fsverity: None,
                 path: PathBuf::from(format!("vms/{node}/{disk_name}")),
                 sha256,
                 size,
@@ -581,6 +584,7 @@ impl Snapshot {
 
         Ok((
             FileMeta {
+                fsverity: None,
                 path: PathBuf::from(format!("vms/{node}/{file_name}")),
                 sha256,
                 size,
@@ -602,6 +606,18 @@ impl Snapshot {
         let file = opener
             .open(&meta.path)
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        // Enabling verity requires write permission even on an O_RDONLY descriptor.
+        // Captured memory is already read-only; restore its mode on every outcome.
+        let permissions = file
+            .metadata()
+            .map_err(|e| contextual(&self.root, e))?
+            .permissions();
+        file.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o200))
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        let sealed = verity::enable(&file);
+        file.set_permissions(permissions)
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        meta.fsverity = sealed.map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         let (sha256, size) = compute_file_sha256_and_size(&file, meta.size)
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         if size != meta.size {

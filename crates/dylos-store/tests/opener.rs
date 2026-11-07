@@ -112,6 +112,7 @@ fn manifest_verifies_through_public_descriptor_opener() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("file"), "hello world").unwrap();
     let meta = FileMeta {
+        fsverity: None,
         path: "file".into(),
         size: 11,
         sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
@@ -152,6 +153,7 @@ fn opener_verify_rejects_undeclared_entries() {
     let tmp = tempdir().unwrap();
     fs::write(tmp.path().join("file"), "hello world").unwrap();
     let meta = FileMeta {
+        fsverity: None,
         path: "file".into(),
         size: 11,
         sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
@@ -229,6 +231,7 @@ fn opener_verify_rejects_symlinked_manifest_and_declared_files() {
     let outside = tempdir().unwrap();
     fs::write(tmp.path().join("file"), "hello world").unwrap();
     let meta = FileMeta {
+        fsverity: None,
         path: "file".into(),
         size: 11,
         sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
