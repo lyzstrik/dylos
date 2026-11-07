@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use dylos_core::diff::DiffStatus;
 use dylos_core::manifest::{FileMeta, SnapshotManifest, StepDurations, VmManifest, sha256_hex};
 use dylos_core::{Interface, LabSpec, Node, Segment};
 use dylos_runtime::diff_snapshots;
@@ -81,7 +82,7 @@ fn single_vm_spec() -> LabSpec {
         segments: vec![Segment {
             name: "lan".into(),
             ipv6: "fd64:796c:6f73:1::/64".parse().unwrap(),
-            ipv4: None,
+            ipv4: Some("10.0.1.0/24".parse().unwrap()),
         }],
         nodes: vec![Node {
             name: "vm1".into(),
@@ -92,7 +93,7 @@ fn single_vm_spec() -> LabSpec {
                 name: "eth0".into(),
                 segment: "lan".into(),
                 ipv6: "fd64:796c:6f73:1::2/64".parse().unwrap(),
-                ipv4: None,
+                ipv4: Some("10.0.1.2/24".parse().unwrap()),
             }],
             static_routes: vec![],
         }],
@@ -119,10 +120,11 @@ async fn diff_identical_snapshots() {
     assert_eq!(diff.vms.len(), 1);
 
     let vm1 = &diff.vms["vm1"];
-    assert!(vm1.state.identical);
-    assert!(vm1.memory.identical);
+    assert_eq!(vm1.status, DiffStatus::Identical);
+    assert!(vm1.state.is_identical());
+    assert!(vm1.memory.is_identical());
     assert_eq!(vm1.disks.len(), 1);
-    assert!(vm1.disks[0].identical);
+    assert!(vm1.disks[0].is_identical());
 }
 
 fn topology_spec_a() -> LabSpec {
@@ -131,12 +133,12 @@ fn topology_spec_a() -> LabSpec {
             Segment {
                 name: "lan1".into(),
                 ipv6: "fd64:796c:6f73:1::/64".parse().unwrap(),
-                ipv4: None,
+                ipv4: Some("10.0.1.0/24".parse().unwrap()),
             },
             Segment {
                 name: "lan2".into(),
                 ipv6: "fd64:796c:6f73:2::/64".parse().unwrap(),
-                ipv4: None,
+                ipv4: Some("10.0.2.0/24".parse().unwrap()),
             },
         ],
         nodes: vec![Node {
@@ -148,7 +150,7 @@ fn topology_spec_a() -> LabSpec {
                 name: "eth0".into(),
                 segment: "lan1".into(),
                 ipv6: "fd64:796c:6f73:1::2/64".parse().unwrap(),
-                ipv4: None,
+                ipv4: Some("10.0.1.2/24".parse().unwrap()),
             }],
             static_routes: vec![],
         }],
@@ -161,12 +163,12 @@ fn topology_spec_b() -> LabSpec {
             Segment {
                 name: "lan1".into(),
                 ipv6: "fd64:796c:6f73:10::/64".parse().unwrap(),
-                ipv4: None,
+                ipv4: Some("10.0.10.0/24".parse().unwrap()),
             },
             Segment {
                 name: "lan3".into(),
                 ipv6: "fd64:796c:6f73:3::/64".parse().unwrap(),
-                ipv4: None,
+                ipv4: Some("10.0.3.0/24".parse().unwrap()),
             },
         ],
         nodes: vec![
@@ -180,13 +182,13 @@ fn topology_spec_b() -> LabSpec {
                         name: "eth0".into(),
                         segment: "lan1".into(),
                         ipv6: "fd64:796c:6f73:10::2/64".parse().unwrap(),
-                        ipv4: None,
+                        ipv4: Some("10.0.10.2/24".parse().unwrap()),
                     },
                     Interface {
                         name: "eth1".into(),
                         segment: "lan3".into(),
                         ipv6: "fd64:796c:6f73:3::2/64".parse().unwrap(),
-                        ipv4: None,
+                        ipv4: Some("10.0.3.2/24".parse().unwrap()),
                     },
                 ],
                 static_routes: vec![],
@@ -200,7 +202,7 @@ fn topology_spec_b() -> LabSpec {
                     name: "eth0".into(),
                     segment: "lan3".into(),
                     ipv6: "fd64:796c:6f73:3::3/64".parse().unwrap(),
-                    ipv4: None,
+                    ipv4: Some("10.0.3.3/24".parse().unwrap()),
                 }],
                 static_routes: vec![],
             },
@@ -229,6 +231,10 @@ async fn diff_topology_changes() {
     assert_eq!(diff.topology.segments.removed, vec!["lan2"]);
     assert_eq!(diff.topology.segments.changed.len(), 1);
     assert_eq!(diff.topology.segments.changed[0].name, "lan1");
+    assert_eq!(
+        diff.topology.segments.changed[0].ipv4.as_ref().unwrap().to,
+        Some("10.0.10.0/24".parse().unwrap())
+    );
 
     assert_eq!(diff.topology.nodes.added, vec!["vm2"]);
     assert_eq!(diff.topology.nodes.removed, Vec::<String>::new());
@@ -248,6 +254,14 @@ async fn diff_topology_changes() {
     assert_eq!(diff.topology.interfaces.changed.len(), 1);
     assert_eq!(diff.topology.interfaces.changed[0].node, "vm1");
     assert_eq!(diff.topology.interfaces.changed[0].interface, "eth0");
+    assert_eq!(
+        diff.topology.interfaces.changed[0]
+            .ipv4
+            .as_ref()
+            .unwrap()
+            .to,
+        Some("10.0.10.2/24".parse().unwrap())
+    );
 }
 
 #[tokio::test]
@@ -271,9 +285,43 @@ async fn diff_changed_disk_reports_status_and_sizes() {
     let diff = diff_snapshots(&dir_a, &dir_b).await.unwrap();
 
     let vm1 = &diff.vms["vm1"];
-    assert!(!vm1.disks[0].identical);
-    assert_eq!(vm1.disks[0].size_a, 4096);
-    assert_eq!(vm1.disks[0].size_b, 8192);
+    assert_eq!(vm1.status, DiffStatus::Changed);
+    assert_eq!(vm1.disks[0].status, DiffStatus::Changed);
+    assert_eq!(vm1.disks[0].size_a, Some(4096));
+    assert_eq!(vm1.disks[0].size_b, Some(8192));
+}
+
+#[tokio::test]
+async fn diff_vm_added_and_removed() {
+    let tmp = tempdir().unwrap();
+    let disk = vec![0u8; 4096];
+
+    let spec_a = single_vm_spec();
+    let mut spec_b = single_vm_spec();
+    spec_b.nodes[0].name = "vm2".into();
+
+    let dir_a = create_test_snapshot(&tmp.path().join("snap_a"), spec_a, &[("vm1", &disk)]);
+    let dir_b = create_test_snapshot(&tmp.path().join("snap_b"), spec_b, &[("vm2", &disk)]);
+
+    let diff = diff_snapshots(&dir_a, &dir_b).await.unwrap();
+
+    let vm1 = &diff.vms["vm1"];
+    assert_eq!(vm1.status, DiffStatus::Removed);
+    assert_eq!(vm1.state.status, DiffStatus::Removed);
+    assert!(vm1.state.size_a.is_some());
+    assert_eq!(vm1.state.size_b, None);
+    assert_eq!(vm1.disks[0].status, DiffStatus::Removed);
+    assert_eq!(vm1.disks[0].size_a, Some(4096));
+    assert_eq!(vm1.disks[0].size_b, None);
+
+    let vm2 = &diff.vms["vm2"];
+    assert_eq!(vm2.status, DiffStatus::Added);
+    assert_eq!(vm2.state.status, DiffStatus::Added);
+    assert_eq!(vm2.state.size_a, None);
+    assert!(vm2.state.size_b.is_some());
+    assert_eq!(vm2.disks[0].status, DiffStatus::Added);
+    assert_eq!(vm2.disks[0].size_a, None);
+    assert_eq!(vm2.disks[0].size_b, Some(4096));
 }
 
 #[tokio::test]
@@ -298,9 +346,44 @@ async fn diff_corrupted_snapshot_fails_verification() {
     let err = diff_snapshots(&dir_a, &dir_b).await.unwrap_err();
     let err_str = err.to_string();
     assert!(
-        err_str.contains("mismatch")
+        err_str.to_lowercase().contains("integrity mismatch")
             || err_str.contains("IntegrityMismatch")
             || err_str.contains("expected"),
         "error should indicate verification failure, got: {err_str}"
+    );
+}
+
+#[tokio::test]
+async fn diff_rejects_manifest_vm_keys_mismatch() {
+    let tmp = tempdir().unwrap();
+    let disk = vec![0u8; 4096];
+
+    let dir_a = create_test_snapshot(
+        &tmp.path().join("snap_a"),
+        single_vm_spec(),
+        &[("vm1", &disk)],
+    );
+    let dir_b = create_test_snapshot(
+        &tmp.path().join("snap_b"),
+        single_vm_spec(),
+        &[("vm1", &disk)],
+    );
+
+    // Tamper with manifest in B: add an undeclared VM key
+    let manifest_path = dir_b.join("manifest.json");
+    let mut manifest_json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest_json["vms"]["rogue_vm"] = manifest_json["vms"]["vm1"].clone();
+    fs::write(
+        &manifest_path,
+        serde_json::to_string(&manifest_json).unwrap(),
+    )
+    .unwrap();
+
+    let err = diff_snapshots(&dir_a, &dir_b).await.unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("manifest VMs do not match") || err_str.contains("manifest"),
+        "expected VM key mismatch rejection, got: {err_str}"
     );
 }

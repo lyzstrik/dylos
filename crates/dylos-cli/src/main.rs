@@ -569,104 +569,161 @@ fn print_human_diff(diff: &SnapshotDiff) {
     print_human_vms(&diff.vms);
 }
 
+fn format_ipv4_change<T: std::fmt::Display>(
+    ipv4: Option<&dylos_core::diff::ValueChange<Option<T>>>,
+) -> Option<String> {
+    ipv4.map(|c| {
+        let from_s = c
+            .from
+            .as_ref()
+            .map_or_else(|| "none".to_string(), ToString::to_string);
+        let to_s =
+            c.to.as_ref()
+                .map_or_else(|| "none".to_string(), ToString::to_string);
+        format!("ipv4: {from_s} -> {to_s}")
+    })
+}
+
+fn format_file_status(
+    status: dylos_core::diff::DiffStatus,
+    size_a: Option<u64>,
+    size_b: Option<u64>,
+) -> String {
+    match status {
+        dylos_core::diff::DiffStatus::Identical => {
+            format!("identical ({} bytes)", size_a.unwrap_or(0))
+        }
+        dylos_core::diff::DiffStatus::Changed => format!(
+            "changed ({} bytes -> {} bytes)",
+            size_a.unwrap_or(0),
+            size_b.unwrap_or(0)
+        ),
+        dylos_core::diff::DiffStatus::Added => {
+            format!("added ({} bytes)", size_b.unwrap_or(0))
+        }
+        dylos_core::diff::DiffStatus::Removed => {
+            format!("removed ({} bytes)", size_a.unwrap_or(0))
+        }
+    }
+}
+
 fn print_human_topology(topology: &dylos_core::diff::TopologyDiff) {
     if topology.is_empty() {
         println!("Topology: no changes");
         return;
     }
     println!("Topology:");
-    if !topology.segments.is_empty() {
-        println!("  Segments:");
-        for added in &topology.segments.added {
-            println!("    + {added}");
-        }
-        for removed in &topology.segments.removed {
-            println!("    - {removed}");
-        }
-        for changed in &topology.segments.changed {
-            print!("    ~ {}:", changed.name);
-            if let Some(ref ipv6) = changed.ipv6 {
-                print!(" ipv6: {} -> {}", ipv6.from, ipv6.to);
-            }
-            if let Some(ref ipv4) = changed.ipv4 {
-                let from_s = ipv4
-                    .from
-                    .map_or_else(|| "none".to_string(), |v| v.to_string());
-                let to_s = ipv4
-                    .to
-                    .map_or_else(|| "none".to_string(), |v| v.to_string());
-                print!(" ipv4: {from_s} -> {to_s}");
-            }
-            println!();
-        }
+    print_human_segments(&topology.segments);
+    print_human_nodes(&topology.nodes);
+    print_human_interfaces(&topology.interfaces);
+}
+
+fn print_human_segments(segments: &dylos_core::diff::SegmentDiff) {
+    if segments.is_empty() {
+        return;
     }
-    if !topology.nodes.is_empty() {
-        println!("  Nodes:");
-        for added in &topology.nodes.added {
-            println!("    + {added}");
-        }
-        for removed in &topology.nodes.removed {
-            println!("    - {removed}");
-        }
-        for changed in &topology.nodes.changed {
-            print!("    ~ {}:", changed.name);
-            let mut parts = Vec::new();
-            if let Some(ref image) = changed.image {
-                parts.push(format!("image: {} -> {}", image.from, image.to));
-            }
-            if let Some(ref vcpus) = changed.vcpus {
-                parts.push(format!("vcpus: {} -> {}", vcpus.from, vcpus.to));
-            }
-            if let Some(ref memory) = changed.memory {
-                parts.push(format!("memory: {} -> {}", memory.from, memory.to));
-            }
-            if parts.is_empty() {
-                println!(" (properties unchanged)");
-            } else {
-                println!(" {}", parts.join(", "));
-            }
-        }
+    println!("  Segments:");
+    for added in &segments.added {
+        println!("    + {}", added.escape_debug());
     }
-    if !topology.interfaces.is_empty() {
-        println!("  Interfaces:");
-        for added in &topology.interfaces.added {
-            let v4 = added
-                .ipv4
-                .map_or_else(String::new, |v| format!(", ipv4: {v}"));
-            println!(
-                "    + {}/{} (segment: {}, ipv6: {}{v4})",
-                added.node, added.interface, added.segment, added.ipv6
-            );
+    for removed in &segments.removed {
+        println!("    - {}", removed.escape_debug());
+    }
+    for changed in &segments.changed {
+        print!("    ~ {}:", changed.name.escape_debug());
+        if let Some(ref ipv6) = changed.ipv6 {
+            print!(" ipv6: {} -> {}", ipv6.from, ipv6.to);
         }
-        for removed in &topology.interfaces.removed {
-            let v4 = removed
-                .ipv4
-                .map_or_else(String::new, |v| format!(", ipv4: {v}"));
-            println!(
-                "    - {}/{} (segment: {}, ipv6: {}{v4})",
-                removed.node, removed.interface, removed.segment, removed.ipv6
-            );
+        if let Some(msg) = format_ipv4_change(changed.ipv4.as_ref()) {
+            print!(" {msg}");
         }
-        for changed in &topology.interfaces.changed {
-            print!("    ~ {}/{}:", changed.node, changed.interface);
-            let mut parts = Vec::new();
-            if let Some(ref seg) = changed.segment {
-                parts.push(format!("segment: {} -> {}", seg.from, seg.to));
-            }
-            if let Some(ref ipv6) = changed.ipv6 {
-                parts.push(format!("ipv6: {} -> {}", ipv6.from, ipv6.to));
-            }
-            if let Some(ref ipv4) = changed.ipv4 {
-                let from_s = ipv4
-                    .from
-                    .map_or_else(|| "none".to_string(), |v| v.to_string());
-                let to_s = ipv4
-                    .to
-                    .map_or_else(|| "none".to_string(), |v| v.to_string());
-                parts.push(format!("ipv4: {from_s} -> {to_s}"));
-            }
+        println!();
+    }
+}
+
+fn print_human_nodes(nodes: &dylos_core::diff::NodeDiff) {
+    if nodes.is_empty() {
+        return;
+    }
+    println!("  Nodes:");
+    for added in &nodes.added {
+        println!("    + {}", added.escape_debug());
+    }
+    for removed in &nodes.removed {
+        println!("    - {}", removed.escape_debug());
+    }
+    for changed in &nodes.changed {
+        print!("    ~ {}:", changed.name.escape_debug());
+        let mut parts = Vec::new();
+        if let Some(ref image) = changed.image {
+            parts.push(format!("image: {} -> {}", image.from, image.to));
+        }
+        if let Some(ref vcpus) = changed.vcpus {
+            parts.push(format!("vcpus: {} -> {}", vcpus.from, vcpus.to));
+        }
+        if let Some(ref memory) = changed.memory {
+            parts.push(format!("memory: {} -> {}", memory.from, memory.to));
+        }
+        if let Some(ref routes) = changed.static_routes {
+            parts.push(format!(
+                "static_routes: {:?} -> {:?}",
+                routes.from, routes.to
+            ));
+        }
+        if parts.is_empty() {
+            println!(" (properties unchanged)");
+        } else {
             println!(" {}", parts.join(", "));
         }
+    }
+}
+
+fn print_human_interfaces(interfaces: &dylos_core::diff::InterfaceDiff) {
+    if interfaces.is_empty() {
+        return;
+    }
+    println!("  Interfaces:");
+    for added in &interfaces.added {
+        let v4 = added
+            .ipv4
+            .map_or_else(String::new, |v| format!(", ipv4: {v}"));
+        println!(
+            "    + {}/{} (segment: {}, ipv6: {}{v4})",
+            added.node.escape_debug(),
+            added.interface.escape_debug(),
+            added.segment.escape_debug(),
+            added.ipv6
+        );
+    }
+    for removed in &interfaces.removed {
+        let v4 = removed
+            .ipv4
+            .map_or_else(String::new, |v| format!(", ipv4: {v}"));
+        println!(
+            "    - {}/{} (segment: {}, ipv6: {}{v4})",
+            removed.node.escape_debug(),
+            removed.interface.escape_debug(),
+            removed.segment.escape_debug(),
+            removed.ipv6
+        );
+    }
+    for changed in &interfaces.changed {
+        print!(
+            "    ~ {}/{}:",
+            changed.node.escape_debug(),
+            changed.interface.escape_debug()
+        );
+        let mut parts = Vec::new();
+        if let Some(ref seg) = changed.segment {
+            parts.push(format!("segment: {} -> {}", seg.from, seg.to));
+        }
+        if let Some(ref ipv6) = changed.ipv6 {
+            parts.push(format!("ipv6: {} -> {}", ipv6.from, ipv6.to));
+        }
+        if let Some(msg) = format_ipv4_change(changed.ipv4.as_ref()) {
+            parts.push(msg);
+        }
+        println!(" {}", parts.join(", "));
     }
 }
 
@@ -677,33 +734,34 @@ fn print_human_vms(vms: &std::collections::BTreeMap<String, dylos_core::diff::Vm
     }
     println!("VMs:");
     for (vm_name, vm_diff) in vms {
-        println!("  {vm_name}:");
-        if vm_diff.state.identical {
-            println!("    state:  identical ({} bytes)", vm_diff.state.size_a);
-        } else {
-            println!(
-                "    state:  changed ({} bytes -> {} bytes)",
-                vm_diff.state.size_a, vm_diff.state.size_b
-            );
+        let escaped_vm = vm_name.escape_debug();
+        match vm_diff.status {
+            dylos_core::diff::DiffStatus::Added => println!("  {escaped_vm} (added):"),
+            dylos_core::diff::DiffStatus::Removed => println!("  {escaped_vm} (removed):"),
+            _ => println!("  {escaped_vm}:"),
         }
-        if vm_diff.memory.identical {
-            println!("    memory: identical ({} bytes)", vm_diff.memory.size_a);
-        } else {
-            println!(
-                "    memory: changed ({} bytes -> {} bytes)",
-                vm_diff.memory.size_a, vm_diff.memory.size_b
-            );
-        }
+        println!(
+            "    state:  {}",
+            format_file_status(
+                vm_diff.state.status,
+                vm_diff.state.size_a,
+                vm_diff.state.size_b
+            )
+        );
+        println!(
+            "    memory: {}",
+            format_file_status(
+                vm_diff.memory.status,
+                vm_diff.memory.size_a,
+                vm_diff.memory.size_b
+            )
+        );
         for disk in &vm_diff.disks {
-            let path_str = disk.path.display();
-            if disk.identical {
-                println!("    disk \"{path_str}\": identical ({} bytes)", disk.size_a);
-            } else {
-                println!(
-                    "    disk \"{path_str}\": changed ({} bytes -> {} bytes)",
-                    disk.size_a, disk.size_b
-                );
-            }
+            let escaped_path = disk.path.display().to_string().escape_debug().to_string();
+            println!(
+                "    disk \"{escaped_path}\": {}",
+                format_file_status(disk.status, disk.size_a, disk.size_b)
+            );
         }
     }
 }
