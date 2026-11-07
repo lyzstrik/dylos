@@ -873,3 +873,62 @@ async fn check_static_firecracker_fails_on_missing_file() {
     let err = check_static_firecracker(&missing).await.unwrap_err();
     assert!(matches!(err, Error::Io { .. }), "{err:?}");
 }
+
+#[tokio::test]
+async fn malformed_program_header_layouts_fail_closed() {
+    for (fixture, phoff, ehsize, phentsize, phnum, header_size, entry_size) in [
+        (
+            include_bytes!("fixtures/elf/dynamic_binary").as_slice(),
+            32,
+            52,
+            54,
+            56,
+            64u16,
+            56u16,
+        ),
+        (
+            include_bytes!("fixtures/elf/static_binary_elf32").as_slice(),
+            28,
+            40,
+            42,
+            44,
+            52u16,
+            32u16,
+        ),
+    ] {
+        for (field, value, reason) in [
+            (phoff, 0u64, "program header table"),
+            (phoff, u64::from(header_size - 1), "program header table"),
+            (phoff, 4096, "beyond file length"),
+            (phoff, u64::MAX, "overflow"),
+            (phnum, 0, "program header table"),
+            (phnum, 0xffff, "program header table"),
+            (phnum, 100, "beyond file length"),
+            (phentsize, 0, "entry size"),
+            (phentsize, u64::from(entry_size - 1), "entry size"),
+            (phentsize, u64::from(entry_size + 1), "entry size"),
+            (ehsize, u64::from(header_size - 1), "header size"),
+            (ehsize, u64::from(header_size + 1), "header size"),
+        ] {
+            let mut bytes = fixture.to_vec();
+            let width = if field == phoff {
+                if header_size == 64 { 8 } else { 4 }
+            } else {
+                2
+            };
+            bytes[field..field + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            let temp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(temp.path(), bytes).unwrap();
+            let err = check_static_firecracker(temp.path()).await.unwrap_err();
+            let expected = if header_size == 52 && value == u64::MAX {
+                "beyond file length"
+            } else {
+                reason
+            };
+            assert!(
+                matches!(&err, Error::InvalidFirecrackerBinary { path, reason } if path == temp.path() && reason.contains(expected)),
+                "ELF{header_size} field {field}, value {value}: {err:?}"
+            );
+        }
+    }
+}

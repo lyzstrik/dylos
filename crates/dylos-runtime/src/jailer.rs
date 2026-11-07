@@ -43,10 +43,6 @@ pub fn validate_unix_socket_path(path: &Path) -> std::result::Result<(), usize> 
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const PT_INTERP: u32 = 3;
 
-/// Inspects the program headers of an executable to determine if it requires an ELF interpreter (`PT_INTERP`).
-///
-/// Returns `Ok(true)` if the binary is an ELF file and requests a dynamic program interpreter,
-/// `Ok(false)` if it is statically linked (or static-pie) or not an ELF binary, and `Err` on I/O error.
 /// Inspects an executable file to determine if it requires an ELF interpreter (`PT_INTERP`).
 ///
 /// An ELF binary without `PT_INTERP` is statically linked (or a static PIE).
@@ -102,6 +98,14 @@ pub fn has_elf_interpreter(path: &Path) -> std::io::Result<bool> {
             ));
         }
     };
+
+    let header_size = if class == 1 { 52 } else { 64 };
+    if phoff < header_size || phnum == 0 || phnum == 0xffff {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "missing, overlapping, or unsupported extended program header table",
+        ));
+    }
 
     let table_size = phnum.checked_mul(phentsize).ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "program header table size overflow")
@@ -165,7 +169,7 @@ fn parse_elf32_header(
     let mut header = [0u8; 36];
     file.read_exact(&mut header)?;
     let ehsize = u64::from(read_u16(&header[24..26], is_le));
-    if ehsize < 52 {
+    if ehsize != 52 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "invalid ELF32 header size",
@@ -174,10 +178,10 @@ fn parse_elf32_header(
     let phoff = u64::from(read_u32(&header[12..16], is_le));
     let phentsize = u64::from(read_u16(&header[26..28], is_le));
     let phnum = u64::from(read_u16(&header[28..30], is_le));
-    if phnum > 0 && phentsize < 32 {
+    if phentsize != 32 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
-            "invalid ELF32 program header entry size (must be >= 32)",
+            "invalid ELF32 program header entry size (must be 32)",
         ));
     }
     Ok((phoff, phentsize, phnum))
@@ -197,7 +201,7 @@ fn parse_elf64_header(
     let mut header = [0u8; 48];
     file.read_exact(&mut header)?;
     let ehsize = u64::from(read_u16(&header[36..38], is_le));
-    if ehsize < 64 {
+    if ehsize != 64 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
             "invalid ELF64 header size",
@@ -206,10 +210,10 @@ fn parse_elf64_header(
     let phoff = read_u64(&header[16..24], is_le);
     let phentsize = u64::from(read_u16(&header[38..40], is_le));
     let phnum = u64::from(read_u16(&header[40..42], is_le));
-    if phnum > 0 && phentsize < 56 {
+    if phentsize != 56 {
         return Err(std::io::Error::new(
             ErrorKind::InvalidData,
-            "invalid ELF64 program header entry size (must be >= 56)",
+            "invalid ELF64 program header entry size (must be 56)",
         ));
     }
     Ok((phoff, phentsize, phnum))
@@ -223,7 +227,12 @@ fn scan_program_headers(
     is_le: bool,
 ) -> std::io::Result<bool> {
     for i in 0..phnum {
-        let entry_offset = phoff + i * phentsize;
+        let entry_offset = i
+            .checked_mul(phentsize)
+            .and_then(|offset| phoff.checked_add(offset))
+            .ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidData, "program header offset overflow")
+            })?;
         file.seek(SeekFrom::Start(entry_offset))?;
         let mut p_type_bytes = [0u8; 4];
         file.read_exact(&mut p_type_bytes)?;
