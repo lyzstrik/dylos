@@ -93,6 +93,8 @@ struct LabArgs {
 
 #[derive(Subcommand, Debug)]
 enum LabCommands {
+    /// List persisted labs and their observed lifecycle state
+    List,
     /// Bring up a lab and supervise it until teardown
     Up(UpArgs),
     /// Restore a snapshot directory into a new supervised lab
@@ -199,6 +201,23 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Lab(lab_args) => match lab_args.command {
+            LabCommands::List => {
+                let config = build_base_config();
+                let labs = tokio::task::spawn_blocking(move || {
+                    dylos_cli::list_labs(&config, Path::new("/proc"))
+                })
+                .await??;
+                for lab in labs {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        lab.id,
+                        lab.state,
+                        lab.vms,
+                        lab.directory.display()
+                    );
+                }
+                Ok(())
+            }
             LabCommands::Up(up_args) => lab_up(up_args).await,
             LabCommands::Restore(args) => lab_restore(args).await,
             LabCommands::Fork(args) => lab_fork(args).await,
