@@ -121,6 +121,7 @@ fn snapshot_clone_disk_save_vm_file_and_manifest_verify() {
             resume: 40,
             thaw: 50,
         },
+        parent: None,
     };
 
     snapshot.write_manifest(&manifest).unwrap();
@@ -394,6 +395,7 @@ fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) 
             resume: 0,
             thaw: 0,
         },
+        parent: None,
     };
     snapshot.write_manifest(&manifest).unwrap();
     let path = snapshot.root().to_owned();
@@ -587,6 +589,7 @@ fn staging_with_manifest_cannot_restore_and_publication_is_atomic() {
             resume: 0,
             thaw: 0,
         },
+        parent: None,
     };
     assert!(snapshot.publish().is_err());
     snapshot.write_manifest(&manifest).unwrap();
@@ -634,6 +637,7 @@ fn staged_publication_never_replaces_existing_snapshot() {
             resume: 0,
             thaw: 0,
         },
+        parent: None,
     };
     staging.write_manifest(&manifest).unwrap();
     let mut existing = store.create_snapshot("lab", "snap").unwrap();

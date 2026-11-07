@@ -73,6 +73,7 @@ impl Parts {
             storage: self.storage.as_ref(),
             vms: &self.vms,
             network: self.network.as_ref(),
+            parent: None,
         };
         snapshot_vms(request, &self.slot)
             .await

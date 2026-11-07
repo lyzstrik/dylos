@@ -139,6 +139,7 @@ fn manifest_verifies_through_public_descriptor_opener() {
             resume: 0,
             thaw: 0,
         },
+        parent: None,
     };
     let opener = SnapshotOpener::new(tmp.path()).unwrap();
     manifest.verify(opener.verify_opener()).unwrap();
@@ -195,6 +196,7 @@ fn opener_verify_rejects_undeclared_entries() {
             resume: 0,
             thaw: 0,
         },
+        parent: None,
     };
     let opener = SnapshotOpener::new(tmp.path()).unwrap();
     assert!(opener.verify(&manifest).is_ok());
@@ -273,6 +275,7 @@ fn opener_verify_rejects_symlinked_manifest_and_declared_files() {
             resume: 0,
             thaw: 0,
         },
+        parent: None,
     };
     let opener = SnapshotOpener::new(tmp.path()).unwrap();
     assert!(opener.verify(&manifest).is_ok());

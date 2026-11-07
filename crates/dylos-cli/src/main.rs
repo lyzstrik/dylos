@@ -83,6 +83,20 @@ struct Cli {
 enum Commands {
     /// Manage lab environments
     Lab(LabArgs),
+    /// Manage snapshot lineage trees
+    Snapshot(SnapshotCommandArgs),
+}
+
+#[derive(Args, Debug)]
+struct SnapshotCommandArgs {
+    #[command(subcommand)]
+    command: SnapshotCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCommands {
+    /// Display snapshot lineage tree
+    Tree(TreeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -107,6 +121,19 @@ enum LabCommands {
     Snapshot(SnapshotArgs),
     /// Compare two snapshots of a lab
     Diff(DiffArgs),
+    /// Display snapshot lineage tree
+    #[command(visible_alias = "tree")]
+    Lineage(TreeArgs),
+}
+
+#[derive(Args, Debug, Default)]
+struct TreeArgs {
+    /// Snapshot directory, lab directory, or base snapshots directory (defaults to configured store)
+    path: Option<PathBuf>,
+
+    /// Output machine-readable JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -240,6 +267,10 @@ async fn main() -> Result<()> {
             LabCommands::Down(down_args) => lab_down(down_args).await,
             LabCommands::Snapshot(snapshot_args) => lab_snapshot(snapshot_args).await,
             LabCommands::Diff(diff_args) => lab_diff(diff_args).await,
+            LabCommands::Lineage(tree_args) => snapshot_tree(tree_args).await,
+        },
+        Commands::Snapshot(snapshot_args) => match snapshot_args.command {
+            SnapshotCommands::Tree(tree_args) => snapshot_tree(tree_args).await,
         },
     }
 }
@@ -571,6 +602,37 @@ async fn lab_diff(args: DiffArgs) -> Result<()> {
     } else {
         print_human_topology(&diff.topology);
         print_human_vms(&diff.vms);
+    }
+    Ok(())
+}
+
+async fn snapshot_tree(args: TreeArgs) -> Result<()> {
+    let path = args
+        .path
+        .unwrap_or_else(|| build_base_config().store.base.join("snapshots"));
+    if !path.exists() {
+        if args.json {
+            println!("[]");
+        }
+        return Ok(());
+    }
+    let roots = dylos_runtime::load_lineage_tree(&path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to load snapshot lineage tree from '{}'",
+                path.display()
+            )
+        })?;
+    if args.json {
+        let json = serde_json::to_string_pretty(&roots)
+            .context("failed to serialize snapshot tree to JSON")?;
+        println!("{json}");
+    } else {
+        let formatted = dylos_core::lineage::format_tree(&roots);
+        if !formatted.is_empty() {
+            println!("{formatted}");
+        }
     }
     Ok(())
 }

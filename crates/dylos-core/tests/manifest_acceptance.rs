@@ -53,6 +53,7 @@ fn manifest(vms: BTreeMap<String, VmManifest>) -> SnapshotManifest {
         host_cpu_model: "AMD EPYC 7B13".to_string(),
         created_at_unix_ms: 1_760_000_000_123,
         step_durations_ms: durations(),
+        parent: None,
     }
 }
 

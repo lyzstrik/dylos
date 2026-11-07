@@ -71,6 +71,7 @@ fn create_test_snapshot(dir: &Path, vm_names: &[&str]) -> (SnapshotOpener, Snaps
             resume: 4,
             thaw: 5,
         },
+        parent: None,
     };
 
     let opener = SnapshotOpener::new(dir).unwrap();

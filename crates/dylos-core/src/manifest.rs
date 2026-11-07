@@ -17,6 +17,16 @@ pub struct SnapshotManifest {
     pub host_cpu_model: String,
     pub created_at_unix_ms: u64,
     pub step_durations_ms: StepDurations,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SnapshotParent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotParent {
+    pub lab_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,6 +156,8 @@ struct RawSnapshotManifest {
     host_cpu_model: String,
     created_at_unix_ms: u64,
     step_durations_ms: StepDurations,
+    #[serde(default)]
+    parent: Option<SnapshotParent>,
 }
 
 /// A JSON object with a repeated VM name must be rejected: a plain `BTreeMap` would keep
@@ -197,8 +209,10 @@ impl RawSnapshotManifest {
             host_cpu_model: self.host_cpu_model,
             created_at_unix_ms: self.created_at_unix_ms,
             step_durations_ms: self.step_durations_ms,
+            parent: self.parent,
         };
         manifest.validate_paths()?;
+        manifest.validate_parent()?;
         Ok(manifest)
     }
 }
@@ -238,6 +252,7 @@ impl SnapshotManifest {
             });
         }
         self.validate_paths()?;
+        self.validate_parent()?;
         Ok(serde_json::to_string(self)?)
     }
 
@@ -255,6 +270,7 @@ impl SnapshotManifest {
             });
         }
         self.validate_paths()?;
+        self.validate_parent()?;
         Ok(serde_json::to_string_pretty(self)?)
     }
 
@@ -294,6 +310,30 @@ impl SnapshotManifest {
         Ok(())
     }
 
+    /// Validates snapshot parent information if present.
+    ///
+    /// # Errors
+    /// Returns [`Error::InvalidName`] if `lab_id` or `snapshot` identifier is malformed.
+    pub fn validate_parent(&self) -> Result<(), Error> {
+        if let Some(parent) = &self.parent {
+            crate::validate_name(&parent.lab_id, 32).map_err(|reason| Error::InvalidName {
+                path: "manifest.parent.lab_id".to_string(),
+                value: parent.lab_id.clone(),
+                reason,
+            })?;
+            if let Some(snapshot) = &parent.snapshot {
+                for part in snapshot.split('/') {
+                    crate::validate_name(part, 64).map_err(|reason| Error::InvalidName {
+                        path: "manifest.parent.snapshot".to_string(),
+                        value: snapshot.clone(),
+                        reason,
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Verifies the integrity of all VM files against their expected size and SHA-256 hash.
     ///
     /// # Errors
@@ -305,6 +345,7 @@ impl SnapshotManifest {
         mut open: impl FnMut(&Path) -> std::io::Result<R>,
     ) -> Result<(), Error> {
         self.validate_paths()?;
+        self.validate_parent()?;
 
         for (vm_name, vm_manifest) in &self.vms {
             vm_manifest.verify(vm_name, &mut open)?;

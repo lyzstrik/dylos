@@ -84,6 +84,7 @@ fn manifest_strategy() -> impl Strategy<Value = SnapshotManifest> {
                     host_cpu_model,
                     created_at_unix_ms,
                     step_durations_ms,
+                    parent: None,
                 }
             },
         )
@@ -194,6 +195,7 @@ fn test_verify_integrity() {
             resume: 4,
             thaw: 5,
         },
+        parent: None,
     };
 
     let res = manifest.verify(|_| Ok(Cursor::new(content.to_vec())));
@@ -237,6 +239,7 @@ fn test_verify_validates_paths_first() {
             resume: 4,
             thaw: 5,
         },
+        parent: None,
     };
 
     // Add a valid VM first
@@ -368,6 +371,7 @@ fn test_verify_interrupted() {
             resume: 4,
             thaw: 5,
         },
+        parent: None,
     };
 
     let res = manifest.verify(|_| {

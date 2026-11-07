@@ -298,6 +298,30 @@ Exits with `0` on success. Exits with `2` on command-line argument parsing error
 
 ---
 
+### `dylos snapshot tree` / `dylos lab lineage`
+
+Display the snapshot lineage tree across labs and snapshots.
+
+```text
+Usage: dylos snapshot tree [OPTIONS] [PATH]
+       dylos lab lineage [OPTIONS] [PATH]
+```
+
+#### Arguments & Options
+
+- `[PATH]`: Optional snapshot directory, lab directory, or base snapshots directory. Defaults to configured store snapshot directory (`<DYLOS_LAB_DIR>/snapshots`).
+- `--json`: Emit stable machine-readable JSON format on `stdout`.
+- `-h, --help`: Print help and exit `0`.
+
+#### Behavior
+
+- **Read-only**: Scans snapshot manifests and constructs the lineage hierarchy without modifying storage.
+- **Fail-closed verification**: Each candidate snapshot is verified (`verify_snapshot`) for manifest schema validity, directory inventory, and file integrity (fs-verity digests or SHA-256 hashes). Tampered or corrupted snapshots fail verification immediately.
+- **Survival across deletes**: If an ancestor snapshot was removed, descendant subtrees are preserved and displayed under `[missing: <parent_id>]`.
+- **Backward compatible**: Legacy manifests lacking the `parent` field are displayed cleanly as root snapshots.
+
+---
+
 ## Environment Variables
 
 | Variable | Description | Default |

@@ -74,6 +74,7 @@ pub fn create_test_snapshot(
             resume: 4,
             thaw: 5,
         },
+        parent: None,
     };
 
     let manifest_json = manifest.to_json_string().unwrap();

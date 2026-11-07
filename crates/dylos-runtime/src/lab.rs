@@ -142,6 +142,7 @@ pub struct Lab {
     cleanup_on_drop: bool,
     snapshots: SnapshotSlot,
     restore_latency: Option<Duration>,
+    origin_snapshot: Option<String>,
 }
 
 impl Lab {
@@ -201,6 +202,7 @@ impl Lab {
                 cleanup_on_drop: true,
                 snapshots: SnapshotSlot::default(),
                 restore_latency: None,
+                origin_snapshot: None,
             };
             let result = lab.bring_up(config, spec, plan, false).await;
             if let Err(operation) = result {
@@ -251,6 +253,10 @@ impl Lab {
         validate(config, &spec, lab_id)?;
         let plan = FabricPlan::new(lab_id, &spec)?;
         let span = tracing::info_span!("lab_restore", lab = lab_id);
+        let origin_snapshot = snapshot
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(ToString::to_string);
         let mut lab = Self {
             id: lab_id.into(),
             store: config.store.clone(),
@@ -264,6 +270,7 @@ impl Lab {
             cleanup_on_drop: true,
             snapshots: SnapshotSlot::default(),
             restore_latency: None,
+            origin_snapshot,
         };
         let started = Instant::now();
         if let Err(operation) = lab
@@ -676,6 +683,10 @@ impl Lab {
         &mut self,
         snapshot_id: &str,
     ) -> Result<(SnapshotManifest, SnapshotTimings)> {
+        let parent = Some(dylos_core::manifest::SnapshotParent {
+            lab_id: self.id.clone(),
+            snapshot: self.origin_snapshot.clone(),
+        });
         let request = SnapshotRequest {
             lab_id: &self.id,
             snapshot_id,
@@ -684,8 +695,16 @@ impl Lab {
             storage: self.storage.as_ref(),
             vms: &self.vms,
             network: self.network.as_ref(),
+            parent,
         };
-        crate::snapshot_vms(request, &self.snapshots).await
+        let (manifest, timings) = crate::snapshot_vms(request, &self.snapshots).await?;
+        self.origin_snapshot = Some(snapshot_id.to_string());
+        Ok((manifest, timings))
+    }
+
+    #[must_use]
+    pub fn origin_snapshot(&self) -> Option<&str> {
+        self.origin_snapshot.as_deref()
     }
 
     #[must_use]
@@ -1539,6 +1558,7 @@ impl Drop for Lab {
                 cleanup_on_drop: false,
                 snapshots: self.snapshots.clone(),
                 restore_latency: self.restore_latency,
+                origin_snapshot: self.origin_snapshot.clone(),
             };
             runtime.spawn(async move {
                 if let Err(error) = owned.teardown().await {
