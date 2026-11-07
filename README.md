@@ -15,7 +15,7 @@ The spike must prove that a network of microVMs can be snapshotted consistently 
 
 Go criteria:
 
-- consistent snapshot of a 5-VM lab (256 MiB each) in under 1 s,
+- consistent snapshot of a 5-VM lab (256 MiB each) in under 1 s (pause window, freeze to thaw),
 - fork of one clone in under 500 ms,
 - a long-lived TCP connection from A to C survives in 100% of clones,
 - no address conflict with 10 clones running at the same time,
@@ -111,13 +111,13 @@ just images
 
 ### 5. Running the reference lab
 
-Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. If your static Firecracker and jailer binaries are installed in `~/.local/share/dylos/bin` (as described in [`docs/host.md`](docs/host.md)), export `DYLOS_FC_BIN_DIR` so Dylos locates them instead of defaulting to `/usr/bin`.
+Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. By default, the CLI searches for static Firecracker and jailer binaries in order: `~<SUDO_USER>/.local/share/dylos/bin` (when executed under `sudo` with consistent identity), `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin` (as described in [`docs/host.md`](docs/host.md)). You can also set `DYLOS_FC_BIN_DIR` to override this directory.
 
-Run with `sudo -E` to preserve `DYLOS_FC_BIN_DIR`. Invoking the compiled binary directly is preferred because sudoers `secure_path` can override `PATH` and hide user-installed `cargo`:
+Run with `sudo -E` if using user-installed Cargo or custom environment variables. Invoking the compiled binary directly is preferred because sudoers `secure_path` can override `PATH` and hide user-installed `cargo`:
 
 ```bash
-# Point to your static Firecracker and jailer binaries (installed per docs/host.md)
-export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"
+# Optional: override the binary search directory if installed elsewhere
+# export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"
 
 # Bring up the reference 3-node lab (A -- B -- C) with the compiled binary
 sudo -E ./target/release/dylos lab up labs/abc.yaml
@@ -152,7 +152,7 @@ sudo -E cargo run --release -p dylos-cli -- lab down abc
   ```text
   Failed to exec into Firecracker: No such file or directory
   ```
-  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md) and set `DYLOS_FC_BIN_DIR` to their directory (for example `export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"`). Without `DYLOS_FC_BIN_DIR`, the CLI defaults to `/usr/bin/firecracker` and `/usr/bin/jailer` (unlike `just host-check`, which checks `~/.local/share/dylos/bin` by default).
+  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md). The CLI automatically looks for these binaries in candidate search order (`~<SUDO_USER>/.local/share/dylos/bin` under `sudo`, `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin`), or you can point directly to them by setting `DYLOS_FC_BIN_DIR`.
 
 - **Cross-device link errors (`EXDEV`)**:
   If reflink preflight fails, your rootfs image, lab store directory, or jail directory reside on different filesystem mounts. Ensure they are colocated on the same reflink-capable filesystem mount (or configure `DYLOS_LAB_DIR` and `DYLOS_JAIL_DIR` to point to that mount).
