@@ -70,6 +70,9 @@ impl VmManifest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FileMeta {
+    /// SHA-256 fs-verity digest, absent for legacy or unsupported storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsverity: Option<String>,
     pub path: PathBuf,
     pub sha256: String,
     pub size: u64,

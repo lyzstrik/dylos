@@ -27,6 +27,7 @@ fn lab_spec() -> LabSpec {
 
 fn meta(path: &str, data: &[u8]) -> FileMeta {
     FileMeta {
+        fsverity: None,
         path: PathBuf::from(path),
         sha256: sha_hex(data),
         size: data.len() as u64,
@@ -376,6 +377,7 @@ fn serialization_refuses_unsafe_paths() {
     for bad in ["/abs", "../escape", "a/../../b"] {
         let mut m = two_vm_manifest();
         m.vms.get_mut("b").unwrap().disks.push(FileMeta {
+            fsverity: None,
             path: PathBuf::from(bad),
             sha256: EMPTY_SHA.to_string(),
             size: 0,
@@ -528,6 +530,7 @@ fn verify_handles_short_reads() {
 fn verify_handles_empty_files() {
     let mut m = two_vm_manifest();
     m.vms.get_mut("b").unwrap().state_file = FileMeta {
+        fsverity: None,
         path: PathBuf::from("b/state"),
         sha256: EMPTY_SHA.to_string(),
         size: 0,
@@ -605,4 +608,16 @@ fn verify_sha256_known_answer() {
     state.size = 3;
     state.sha256 = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".to_string();
     verify_with(&m, &files).unwrap();
+}
+
+#[test]
+fn optional_verity_digest_round_trips_and_legacy_files_remain_readable() {
+    let original = meta("vms/a/vm.mem", b"content");
+    let legacy = serde_json::to_string(&original).unwrap();
+    assert!(!legacy.contains("fsverity"));
+    assert_eq!(serde_json::from_str::<FileMeta>(&legacy).unwrap(), original);
+    let mut sealed = original;
+    sealed.fsverity = Some("ab".repeat(32));
+    let json = serde_json::to_string(&sealed).unwrap();
+    assert_eq!(serde_json::from_str::<FileMeta>(&json).unwrap(), sealed);
 }
