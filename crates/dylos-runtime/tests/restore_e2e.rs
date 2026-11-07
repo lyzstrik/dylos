@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use dylos_core::LabSpec;
@@ -10,7 +9,7 @@ use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
 mod support;
-use support::test_tempdir;
+use support::{check_e2e_prerequisites, test_tempdir};
 
 async fn exec(lab: &Lab, node: &str, command: &str) -> String {
     let result = lab
@@ -89,30 +88,14 @@ async fn measure_clocks(clone: &Lab, before_clocks: &str, before_timers: &str) {
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn restored_tcp_flows_keep_their_sockets_and_progress() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
-        eprintln!("SKIPPED restore_e2e: DYLOS_FC_BIN_DIR missing");
+    let Some(prereqs) =
+        check_e2e_prerequisites("restored_tcp_flows_keep_their_sockets_and_progress")
+    else {
         return;
     };
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-    if std::fs::metadata("/proc/self").unwrap().uid() != 0
-        || [
-            Path::new("/dev/kvm"),
-            &kernel,
-            &image,
-            &bin.join("jailer"),
-            &bin.join("firecracker"),
-        ]
-        .iter()
-        .any(|p| !p.exists())
-    {
-        eprintln!("SKIPPED restore_e2e: requires root, KVM and built images/binaries");
-        return;
-    }
+    let bin = prereqs.bin;
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");

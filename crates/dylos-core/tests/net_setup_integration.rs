@@ -31,13 +31,13 @@ fn run_net_setup(
     Ok(command.output()?)
 }
 
-fn can_unshare() -> bool {
+fn can_unshare(test: &str) -> bool {
     let ok = Command::new("unshare")
         .args(["-Urn", "true"])
         .output()
         .is_ok_and(|o| o.status.success());
     if !ok {
-        eprintln!("SKIPPED: unprivileged user+net namespaces unavailable");
+        eprintln!("SKIPPED {test}: unprivileged user+net namespaces unavailable");
     }
     ok
 }
@@ -203,7 +203,7 @@ fn check_node_b(obs: &Observed) -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_net_setup_node_b() -> Result<(), Box<dyn Error>> {
-    if !can_unshare() {
+    if !can_unshare("test_net_setup_node_b") {
         return Ok(());
     }
     check_node_b(&run_node("B", &["dummy0", "dummy1"], false)?)
@@ -211,7 +211,7 @@ fn test_net_setup_node_b() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_net_setup_swapped_macs_on_declared_names() -> Result<(), Box<dyn Error>> {
-    if !can_unshare() {
+    if !can_unshare("test_net_setup_swapped_macs_on_declared_names") {
         return Ok(());
     }
     // eth0 carries eth1's MAC and vice versa: a direct rename would hit "File exists".
@@ -220,7 +220,7 @@ fn test_net_setup_swapped_macs_on_declared_names() -> Result<(), Box<dyn Error>>
 
 #[test]
 fn test_net_setup_declared_name_equal_to_a_parking_name() -> Result<(), Box<dyn Error>> {
-    if !can_unshare() {
+    if !can_unshare("test_net_setup_declared_name_equal_to_a_parking_name") {
         return Ok(());
     }
     // `dytmp1` is a valid declared name: parking names must avoid it, or the final
@@ -250,7 +250,7 @@ fn test_net_setup_declared_name_equal_to_a_parking_name() -> Result<(), Box<dyn 
 
 #[test]
 fn test_net_setup_node_a() -> Result<(), Box<dyn Error>> {
-    if !can_unshare() {
+    if !can_unshare("test_net_setup_node_a") {
         return Ok(());
     }
     let obs = run_node("A", &["dummy0"], false)?;
@@ -270,7 +270,7 @@ fn test_net_setup_node_a() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_net_setup_node_c() -> Result<(), Box<dyn Error>> {
-    if !can_unshare() {
+    if !can_unshare("test_net_setup_node_c") {
         return Ok(());
     }
     let obs = run_node("C", &["dummy0"], false)?;
@@ -290,7 +290,7 @@ fn test_net_setup_node_c() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn test_malformed_param() -> Result<(), Box<dyn Error>> {
-    if !can_unshare() {
+    if !can_unshare("test_malformed_param") {
         return Ok(());
     }
 
