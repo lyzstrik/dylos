@@ -177,7 +177,7 @@ async fn diff_corrupted_snapshot_fails_verification() {
     );
 
     // Corrupt rootfs.ext4 in snapshot B behind the manifest's back
-    fs::write(dir_b.join("vms/vm1/rootfs.ext4"), b"corrupted bytes").unwrap();
+    fs::write(dir_b.join("vms/vm1/rootfs.ext4"), vec![1u8; 4096]).unwrap();
 
     for (a, b) in [(&dir_a, &dir_b), (&dir_b, &dir_a)] {
         let err = diff_snapshots(a, b).await.unwrap_err();
@@ -261,6 +261,15 @@ async fn diff_sealed_files_use_verified_digest() {
     );
     // An unsealed peer's SHA-256 is not comparable with a verity digest.
     let c = create_test_snapshot(&tmp.path().join("c"), single_vm_spec(), &[("vm1", b"aaaa")]);
+    let mut sealed =
+        SnapshotManifest::from_json_str(&fs::read_to_string(a.join("manifest.json")).unwrap())
+            .unwrap();
+    let unsealed =
+        SnapshotManifest::from_json_str(&fs::read_to_string(c.join("manifest.json")).unwrap())
+            .unwrap();
+    sealed.vms.get_mut("vm1").unwrap().disks[0].sha256 =
+        unsealed.vms["vm1"].disks[0].sha256.clone();
+    fs::write(a.join("manifest.json"), sealed.to_json_string().unwrap()).unwrap();
     assert_eq!(
         diff_snapshots(&a, &c).await.unwrap().vms["vm1"].disks[0].status,
         DiffStatus::Changed

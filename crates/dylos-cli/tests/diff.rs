@@ -110,6 +110,7 @@ struct TreeEntry {
     is_dir: bool,
     size: u64,
     modified: SystemTime,
+    contents: Option<Vec<u8>>,
 }
 
 fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
@@ -129,6 +130,7 @@ fn snapshot_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
                     is_dir,
                     size: meta.len(),
                     modified: meta.modified().unwrap(),
+                    contents: (!is_dir).then(|| fs::read(&path).unwrap()),
                 },
             );
             if is_dir {
@@ -223,6 +225,10 @@ fn cli_diff_documented_example_parses_and_matches() {
     assert!(out.status.success());
     let actual: SnapshotDiff = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(parsed, actual);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap(),
+        serde_json::from_str::<serde_json::Value>(json_text).unwrap()
+    );
 }
 
 #[test]

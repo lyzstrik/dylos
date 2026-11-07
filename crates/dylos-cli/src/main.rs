@@ -12,7 +12,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
-use dylos_core::diff::SnapshotDiff;
 use dylos_runtime::{Fleet, Lab, LabConfig, LabError, diff_snapshots};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
@@ -570,14 +569,10 @@ async fn lab_diff(args: DiffArgs) -> Result<()> {
             serde_json::to_string_pretty(&diff).context("failed to serialize diff to JSON")?;
         println!("{json}");
     } else {
-        print_human_diff(&diff);
+        print_human_topology(&diff.topology);
+        print_human_vms(&diff.vms);
     }
     Ok(())
-}
-
-fn print_human_diff(diff: &SnapshotDiff) {
-    print_human_topology(&diff.topology);
-    print_human_vms(&diff.vms);
 }
 
 fn format_ipv4_change<T: std::fmt::Display>(
