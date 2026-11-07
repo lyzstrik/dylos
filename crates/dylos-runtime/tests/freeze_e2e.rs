@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -10,7 +9,7 @@ use dylos_runtime::{Lab, LabConfig};
 use serde_json::Value;
 
 mod support;
-use support::test_tempdir;
+use support::{check_e2e_prerequisites, test_tempdir};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -266,32 +265,13 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn abc_fabric_freeze_under_real_traffic() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
-        eprintln!("SKIPPED freeze_e2e: DYLOS_FC_BIN_DIR is not set");
+    let Some(prereqs) = check_e2e_prerequisites("abc_fabric_freeze_under_real_traffic") else {
         return;
     };
-    if std::fs::metadata("/proc/self").unwrap().uid() != 0 {
-        eprintln!("SKIPPED freeze_e2e: must start as root");
-        return;
-    }
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-    for path in [
-        Path::new("/dev/kvm"),
-        &bin.join("jailer"),
-        &bin.join("firecracker"),
-        &kernel,
-        &image,
-    ] {
-        if !path.exists() {
-            eprintln!("SKIPPED freeze_e2e: {} is missing", path.display());
-            return;
-        }
-    }
+    let workspace = prereqs.workspace;
+    let bin = prereqs.bin;
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     // Keep expected TAP-down errors separate from serial command sentinels.

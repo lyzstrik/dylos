@@ -18,7 +18,7 @@ fn setup() -> Result<(tempfile::TempDir, Store, LabSpec), Box<dyn std::error::Er
     let spec = LabSpec::from_yaml_str(include_str!("fixtures/lab.yaml"))?;
     Ok((temp, store, spec))
 }
-fn supported(store: &Store, spec: &LabSpec) -> Result<bool, Error> {
+fn supported(test: &str, store: &Store, spec: &LabSpec) -> Result<bool, Error> {
     match store.create("probe", spec) {
         Ok(mut lab) => {
             lab.remove()?;
@@ -30,7 +30,7 @@ fn supported(store: &Store, spec: &LabSpec) -> Result<bool, Error> {
                 Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL)
             ) =>
         {
-            eprintln!("SKIP: reflinks unsupported on CARGO_TARGET_TMPDIR: {source}");
+            eprintln!("SKIPPED {test}: reflinks unsupported on CARGO_TARGET_TMPDIR: {source}");
             assert!(!store.base.join("probe").exists());
             Ok(false)
         }
@@ -40,7 +40,7 @@ fn supported(store: &Store, spec: &LabSpec) -> Result<bool, Error> {
 #[test]
 fn layout_state_reflinks_exclusivity_and_raii() {
     let (_temp, store, spec) = setup().unwrap();
-    if !supported(&store, &spec).unwrap() {
+    if !supported("layout_state_reflinks_exclusivity_and_raii", &store, &spec).unwrap() {
         return;
     }
     let mut lab = store.create("lab-1", &spec).unwrap();
@@ -144,7 +144,7 @@ fn partial_removal_unlinks_nested_symlinks_and_is_idempotent() {
 #[test]
 fn owned_handle_refuses_replacement_directory() {
     let (_temp, store, spec) = setup().unwrap();
-    if !supported(&store, &spec).unwrap() {
+    if !supported("owned_handle_refuses_replacement_directory", &store, &spec).unwrap() {
         return;
     }
     let mut lab = store.create("lab", &spec).unwrap();
@@ -162,7 +162,7 @@ fn owned_handle_refuses_replacement_directory() {
 fn unsupported_reflink_never_falls_back_to_copy() {
     let (_temp, mut store, spec) = setup().unwrap();
     let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
-        eprintln!("SKIP: /dev/shm unavailable");
+        eprintln!("SKIPPED unsupported_reflink_never_falls_back_to_copy: /dev/shm unavailable");
         return;
     };
     store.base = other.path().join("labs");
@@ -177,7 +177,13 @@ fn unsupported_reflink_never_falls_back_to_copy() {
 #[test]
 fn preflight_probes_real_clones_without_leaving_files_or_directories() {
     let (temp, store, spec) = setup().unwrap();
-    if !supported(&store, &spec).unwrap() {
+    if !supported(
+        "preflight_probes_real_clones_without_leaving_files_or_directories",
+        &store,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     fs::remove_dir(&store.base).unwrap();
@@ -197,7 +203,13 @@ fn preflight_probes_real_clones_without_leaving_files_or_directories() {
 #[test]
 fn preflight_rejects_jail_on_an_incompatible_mount_and_cleans_up() {
     let (temp, store, spec) = setup().unwrap();
-    if !supported(&store, &spec).unwrap() {
+    if !supported(
+        "preflight_rejects_jail_on_an_incompatible_mount_and_cleans_up",
+        &store,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     fs::remove_dir(&store.base).unwrap();

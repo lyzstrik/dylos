@@ -76,7 +76,7 @@ fn setup(mode: Mode) -> (Sandbox, LabConfig, LabSpec) {
     (sandbox, config, spec)
 }
 
-fn supported(config: &LabConfig, spec: &LabSpec) -> Result<bool, dylos_store::Error> {
+fn supported(test: &str, config: &LabConfig, spec: &LabSpec) -> Result<bool, dylos_store::Error> {
     match config.store.create("probe", spec) {
         Ok(mut lab) => {
             lab.remove().unwrap();
@@ -93,7 +93,7 @@ fn supported(config: &LabConfig, spec: &LabSpec) -> Result<bool, dylos_store::Er
                 )
             }) =>
         {
-            eprintln!("SKIPPED lab test: reflinks unavailable: {source}");
+            eprintln!("SKIPPED {test}: reflinks unavailable: {source}");
             Ok(false)
         }
         Err(error) => Err(error),
@@ -112,7 +112,13 @@ async fn bring_up_configures_all_vms_and_socket_teardown_removes_everything() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "bring_up_configures_all_vms_and_socket_teardown_removes_everything",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let (logs, _guard) = support::Captured::install();
@@ -202,7 +208,13 @@ async fn partial_launch_api_failure_readiness_failure_and_timeout_roll_back() {
         Mode::Serve,
     ] {
         let (sandbox, config, spec) = setup(mode);
-        if !supported(&config, &spec).unwrap() {
+        if !supported(
+            "partial_launch_api_failure_readiness_failure_and_timeout_roll_back",
+            &config,
+            &spec,
+        )
+        .unwrap()
+        {
             return;
         }
         let error = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
@@ -303,7 +315,13 @@ async fn dropped_lab_and_double_teardown_release_owned_resources() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "dropped_lab_and_double_teardown_release_owned_resources",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut lab = Lab::up_with(&config, &spec, "lab").await.unwrap();
@@ -325,7 +343,13 @@ async fn invalid_control_request_does_not_stop_the_supervisor() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "invalid_control_request_does_not_stop_the_supervisor",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let lab = Lab::up_with(&config, &spec, "lab").await.unwrap();
@@ -426,7 +450,13 @@ async fn unexpected_vm_exit_tears_down_the_entire_lab() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabCrashOnFlush);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "unexpected_vm_exit_tears_down_the_entire_lab",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let lab = Lab::up_with(&config, &spec, "lab").await.unwrap();
@@ -455,7 +485,13 @@ async fn restore_loads_frozen_then_resumes_and_supervises() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "restore_loads_frozen_then_resumes_and_supervises",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
@@ -493,7 +529,13 @@ async fn restore_load_and_resume_failures_roll_back_all_resources() {
     }
     for stage in ["load", "resume"] {
         let (sandbox, config, spec) = setup(Mode::LabReady);
-        if !supported(&config, &spec).unwrap() {
+        if !supported(
+            "restore_load_and_resume_failures_roll_back_all_resources",
+            &config,
+            &spec,
+        )
+        .unwrap()
+        {
             return;
         }
         let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
@@ -546,7 +588,13 @@ async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_la
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_latency_and_pss",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut source = Lab::up_with(&config, &spec, "s").await.unwrap();
@@ -597,7 +645,7 @@ async fn fork_partial_failure_rolls_back_all_clones() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported("fork_partial_failure_rolls_back_all_clones", &config, &spec).unwrap() {
         return;
     }
     let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
@@ -666,7 +714,13 @@ async fn fleet_recovers_failed_and_panicked_labs_and_keeps_the_others() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabCrashOnFlush);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fleet_recovers_failed_and_panicked_labs_and_keeps_the_others",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut fleet = Fleet::new(&config, Duration::from_secs(5));
@@ -725,7 +779,13 @@ async fn fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fleet_shutdown_aborts_stalled_and_unreachable_supervisors_then_recovers",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let timeout = Duration::from_secs(30);
@@ -799,7 +859,13 @@ async fn fleet_reports_the_recovery_error_with_the_operation_error() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fleet_reports_the_recovery_error_with_the_operation_error",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut fleet = Fleet::new(&config, Duration::from_millis(300));
@@ -830,7 +896,13 @@ async fn fleet_signal_teardown_keeps_supervisor_failure_as_main_error_after_unex
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabCrashOnFlush);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fleet_signal_teardown_keeps_supervisor_failure_as_main_error_after_unexpected_vm_exit",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut fleet = Fleet::new(&config, Duration::from_secs(5));
@@ -1038,7 +1110,13 @@ async fn fleet_clean_signal_teardown_is_unchanged_when_supervision_has_not_faile
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fleet_clean_signal_teardown_is_unchanged_when_supervision_has_not_failed",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     let mut fleet = Fleet::new(&config, Duration::from_secs(5));
@@ -1086,7 +1164,13 @@ async fn failed_up_rollback_is_reported_as_unrecovered() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabPartialLaunch);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "failed_up_rollback_is_reported_as_unrecovered",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     sandbox.make_teardown_fail();
@@ -1125,7 +1209,13 @@ async fn fork_reports_a_later_clone_whose_rollback_failed() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fork_reports_a_later_clone_whose_rollback_failed",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
     fs::write(sandbox.dir.path().join("fail-restore"), "load").unwrap();
@@ -1146,7 +1236,13 @@ async fn fork_reports_a_successful_clone_that_could_not_be_torn_down() {
         return;
     }
     let (sandbox, config, spec) = setup(Mode::LabReady);
-    if !supported(&config, &spec).unwrap() {
+    if !supported(
+        "fork_reports_a_successful_clone_that_could_not_be_torn_down",
+        &config,
+        &spec,
+    )
+    .unwrap()
+    {
         return;
     }
 
