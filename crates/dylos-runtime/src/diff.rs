@@ -2,16 +2,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use dylos_core::diff::{DiffStatus, DiskDiff, FileDiff, SnapshotDiff, TopologyDiff, VmDiff};
-use dylos_core::manifest::{FileMeta, SnapshotManifest, VmManifest};
+use dylos_core::manifest::{FileMeta, SnapshotManifest};
 use dylos_store::SnapshotOpener;
 
 use crate::lab::LabError;
 use crate::snapshot::verify_snapshot;
 
 /// Single call site for snapshot loading and integrity verification.
-async fn load_and_verify_snapshot(
-    path: &Path,
-) -> Result<(SnapshotOpener, SnapshotManifest), LabError> {
+async fn load_and_verify_snapshot(path: &Path) -> Result<SnapshotManifest, LabError> {
     let path_buf = path.to_path_buf();
     let (opener, manifest) = tokio::task::spawn_blocking(move || {
         let opener = SnapshotOpener::new(&path_buf).map_err(|e| dylos_core::Error::Io {
@@ -29,52 +27,32 @@ async fn load_and_verify_snapshot(
     })??;
 
     verify_snapshot(&opener, &manifest).await?;
-    Ok((opener, manifest))
+    Ok(manifest)
 }
 
-fn solo_vm_diff(vm: &VmManifest, status: DiffStatus) -> VmDiff {
-    let (state_a, state_b) = match status {
-        DiffStatus::Added => (None, Some(vm.state_file.size)),
-        DiffStatus::Removed => (Some(vm.state_file.size), None),
-        _ => (None, None),
+// Compare only the digest that verification checked. Mixed sealing modes have
+// incomparable digests and conservatively report a change.
+fn file_diff(a: Option<&FileMeta>, b: Option<&FileMeta>) -> FileDiff {
+    let status = match (a, b) {
+        (Some(a), Some(b))
+            if a.size == b.size
+                && match (&a.fsverity, &b.fsverity) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => a.sha256 == b.sha256,
+                    _ => false,
+                } =>
+        {
+            DiffStatus::Identical
+        }
+        (Some(_), Some(_)) => DiffStatus::Changed,
+        (Some(_), None) => DiffStatus::Removed,
+        (None, Some(_)) => DiffStatus::Added,
+        (None, None) => DiffStatus::Identical,
     };
-    let (mem_a, mem_b) = match status {
-        DiffStatus::Added => (None, Some(vm.memory_file.size)),
-        DiffStatus::Removed => (Some(vm.memory_file.size), None),
-        _ => (None, None),
-    };
-    let mut disks: Vec<DiskDiff> = vm
-        .disks
-        .iter()
-        .map(|d| DiskDiff {
-            path: d.path.clone(),
-            status,
-            size_a: if status == DiffStatus::Removed {
-                Some(d.size)
-            } else {
-                None
-            },
-            size_b: if status == DiffStatus::Added {
-                Some(d.size)
-            } else {
-                None
-            },
-        })
-        .collect();
-    disks.sort_by(|d1, d2| d1.path.cmp(&d2.path));
-    VmDiff {
+    FileDiff {
         status,
-        state: FileDiff {
-            status,
-            size_a: state_a,
-            size_b: state_b,
-        },
-        memory: FileDiff {
-            status,
-            size_a: mem_a,
-            size_b: mem_b,
-        },
-        disks,
+        size_a: a.map(|f| f.size),
+        size_b: b.map(|f| f.size),
     }
 }
 
@@ -83,8 +61,8 @@ fn solo_vm_diff(vm: &VmManifest, status: DiffStatus) -> VmDiff {
 /// # Errors
 /// Returns [`LabError`] if opening or verifying either snapshot fails.
 pub async fn diff_snapshots(path_a: &Path, path_b: &Path) -> Result<SnapshotDiff, LabError> {
-    let (_opener_a, manifest_a) = load_and_verify_snapshot(path_a).await?;
-    let (_opener_b, manifest_b) = load_and_verify_snapshot(path_b).await?;
+    let manifest_a = load_and_verify_snapshot(path_a).await?;
+    let manifest_b = load_and_verify_snapshot(path_b).await?;
 
     let topology = TopologyDiff::diff(&manifest_a.lab_spec, &manifest_b.lab_spec);
 
@@ -93,85 +71,49 @@ pub async fn diff_snapshots(path_a: &Path, path_b: &Path) -> Result<SnapshotDiff
 
     let mut vms = BTreeMap::new();
     for vm_name in vm_names {
-        let vm_diff = match (manifest_a.vms.get(vm_name), manifest_b.vms.get(vm_name)) {
-            (Some(a), Some(b)) => {
-                let state_status = if a.state_file.sha256 == b.state_file.sha256 {
-                    DiffStatus::Identical
-                } else {
-                    DiffStatus::Changed
-                };
-                let state = FileDiff {
-                    status: state_status,
-                    size_a: Some(a.state_file.size),
-                    size_b: Some(b.state_file.size),
-                };
-
-                let mem_status = if a.memory_file.sha256 == b.memory_file.sha256 {
-                    DiffStatus::Identical
-                } else {
-                    DiffStatus::Changed
-                };
-                let memory = FileDiff {
-                    status: mem_status,
-                    size_a: Some(a.memory_file.size),
-                    size_b: Some(b.memory_file.size),
-                };
-
-                let mut disks_b: BTreeMap<&Path, &FileMeta> =
-                    b.disks.iter().map(|d| (d.path.as_path(), d)).collect();
-                let mut disks = Vec::new();
-
-                for disk_a in &a.disks {
-                    if let Some(disk_b) = disks_b.remove(disk_a.path.as_path()) {
-                        let disk_status = if disk_a.sha256 == disk_b.sha256 {
-                            DiffStatus::Identical
-                        } else {
-                            DiffStatus::Changed
-                        };
-                        disks.push(DiskDiff {
-                            path: disk_a.path.clone(),
-                            status: disk_status,
-                            size_a: Some(disk_a.size),
-                            size_b: Some(disk_b.size),
-                        });
-                    } else {
-                        disks.push(DiskDiff {
-                            path: disk_a.path.clone(),
-                            status: DiffStatus::Removed,
-                            size_a: Some(disk_a.size),
-                            size_b: None,
-                        });
-                    }
+        let a = manifest_a.vms.get(vm_name);
+        let b = manifest_b.vms.get(vm_name);
+        let state = file_diff(a.map(|v| &v.state_file), b.map(|v| &v.state_file));
+        let memory = file_diff(a.map(|v| &v.memory_file), b.map(|v| &v.memory_file));
+        let disks_a: BTreeMap<_, _> = a
+            .into_iter()
+            .flat_map(|v| &v.disks)
+            .map(|d| (&d.path, d))
+            .collect();
+        let disks_b: BTreeMap<_, _> = b
+            .into_iter()
+            .flat_map(|v| &v.disks)
+            .map(|d| (&d.path, d))
+            .collect();
+        let paths: BTreeSet<_> = disks_a.keys().chain(disks_b.keys()).copied().collect();
+        let disks: Vec<_> = paths
+            .into_iter()
+            .map(|path| {
+                let file = file_diff(disks_a.get(path).copied(), disks_b.get(path).copied());
+                DiskDiff {
+                    path: path.clone(),
+                    status: file.status,
+                    size_a: file.size_a,
+                    size_b: file.size_b,
                 }
-                for disk_b in disks_b.values() {
-                    disks.push(DiskDiff {
-                        path: disk_b.path.clone(),
-                        status: DiffStatus::Added,
-                        size_a: None,
-                        size_b: Some(disk_b.size),
-                    });
-                }
-                disks.sort_by(|d1, d2| d1.path.cmp(&d2.path));
-
-                let vm_status = if state.status == DiffStatus::Identical
-                    && memory.status == DiffStatus::Identical
-                    && disks.iter().all(|d| d.status == DiffStatus::Identical)
-                {
-                    DiffStatus::Identical
-                } else {
-                    DiffStatus::Changed
-                };
-
-                VmDiff {
-                    status: vm_status,
-                    state,
-                    memory,
-                    disks,
-                }
+            })
+            .collect();
+        let status = match (a, b) {
+            (None, Some(_)) => DiffStatus::Added,
+            (Some(_), None) => DiffStatus::Removed,
+            _ if state.is_identical()
+                && memory.is_identical()
+                && disks.iter().all(DiskDiff::is_identical) =>
+            {
+                DiffStatus::Identical
             }
-            (Some(a), None) => solo_vm_diff(a, DiffStatus::Removed),
-            (None, Some(b)) => solo_vm_diff(b, DiffStatus::Added),
-            (None, None) => continue,
+            _ => DiffStatus::Changed,
+        };
+        let vm_diff = VmDiff {
+            status,
+            state,
+            memory,
+            disks,
         };
         vms.insert(vm_name.to_string(), vm_diff);
     }

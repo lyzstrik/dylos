@@ -1,104 +1,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
 
+use dylos_core::LabSpec;
 use dylos_core::diff::DiffStatus;
-use dylos_core::manifest::{FileMeta, SnapshotManifest, StepDurations, VmManifest, sha256_hex};
-use dylos_core::{Interface, LabSpec, Node, Segment};
+use dylos_core::manifest::SnapshotManifest;
 use dylos_runtime::diff_snapshots;
-use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-fn sha(data: &[u8]) -> String {
-    sha256_hex(&Sha256::digest(data).into())
-}
-
-fn create_test_snapshot(dir: &Path, spec: LabSpec, disk_data_by_vm: &[(&str, &[u8])]) -> PathBuf {
-    fs::create_dir_all(dir).unwrap();
-    let mut vms = BTreeMap::new();
-
-    for &(vm_name, disk_data) in disk_data_by_vm {
-        let vm_dir = dir.join("vms").join(vm_name);
-        fs::create_dir_all(&vm_dir).unwrap();
-
-        let state_data = format!("state for {vm_name}").into_bytes();
-        let mem_data = format!("memory for {vm_name} with extra padding").into_bytes();
-
-        let state_path = format!("vms/{vm_name}/vm.state");
-        let mem_path = format!("vms/{vm_name}/vm.mem");
-        let disk_path = format!("vms/{vm_name}/rootfs.ext4");
-
-        fs::write(dir.join(&state_path), &state_data).unwrap();
-        fs::write(dir.join(&mem_path), &mem_data).unwrap();
-        fs::write(dir.join(&disk_path), disk_data).unwrap();
-
-        vms.insert(
-            vm_name.to_string(),
-            VmManifest {
-                state_file: FileMeta {
-                    path: PathBuf::from(&state_path),
-                    size: state_data.len() as u64,
-                    sha256: sha(&state_data),
-                },
-                memory_file: FileMeta {
-                    path: PathBuf::from(&mem_path),
-                    size: mem_data.len() as u64,
-                    sha256: sha(&mem_data),
-                },
-                disks: vec![FileMeta {
-                    path: PathBuf::from(&disk_path),
-                    size: disk_data.len() as u64,
-                    sha256: sha(disk_data),
-                }],
-            },
-        );
-    }
-
-    let manifest = SnapshotManifest {
-        format_version: 1,
-        lab_spec: spec,
-        vms,
-        firecracker_version: "1.17.0".into(),
-        host_cpu_model: "test-cpu".into(),
-        created_at_unix_ms: 1000,
-        step_durations_ms: StepDurations {
-            freeze: 1,
-            pause: 2,
-            snapshot: 3,
-            resume: 4,
-            thaw: 5,
-        },
-    };
-
-    let manifest_json = manifest.to_json_string().unwrap();
-    fs::write(dir.join("manifest.json"), manifest_json).unwrap();
-    dir.to_path_buf()
-}
-
-fn single_vm_spec() -> LabSpec {
-    LabSpec {
-        segments: vec![Segment {
-            name: "lan".into(),
-            ipv6: "fd64:796c:6f73:1::/64".parse().unwrap(),
-            ipv4: Some("10.0.1.0/24".parse().unwrap()),
-        }],
-        nodes: vec![Node {
-            name: "vm1".into(),
-            image: "alpine-3-18".into(),
-            vcpus: 1,
-            memory: 128,
-            interfaces: vec![Interface {
-                name: "eth0".into(),
-                segment: "lan".into(),
-                ipv6: "fd64:796c:6f73:1::2/64".parse().unwrap(),
-                ipv4: Some("10.0.1.2/24".parse().unwrap()),
-            }],
-            static_routes: vec![],
-        }],
-    }
-}
+#[path = "support/diff.rs"]
+mod support;
+use support::{create_test_snapshot, single_vm_spec};
 
 #[tokio::test]
 async fn diff_identical_snapshots() {
@@ -128,86 +40,10 @@ async fn diff_identical_snapshots() {
 }
 
 fn topology_spec_a() -> LabSpec {
-    LabSpec {
-        segments: vec![
-            Segment {
-                name: "lan1".into(),
-                ipv6: "fd64:796c:6f73:1::/64".parse().unwrap(),
-                ipv4: Some("10.0.1.0/24".parse().unwrap()),
-            },
-            Segment {
-                name: "lan2".into(),
-                ipv6: "fd64:796c:6f73:2::/64".parse().unwrap(),
-                ipv4: Some("10.0.2.0/24".parse().unwrap()),
-            },
-        ],
-        nodes: vec![Node {
-            name: "vm1".into(),
-            image: "alpine-3-18".into(),
-            vcpus: 1,
-            memory: 128,
-            interfaces: vec![Interface {
-                name: "eth0".into(),
-                segment: "lan1".into(),
-                ipv6: "fd64:796c:6f73:1::2/64".parse().unwrap(),
-                ipv4: Some("10.0.1.2/24".parse().unwrap()),
-            }],
-            static_routes: vec![],
-        }],
-    }
+    LabSpec::from_yaml_str(include_str!("fixtures/diff-topology-a.yaml")).unwrap()
 }
-
 fn topology_spec_b() -> LabSpec {
-    LabSpec {
-        segments: vec![
-            Segment {
-                name: "lan1".into(),
-                ipv6: "fd64:796c:6f73:10::/64".parse().unwrap(),
-                ipv4: Some("10.0.10.0/24".parse().unwrap()),
-            },
-            Segment {
-                name: "lan3".into(),
-                ipv6: "fd64:796c:6f73:3::/64".parse().unwrap(),
-                ipv4: Some("10.0.3.0/24".parse().unwrap()),
-            },
-        ],
-        nodes: vec![
-            Node {
-                name: "vm1".into(),
-                image: "alpine-3-19".into(),
-                vcpus: 2,
-                memory: 256,
-                interfaces: vec![
-                    Interface {
-                        name: "eth0".into(),
-                        segment: "lan1".into(),
-                        ipv6: "fd64:796c:6f73:10::2/64".parse().unwrap(),
-                        ipv4: Some("10.0.10.2/24".parse().unwrap()),
-                    },
-                    Interface {
-                        name: "eth1".into(),
-                        segment: "lan3".into(),
-                        ipv6: "fd64:796c:6f73:3::2/64".parse().unwrap(),
-                        ipv4: Some("10.0.3.2/24".parse().unwrap()),
-                    },
-                ],
-                static_routes: vec![],
-            },
-            Node {
-                name: "vm2".into(),
-                image: "alpine-3-18".into(),
-                vcpus: 1,
-                memory: 128,
-                interfaces: vec![Interface {
-                    name: "eth0".into(),
-                    segment: "lan3".into(),
-                    ipv6: "fd64:796c:6f73:3::3/64".parse().unwrap(),
-                    ipv4: Some("10.0.3.3/24".parse().unwrap()),
-                }],
-                static_routes: vec![],
-            },
-        ],
-    }
+    LabSpec::from_yaml_str(include_str!("fixtures/diff-topology-b.yaml")).unwrap()
 }
 
 #[tokio::test]
@@ -343,14 +179,10 @@ async fn diff_corrupted_snapshot_fails_verification() {
     // Corrupt rootfs.ext4 in snapshot B behind the manifest's back
     fs::write(dir_b.join("vms/vm1/rootfs.ext4"), b"corrupted bytes").unwrap();
 
-    let err = diff_snapshots(&dir_a, &dir_b).await.unwrap_err();
-    let err_str = err.to_string();
-    assert!(
-        err_str.to_lowercase().contains("integrity mismatch")
-            || err_str.contains("IntegrityMismatch")
-            || err_str.contains("expected"),
-        "error should indicate verification failure, got: {err_str}"
-    );
+    for (a, b) in [(&dir_a, &dir_b), (&dir_b, &dir_a)] {
+        let err = diff_snapshots(a, b).await.unwrap_err();
+        assert!(err.to_string().contains("integrity mismatch"), "{err}");
+    }
 }
 
 #[tokio::test]
@@ -383,7 +215,54 @@ async fn diff_rejects_manifest_vm_keys_mismatch() {
     let err = diff_snapshots(&dir_a, &dir_b).await.unwrap_err();
     let err_str = err.to_string();
     assert!(
-        err_str.contains("manifest VMs do not match") || err_str.contains("manifest"),
+        err_str.contains("manifest VMs do not match lab spec nodes"),
         "expected VM key mismatch rejection, got: {err_str}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires an fs-verity capable filesystem; run through just e2e"]
+async fn diff_sealed_files_use_verified_digest() {
+    let tmp = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+    let a = create_test_snapshot(&tmp.path().join("a"), single_vm_spec(), &[("vm1", b"aaaa")]);
+    let b = create_test_snapshot(&tmp.path().join("b"), single_vm_spec(), &[("vm1", b"bbbb")]);
+    for dir in [&a, &b] {
+        let path = dir.join("manifest.json");
+        let mut manifest: SnapshotManifest =
+            SnapshotManifest::from_json_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        for vm in manifest.vms.values_mut() {
+            for file in [&mut vm.state_file, &mut vm.memory_file]
+                .into_iter()
+                .chain(&mut vm.disks)
+            {
+                file.fsverity = Some(
+                    dylos_store::verity::enable(&fs::File::open(dir.join(&file.path)).unwrap())
+                        .unwrap()
+                        .expect("E2E filesystem must support fs-verity"),
+                );
+                // Equal SHA-256 values cannot conceal different sealed content.
+                file.sha256 = "0".repeat(64);
+            }
+        }
+        fs::write(path, manifest.to_json_string().unwrap()).unwrap();
+    }
+    let diff = diff_snapshots(&a, &b).await.unwrap();
+    assert_eq!(diff.vms["vm1"].disks[0].status, DiffStatus::Changed);
+    assert!(diff.vms["vm1"].state.is_identical());
+    let path = b.join("manifest.json");
+    let mut manifest: SnapshotManifest =
+        SnapshotManifest::from_json_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    manifest.vms.get_mut("vm1").unwrap().state_file.sha256 = "1".repeat(64);
+    fs::write(&path, manifest.to_json_string().unwrap()).unwrap();
+    assert!(
+        diff_snapshots(&a, &b).await.unwrap().vms["vm1"]
+            .state
+            .is_identical()
+    );
+    // An unsealed peer's SHA-256 is not comparable with a verity digest.
+    let c = create_test_snapshot(&tmp.path().join("c"), single_vm_spec(), &[("vm1", b"aaaa")]);
+    assert_eq!(
+        diff_snapshots(&a, &c).await.unwrap().vms["vm1"].disks[0].status,
+        DiffStatus::Changed
     );
 }

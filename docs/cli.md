@@ -265,125 +265,32 @@ Usage: dylos lab diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
 #### Behavior
 
 - **Read-only**: `dylos lab diff` creates, modifies, and deletes nothing on the host or in storage.
-- **Verification first**: Both snapshots are verified (manifest integrity, SHA-256 hashes, file sizes, and inventory) before comparison. A corrupted or tampered snapshot is treated as a fatal verification error, never as a diff. Reading both snapshots completely means runtime is O(total snapshot size).
+- **Verification first**: Both snapshots are verified (manifest validity, file sizes, inventory, and the fs-verity digest for sealed files or SHA-256 for unsealed files) before comparison. A corrupted or tampered snapshot is treated as a fatal verification error, never as a diff. Unsealed verification reads all bytes (O(total unsealed size)); sealed verification measures kernel digests without rehashing file contents. Identity uses size and the verified digest; mixed sealed/unsealed pairs conservatively report `changed`.
 - **Topology comparison**: Compares `LabSpec` definitions across segments (added, removed, IP prefix changes), nodes (added, removed, image/vCPU/memory/route changes), and per-node interfaces (added, removed, segment/IP changes).
 - **Per-VM file comparison**: Compares VM state, memory, and disk files, reporting presence status (`identical`, `changed`, `added`, `removed`), with sizes in snapshot A and snapshot B (missing side reported as `null`).
 
 #### Standard Output
 
-Default human-readable format:
-```text
-Topology:
-  Segments:
-    + wan
-    - old-lan
-    ~ lan1: ipv6: fd64::1/64 -> fd64::10/64
-  Nodes:
-    + vm2
-    ~ vm1: vcpus: 1 -> 2, memory: 128 -> 256
-  Interfaces:
-    + vm2/eth0 (segment: lan1, ipv6: fd64::20/64)
-    ~ vm1/eth0: ipv6: fd64::2/64 -> fd64::3/64
-VMs:
-  vm1:
-    state:  identical (1024 bytes)
-    memory: changed (52428800 bytes -> 52428800 bytes)
-    disk "vms/vm1/rootfs.ext4": changed (104857600 bytes -> 104857600 bytes)
-```
-
+Default human output lists topology changes and each VM's state, memory and disk status with byte sizes.
 When `--json` is supplied, a structured JSON document is emitted:
 ```json
 {
   "topology": {
-    "segments": {
-      "added": [
-        "wan"
-      ],
-      "removed": [
-        "old-lan"
-      ],
-      "changed": [
-        {
-          "name": "lan1",
-          "ipv6": {
-            "from": "fd64::1/64",
-            "to": "fd64::10/64"
-          },
-          "ipv4": null
-        }
-      ]
-    },
-    "nodes": {
-      "added": [
-        "vm2"
-      ],
-      "removed": [],
-      "changed": [
-        {
-          "name": "vm1",
-          "image": null,
-          "vcpus": {
-            "from": 1,
-            "to": 2
-          },
-          "memory": {
-            "from": 128,
-            "to": 256
-          },
-          "static_routes": null
-        }
-      ]
-    },
-    "interfaces": {
-      "added": [
-        {
-          "node": "vm2",
-          "interface": "eth0",
-          "segment": "lan1",
-          "ipv6": "fd64::20/64",
-          "ipv4": null
-        }
-      ],
-      "removed": [],
-      "changed": [
-        {
-          "node": "vm1",
-          "interface": "eth0",
-          "segment": null,
-          "ipv6": {
-            "from": "fd64::2/64",
-            "to": "fd64::3/64"
-          },
-          "ipv4": null
-        }
-      ]
-    }
+    "segments": {"added": [], "removed": [], "changed": []},
+    "nodes": {"added": [], "removed": [], "changed": []},
+    "interfaces": {"added": [], "removed": [], "changed": []}
   },
   "vms": {
     "vm1": {
-      "status": "changed",
-      "state": {
-        "status": "identical",
-        "size_a": 1024,
-        "size_b": 1024
-      },
-      "memory": {
-        "status": "changed",
-        "size_a": 52428800,
-        "size_b": 52428800
-      },
-      "disks": [
-        {
-          "path": "vms/vm1/rootfs.ext4",
-          "status": "changed",
-          "size_a": 104857600,
-          "size_b": 104857600
-        }
-      ]
+      "status": "identical",
+      "state": {"status": "identical", "size_a": 13, "size_b": 13},
+      "memory": {"status": "identical", "size_a": 33, "size_b": 33},
+      "disks": [{"path": "vms/vm1/rootfs.ext4", "status": "identical", "size_a": 4, "size_b": 4}]
     }
   }
 }
 ```
+All keys are emitted; unchanged topology fields are `null` and missing file sizes are `null`.
 
 #### Exit Status
 

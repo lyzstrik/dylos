@@ -4,33 +4,7 @@ use dylos_core::diff::TopologyDiff;
 use dylos_core::{Interface, LabSpec, Node, Segment};
 
 fn sample_spec() -> LabSpec {
-    LabSpec {
-        segments: vec![
-            Segment {
-                name: "seg1".into(),
-                ipv6: "2001:db8:1::/64".parse().unwrap(),
-                ipv4: Some("10.0.1.0/24".parse().unwrap()),
-            },
-            Segment {
-                name: "seg2".into(),
-                ipv6: "2001:db8:2::/64".parse().unwrap(),
-                ipv4: None,
-            },
-        ],
-        nodes: vec![Node {
-            name: "vm1".into(),
-            image: "alpine-3-18".into(),
-            vcpus: 2,
-            memory: 256,
-            interfaces: vec![Interface {
-                name: "eth0".into(),
-                segment: "seg1".into(),
-                ipv6: "2001:db8:1::2/64".parse().unwrap(),
-                ipv4: Some("10.0.1.2/24".parse().unwrap()),
-            }],
-            static_routes: vec![],
-        }],
-    }
+    LabSpec::from_yaml_str(include_str!("fixtures/diff-topology.yaml")).unwrap()
 }
 
 #[test]

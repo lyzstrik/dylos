@@ -634,11 +634,10 @@ fn print_human_segments(segments: &dylos_core::diff::SegmentDiff) {
         return;
     }
     println!("  Segments:");
-    for added in &segments.added {
-        println!("    + {}", added.escape_debug());
-    }
-    for removed in &segments.removed {
-        println!("    - {}", removed.escape_debug());
+    for (sign, names) in [("+", &segments.added), ("-", &segments.removed)] {
+        for name in names {
+            println!("    {sign} {}", name.escape_debug());
+        }
     }
     for changed in &segments.changed {
         print!("    ~ {}:", changed.name.escape_debug());
@@ -652,16 +651,23 @@ fn print_human_segments(segments: &dylos_core::diff::SegmentDiff) {
     }
 }
 
+fn format_routes(routes: &[dylos_core::StaticRoute]) -> String {
+    routes
+        .iter()
+        .map(|r| format!("{} via {}", r.destination, r.gateway))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn print_human_nodes(nodes: &dylos_core::diff::NodeDiff) {
     if nodes.is_empty() {
         return;
     }
     println!("  Nodes:");
-    for added in &nodes.added {
-        println!("    + {}", added.escape_debug());
-    }
-    for removed in &nodes.removed {
-        println!("    - {}", removed.escape_debug());
+    for (sign, names) in [("+", &nodes.added), ("-", &nodes.removed)] {
+        for name in names {
+            println!("    {sign} {}", name.escape_debug());
+        }
     }
     for changed in &nodes.changed {
         print!("    ~ {}:", changed.name.escape_debug());
@@ -677,15 +683,12 @@ fn print_human_nodes(nodes: &dylos_core::diff::NodeDiff) {
         }
         if let Some(ref routes) = changed.static_routes {
             parts.push(format!(
-                "static_routes: {:?} -> {:?}",
-                routes.from, routes.to
+                "static_routes: {} -> {}",
+                format_routes(&routes.from),
+                format_routes(&routes.to)
             ));
         }
-        if parts.is_empty() {
-            println!(" (properties unchanged)");
-        } else {
-            println!(" {}", parts.join(", "));
-        }
+        println!(" {}", parts.join(", "));
     }
 }
 
@@ -694,29 +697,19 @@ fn print_human_interfaces(interfaces: &dylos_core::diff::InterfaceDiff) {
         return;
     }
     println!("  Interfaces:");
-    for added in &interfaces.added {
-        let v4 = added
-            .ipv4
-            .map_or_else(String::new, |v| format!(", ipv4: {v}"));
-        println!(
-            "    + {}/{} (segment: {}, ipv6: {}{v4})",
-            added.node.escape_debug(),
-            added.interface.escape_debug(),
-            added.segment.escape_debug(),
-            added.ipv6
-        );
-    }
-    for removed in &interfaces.removed {
-        let v4 = removed
-            .ipv4
-            .map_or_else(String::new, |v| format!(", ipv4: {v}"));
-        println!(
-            "    - {}/{} (segment: {}, ipv6: {}{v4})",
-            removed.node.escape_debug(),
-            removed.interface.escape_debug(),
-            removed.segment.escape_debug(),
-            removed.ipv6
-        );
+    for (sign, items) in [("+", &interfaces.added), ("-", &interfaces.removed)] {
+        for item in items {
+            let v4 = item
+                .ipv4
+                .map_or_else(String::new, |v| format!(", ipv4: {v}"));
+            println!(
+                "    {sign} {}/{} (segment: {}, ipv6: {}{v4})",
+                item.node.escape_debug(),
+                item.interface.escape_debug(),
+                item.segment.escape_debug(),
+                item.ipv6
+            );
+        }
     }
     for changed in &interfaces.changed {
         print!(
@@ -751,22 +744,12 @@ fn print_human_vms(vms: &std::collections::BTreeMap<String, dylos_core::diff::Vm
             dylos_core::diff::DiffStatus::Removed => println!("  {escaped_vm} (removed):"),
             _ => println!("  {escaped_vm}:"),
         }
-        println!(
-            "    state:  {}",
-            format_file_status(
-                vm_diff.state.status,
-                vm_diff.state.size_a,
-                vm_diff.state.size_b
-            )
-        );
-        println!(
-            "    memory: {}",
-            format_file_status(
-                vm_diff.memory.status,
-                vm_diff.memory.size_a,
-                vm_diff.memory.size_b
-            )
-        );
+        for (label, file) in [("state: ", &vm_diff.state), ("memory:", &vm_diff.memory)] {
+            println!(
+                "    {label} {}",
+                format_file_status(file.status, file.size_a, file.size_b)
+            );
+        }
         for disk in &vm_diff.disks {
             let escaped_path = disk.path.display().to_string().escape_debug().to_string();
             println!(

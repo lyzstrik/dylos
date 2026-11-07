@@ -7,87 +7,12 @@ use std::process::Command;
 use std::time::SystemTime;
 
 use dylos_core::diff::{DiffStatus, SnapshotDiff};
-use dylos_core::manifest::{FileMeta, SnapshotManifest, StepDurations, VmManifest, sha256_hex};
-use dylos_core::{Interface, LabSpec, Node, Segment};
-use sha2::{Digest, Sha256};
 use tempfile::tempdir;
 
-fn sha(data: &[u8]) -> String {
-    sha256_hex(&Sha256::digest(data).into())
-}
-
-fn create_fixture_snapshot(dir: &Path, disk_data: &[u8]) -> PathBuf {
-    fs::create_dir_all(dir.join("vms/vm1")).unwrap();
-    let state_data = b"state data";
-    let mem_data = b"memory data";
-
-    fs::write(dir.join("vms/vm1/vm.state"), state_data).unwrap();
-    fs::write(dir.join("vms/vm1/vm.mem"), mem_data).unwrap();
-    fs::write(dir.join("vms/vm1/rootfs.ext4"), disk_data).unwrap();
-
-    let mut vms = BTreeMap::new();
-    vms.insert(
-        "vm1".to_string(),
-        VmManifest {
-            state_file: FileMeta {
-                path: PathBuf::from("vms/vm1/vm.state"),
-                size: state_data.len() as u64,
-                sha256: sha(state_data),
-            },
-            memory_file: FileMeta {
-                path: PathBuf::from("vms/vm1/vm.mem"),
-                size: mem_data.len() as u64,
-                sha256: sha(mem_data),
-            },
-            disks: vec![FileMeta {
-                path: PathBuf::from("vms/vm1/rootfs.ext4"),
-                size: disk_data.len() as u64,
-                sha256: sha(disk_data),
-            }],
-        },
-    );
-
-    let manifest = SnapshotManifest {
-        format_version: 1,
-        lab_spec: LabSpec {
-            segments: vec![Segment {
-                name: "lan".into(),
-                ipv6: "fd64:796c:6f73:1::/64".parse().unwrap(),
-                ipv4: Some("10.0.1.0/24".parse().unwrap()),
-            }],
-            nodes: vec![Node {
-                name: "vm1".into(),
-                image: "alpine-3-18".into(),
-                vcpus: 1,
-                memory: 128,
-                interfaces: vec![Interface {
-                    name: "eth0".into(),
-                    segment: "lan".into(),
-                    ipv6: "fd64:796c:6f73:1::2/64".parse().unwrap(),
-                    ipv4: Some("10.0.1.2/24".parse().unwrap()),
-                }],
-                static_routes: vec![],
-            }],
-        },
-        vms,
-        firecracker_version: "1.17.0".into(),
-        host_cpu_model: "test-cpu".into(),
-        created_at_unix_ms: 1000,
-        step_durations_ms: StepDurations {
-            freeze: 1,
-            pause: 2,
-            snapshot: 3,
-            resume: 4,
-            thaw: 5,
-        },
-    };
-
-    fs::write(
-        dir.join("manifest.json"),
-        manifest.to_json_string().unwrap(),
-    )
-    .unwrap();
-    dir.to_path_buf()
+#[path = "../../dylos-runtime/tests/support/diff.rs"]
+mod support;
+fn create_fixture_snapshot(dir: &Path, data: &[u8]) -> PathBuf {
+    support::create_test_snapshot(dir, support::single_vm_spec(), &[("vm1", data)])
 }
 
 #[test]
@@ -224,8 +149,7 @@ fn cli_diff_is_strictly_read_only() {
     let snap_b = create_fixture_snapshot(&tmp.path().join("snap_b"), &disk_b);
 
     // Snapshot trees before running diff
-    let tree_first_before = snapshot_tree(&snap_a);
-    let tree_second_before = snapshot_tree(&snap_b);
+    let tree_before = snapshot_tree(tmp.path());
 
     // Run both human-readable and JSON diff commands
     let out1 = Command::new(env!("CARGO_BIN_EXE_dylos"))
@@ -251,13 +175,20 @@ fn cli_diff_is_strictly_read_only() {
         .unwrap();
     assert!(out2.status.success());
 
-    // Snapshot trees after running diff
-    let tree_first_after = snapshot_tree(&snap_a);
-    let tree_second_after = snapshot_tree(&snap_b);
-
-    // Prove trees, entries, sizes, and modified times are entirely untouched
-    assert_eq!(tree_first_before, tree_first_after);
-    assert_eq!(tree_second_before, tree_second_after);
+    assert_eq!(tree_before, snapshot_tree(tmp.path()));
+    fs::write(snap_a.join("vms/vm1/rootfs.ext4"), b"corrupt").unwrap();
+    let before_failure = snapshot_tree(tmp.path());
+    let failed = Command::new(env!("CARGO_BIN_EXE_dylos"))
+        .args([
+            "lab",
+            "diff",
+            snap_a.to_str().unwrap(),
+            snap_b.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert_eq!(before_failure, snapshot_tree(tmp.path()));
 }
 
 #[test]
@@ -276,14 +207,22 @@ fn cli_diff_documented_example_parses_and_matches() {
 
     let parsed: SnapshotDiff = serde_json::from_str(json_text)
         .expect("documented JSON example failed to parse as SnapshotDiff");
-    let reserialized =
-        serde_json::to_string_pretty(&parsed).expect("failed to reserialize parsed SnapshotDiff");
-
-    assert_eq!(
-        reserialized.trim(),
-        json_text.trim(),
-        "reserialized diff must match documented JSON in docs/cli.md exactly"
-    );
+    let tmp = tempdir().unwrap();
+    let a = create_fixture_snapshot(&tmp.path().join("a"), b"disk");
+    let b = create_fixture_snapshot(&tmp.path().join("b"), b"disk");
+    let out = Command::new(env!("CARGO_BIN_EXE_dylos"))
+        .args([
+            "lab",
+            "diff",
+            a.to_str().unwrap(),
+            b.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let actual: SnapshotDiff = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(parsed, actual);
 }
 
 #[test]
