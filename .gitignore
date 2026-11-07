@@ -28,3 +28,6 @@ target
 /fuzz/corpus/
 /fuzz/artifacts/
 /fuzz/coverage/
+
+# CI and test run logs
+/check.log
