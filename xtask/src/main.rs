@@ -154,7 +154,7 @@ fn build_rootfs(
     let images_dir = workspace.join("xtask/images");
     let output_spec = format!("type=local,dest={}", temporary.display());
     let status = Command::new("podman")
-        .args(["build", "--platform", "linux/amd64"])
+        .args(["build", "--network=host", "--platform", "linux/amd64"])
         .arg("--build-arg")
         .arg(format!("SOURCE_DATE_EPOCH={SOURCE_DATE_EPOCH}"))
         .arg("--build-arg")
