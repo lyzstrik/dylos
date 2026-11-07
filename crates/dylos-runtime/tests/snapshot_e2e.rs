@@ -118,6 +118,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         .await
         .expect("snapshot manifest verification failed");
     let verify_ms = verify_start.elapsed().as_millis();
+    compare_verification(&opener, &manifest, verify_ms).await;
 
     eprintln!(
         "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
@@ -459,4 +460,53 @@ async fn default_store_and_jail_paths_support_up_and_snapshot() {
     let result = lab.snapshot("defaults").await;
     lab.teardown().await.unwrap();
     assert!(result.is_ok(), "{result:?}");
+}
+
+async fn compare_verification(
+    opener: &SnapshotOpener,
+    manifest: &dylos_core::manifest::SnapshotManifest,
+    verify_ms: u128,
+) {
+    assert!(
+        manifest
+            .vms
+            .values()
+            .flat_map(dylos_core::manifest::VmManifest::files)
+            .all(|file| file.fsverity.is_some()),
+        "CI snapshot storage must exercise fs-verity for every content file"
+    );
+    let mut fallback = manifest.clone();
+    for vm in fallback.vms.values_mut() {
+        for file in [&mut vm.memory_file, &mut vm.state_file]
+            .into_iter()
+            .chain(vm.disks.iter_mut())
+        {
+            file.fsverity = None;
+        }
+    }
+    let fallback_start = Instant::now();
+    dylos_runtime::verify_snapshot(opener, &fallback)
+        .await
+        .unwrap();
+    eprintln!(
+        "Same-snapshot verification: full_sha256={}ms fsverity={}ms",
+        fallback_start.elapsed().as_millis(),
+        verify_ms
+    );
+    for file in manifest.vms.values().next().unwrap().files() {
+        let fd = opener.open(&file.path).unwrap();
+        let started = Instant::now();
+        for _ in 0..100 {
+            assert_eq!(
+                dylos_store::verity::measure(&fd).unwrap(),
+                *file.fsverity.as_ref().unwrap()
+            );
+        }
+        eprintln!(
+            "Verity size probe: path={} bytes={} measurements=100 elapsed_us={}",
+            file.path.display(),
+            file.size,
+            started.elapsed().as_micros()
+        );
+    }
 }
