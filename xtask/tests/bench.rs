@@ -10,8 +10,8 @@ use std::time::Duration;
 use dylos_runtime::LabError;
 use xtask::bench::{
     BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
-    cleanup_private_bench_dir, lab_failure, parse_bench_args, percentile, render_markdown_report,
-    run_in_private_dir, settle_pss, setup_private_bench_dir,
+    SnapshotStages, cleanup_private_bench_dir, lab_failure, parse_bench_args, percentile,
+    render_markdown_report, run_in_private_dir, settle_pss, setup_private_bench_dir,
 };
 
 fn samples(values: &[f64]) -> MetricSamples {
@@ -47,7 +47,18 @@ fn passing() -> BenchResults {
         cold_boot_ms: samples(&[1400.0]),
         freeze_duration_ms: samples(&[2.0]),
         pause_skew_ms: samples(&[0.5]),
-        snapshot_duration_ms: samples(&[800.0]),
+        snapshot_freeze_to_thaw_ms: samples(&[800.0]),
+        snapshot_total_ms: samples(&[5800.0]),
+        snapshot_stages: SnapshotStages {
+            freeze_ms: samples(&[2.0]),
+            pause_ms: samples(&[80.0]),
+            api_snapshot_ms: samples(&[650.0]),
+            storage_ms: samples(&[30.0]),
+            resume_ms: samples(&[20.0]),
+            thaw_ms: samples(&[2.0]),
+            hash_ms: samples(&[5000.0]),
+            manifest_ms: samples(&[10.0]),
+        },
         fork_wall_time_ms: by_count(&[(1, &[300.0]), (10, &[4000.0])]),
         fork_amortized_ms: by_count(&[(1, &[300.0]), (10, &[400.0])]),
         fork_restore_ms: by_count(&[(1, &[30.0]), (10, &[40.0])]),
@@ -61,7 +72,9 @@ fn empty() -> BenchResults {
         cold_boot_ms: MetricSamples::new(),
         freeze_duration_ms: MetricSamples::new(),
         pause_skew_ms: MetricSamples::new(),
-        snapshot_duration_ms: MetricSamples::new(),
+        snapshot_freeze_to_thaw_ms: MetricSamples::new(),
+        snapshot_total_ms: MetricSamples::new(),
+        snapshot_stages: SnapshotStages::default(),
         fork_wall_time_ms: BTreeMap::new(),
         fork_amortized_ms: BTreeMap::new(),
         fork_restore_ms: BTreeMap::new(),
@@ -190,7 +203,7 @@ fn missing_restore_breakdown_is_not_go() {
 fn one_failing_criterion_does_not_mask_another() {
     let r = BenchResults {
         is_quick: true,
-        snapshot_duration_ms: samples(&[20_000.0]),
+        snapshot_freeze_to_thaw_ms: samples(&[20_000.0]),
         fork_wall_time_ms: by_count(&[(1, &[32_000.0]), (10, &[4000.0])]),
         pss_unsettled: BTreeMap::from([(1, 0), (10, 3)]),
         ..passing()
@@ -273,6 +286,100 @@ fn quick_ci_report_is_labelled_indicative_with_one_set_of_columns() {
     assert!(report.contains("CI runner, quick run (indicative)"));
     assert!(report.contains("Reference run:** outstanding"));
     assert!(!report.contains("human run"));
+}
+
+#[test]
+fn passing_pause_with_slow_publication_is_go_and_shows_dominant_stage() {
+    let r = BenchResults {
+        snapshot_freeze_to_thaw_ms: samples(&[750.0]),
+        snapshot_total_ms: samples(&[26_000.0]),
+        snapshot_stages: SnapshotStages {
+            freeze_ms: samples(&[2.0]),
+            pause_ms: samples(&[70.0]),
+            api_snapshot_ms: samples(&[600.0]),
+            storage_ms: samples(&[40.0]),
+            resume_ms: samples(&[20.0]),
+            thaw_ms: samples(&[2.0]),
+            hash_ms: samples(&[25_000.0]),
+            manifest_ms: samples(&[15.0]),
+        },
+        ..passing()
+    };
+    assert_eq!(r.snapshot_verdict(), "GO");
+    assert!(!r.failing_criteria().contains(&"snapshot"));
+    assert!(r.overall_verdict().starts_with("PENDING"));
+
+    let report = render_markdown_report(&r);
+    assert!(report.contains(
+        "Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **GO**"
+    ));
+    assert!(report.contains(
+        "Snapshot pause window, freeze to thaw (5 VMs) | < 1000 ms | 750.0 ms | 750.0 ms | GO"
+    ));
+    assert!(report.contains(
+        "Snapshot total until published (5 VMs) | informational | 26000.0 ms | 26000.0 ms | INFO"
+    ));
+    assert!(report.contains("Dominant stage: hashing (p95: 25000.0 ms)"));
+}
+
+#[test]
+fn failing_pause_is_no_go_regardless_of_publication_time() {
+    let r = BenchResults {
+        snapshot_freeze_to_thaw_ms: samples(&[1250.0]),
+        snapshot_total_ms: samples(&[2000.0]),
+        snapshot_stages: SnapshotStages {
+            freeze_ms: samples(&[2.0]),
+            pause_ms: samples(&[100.0]),
+            api_snapshot_ms: samples(&[1100.0]),
+            storage_ms: samples(&[30.0]),
+            resume_ms: samples(&[25.0]),
+            thaw_ms: samples(&[2.0]),
+            hash_ms: samples(&[700.0]),
+            manifest_ms: samples(&[15.0]),
+        },
+        ..passing()
+    };
+    assert_eq!(r.snapshot_verdict(), "NO-GO");
+    assert!(r.failing_criteria().contains(&"snapshot"));
+    assert!(r.overall_verdict().contains("snapshot"));
+
+    let report = render_markdown_report(&r);
+    assert!(report.contains(
+        "Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **NO-GO**"
+    ));
+    assert!(report.contains(
+        "Snapshot pause window, freeze to thaw (5 VMs) | < 1000 ms | 1250.0 ms | 1250.0 ms | NO-GO"
+    ));
+    assert!(report.contains("Dominant stage: API snapshot (p95: 1100.0 ms)"));
+}
+
+#[test]
+fn storage_dominant_stage_is_identified_and_reported() {
+    let r = BenchResults {
+        snapshot_freeze_to_thaw_ms: samples(&[850.0]),
+        snapshot_total_ms: samples(&[1500.0]),
+        snapshot_stages: SnapshotStages {
+            freeze_ms: samples(&[2.0]),
+            pause_ms: samples(&[50.0]),
+            api_snapshot_ms: samples(&[150.0]),
+            storage_ms: samples(&[600.0]),
+            resume_ms: samples(&[20.0]),
+            thaw_ms: samples(&[2.0]),
+            hash_ms: samples(&[300.0]),
+            manifest_ms: samples(&[15.0]),
+        },
+        ..passing()
+    };
+    assert_eq!(r.snapshot_verdict(), "GO");
+    assert_eq!(r.snapshot_stages.dominant_stage(), Some(("storage", 600.0)));
+
+    let report = render_markdown_report(&r);
+    assert!(report.contains("Dominant stage: storage (p95: 600.0 ms)"));
+    assert!(report.contains("| Storage | 600.0 ms | 600.0 ms | Disk reflink & file capture |"));
+    assert!(
+        report.contains("| API snapshot | 150.0 ms | 150.0 ms | Memory & state serialization |")
+    );
+    assert!(!report.contains("Memory & state serialization, disk reflink"));
 }
 
 fn fast() -> SettleParams {

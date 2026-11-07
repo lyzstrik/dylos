@@ -15,7 +15,7 @@ The spike must prove that a network of microVMs can be snapshotted consistently 
 
 Go criteria:
 
-- consistent snapshot of a 5-VM lab (256 MiB each) in under 1 s,
+- consistent snapshot of a 5-VM lab (256 MiB each) in under 1 s (pause window, freeze to thaw),
 - fork of one clone in under 500 ms,
 - a long-lived TCP connection from A to C survives in 100% of clones,
 - no address conflict with 10 clones running at the same time,
