@@ -3,53 +3,25 @@
 use dylos_fc::config::{BootSource, Drive, InstanceActionInfo, MachineConfiguration};
 use dylos_runtime::jailer::{ChrootFile, JailerConfig};
 use dylos_runtime::{Timeouts, Vm, VmSpec};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 mod support;
-use support::{Captured, test_tempdir};
+use support::{Captured, check_e2e_prerequisites, test_tempdir};
 
 const NOBODY: u32 = 65534;
-
-fn binaries_dir() -> Option<PathBuf> {
-    std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from)
-}
-
-fn missing_prerequisite(kernel: &Path, rootfs: &Path) -> Option<String> {
-    let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| {
-        use std::os::unix::fs::MetadataExt;
-        m.uid() == 0
-    });
-    if !is_root {
-        return Some("must start as root".into());
-    }
-    let Some(bin) = binaries_dir() else {
-        return Some("DYLOS_FC_BIN_DIR is not set".into());
-    };
-    [
-        Path::new("/dev/kvm"),
-        &bin.join("jailer"),
-        &bin.join("firecracker"),
-        kernel,
-        rootfs,
-    ]
-    .into_iter()
-    .find(|p| !p.exists())
-    .map(|p| format!("{} is missing", p.display()))
-}
 
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn vm_boots_and_reaches_readiness() {
-    let kernel = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/vmlinux.bin");
-    let rootfs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/images/rootfs.ext4");
-    if let Some(reason) = missing_prerequisite(&kernel, &rootfs) {
-        eprintln!("SKIPPED boot_e2e test: {reason}");
+    let Some(prereqs) = check_e2e_prerequisites("vm_boots_and_reaches_readiness") else {
         return;
-    }
+    };
+    let kernel = prereqs.kernel;
+    let rootfs = prereqs.image;
+    let bin = prereqs.bin;
 
     let dir = test_tempdir();
-    let bin = binaries_dir().unwrap();
     let mut config = JailerConfig::new(dir.path(), NOBODY, NOBODY);
     config.jailer = bin.join("jailer");
     config.firecracker = bin.join("firecracker");

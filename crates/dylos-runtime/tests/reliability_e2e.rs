@@ -1,8 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use dylos_core::LabSpec;
@@ -11,46 +10,21 @@ use dylos_runtime::{Lab, LabConfig};
 use futures_util::FutureExt;
 
 mod support;
-use support::test_tempdir;
+use support::{check_e2e_prerequisites, test_tempdir};
 
-fn configuration() -> Option<(tempfile::TempDir, LabConfig, LabSpec)> {
-    // The store rejects `..` path components.
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let bin = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from);
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-    let Some(bin) = bin else {
-        eprintln!("SKIPPED reliability_e2e: DYLOS_FC_BIN_DIR missing");
-        return None;
-    };
-    if std::fs::metadata("/proc/self").unwrap().uid() != 0
-        || [
-            Path::new("/dev/kvm"),
-            &kernel,
-            &image,
-            &bin.join("jailer"),
-            &bin.join("firecracker"),
-        ]
-        .iter()
-        .any(|path| !path.exists())
-    {
-        eprintln!("SKIPPED reliability_e2e: requires root, KVM, images and binaries");
-        return None;
-    }
+fn configuration(test: &str) -> Option<(tempfile::TempDir, LabConfig, LabSpec)> {
+    let prereqs = check_e2e_prerequisites(test)?;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
-    jailer.jailer = bin.join("jailer");
-    jailer.firecracker = bin.join("firecracker");
+    jailer.jailer = prereqs.bin.join("jailer");
+    jailer.firecracker = prereqs.bin.join("firecracker");
     let config = LabConfig {
         store: dylos_store::Store {
             base: dir.path().join("labs"),
-            image,
+            image: prereqs.image,
         },
         jailer,
-        kernel,
+        kernel: prereqs.kernel,
         netns_dir: dir.path().join("netns"),
         ..LabConfig::default()
     };
@@ -174,7 +148,7 @@ fn empty_directory(path: &Path) {
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn tcp_survives_in_all_ten_clones() {
-    let Some((_dir, config, spec)) = configuration() else {
+    let Some((_dir, config, spec)) = configuration("tcp_survives_in_all_ten_clones") else {
         return;
     };
     let mut source = Lab::up_with(&config, &spec, "survival").await.unwrap();
@@ -224,7 +198,7 @@ async fn snapshot_fork_down_endurance() {
             .expect("DYLOS_ENDURANCE_CYCLES must be a positive integer")
     });
     assert!(cycles > 0);
-    let Some((_dir, config, spec)) = configuration() else {
+    let Some((_dir, config, spec)) = configuration("snapshot_fork_down_endurance") else {
         return;
     };
     let started = Instant::now();

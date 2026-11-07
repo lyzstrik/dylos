@@ -5,7 +5,6 @@
     clippy::panic
 )]
 
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -17,33 +16,7 @@ use dylos_runtime::jailer::{ChrootFile, JailPaths, JailerConfig};
 use dylos_runtime::{Error, Lab, LabConfig, LabError, Timeouts, Vm, VmSpec};
 
 mod support;
-use support::test_tempdir;
-
-fn binaries_dir() -> Option<PathBuf> {
-    std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from)
-}
-
-fn missing_prerequisite(kernel: &Path, rootfs: &Path) -> Option<String> {
-    let is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
-    if !is_root {
-        return Some("must start as root".into());
-    }
-    let Some(bin) = binaries_dir() else {
-        return Some("DYLOS_FC_BIN_DIR is not set".into());
-    };
-    for path in [
-        Path::new("/dev/kvm"),
-        &bin.join("jailer"),
-        &bin.join("firecracker"),
-        kernel,
-        rootfs,
-    ] {
-        if !path.exists() {
-            return Some(format!("{} is missing", path.display()));
-        }
-    }
-    None
-}
+use support::{check_e2e_prerequisites, test_tempdir};
 
 /// Parses global IP addresses assigned to network interfaces from `ip -o addr show`.
 fn parse_global_ips(output: &str) -> Vec<String> {
@@ -364,19 +337,14 @@ async fn verify_teardown_leaves_nothing(
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn abc_lab_ping_and_iperf3_flow_through_b_then_teardown_leaves_nothing() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-
-    if let Some(reason) = missing_prerequisite(&kernel, &image) {
-        eprintln!("SKIPPED abc_flow_e2e: {reason}");
+    let Some(prereqs) = check_e2e_prerequisites(
+        "abc_lab_ping_and_iperf3_flow_through_b_then_teardown_leaves_nothing",
+    ) else {
         return;
-    }
-
-    let bin = binaries_dir().unwrap();
+    };
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
+    let bin = prereqs.bin;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
@@ -428,19 +396,14 @@ async fn abc_lab_ping_and_iperf3_flow_through_b_then_teardown_leaves_nothing() {
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn guest_with_failed_network_marker_reports_not_ready() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-
-    if let Some(reason) = missing_prerequisite(&kernel, &image) {
-        eprintln!("SKIPPED guest_with_failed_network_marker_reports_not_ready: {reason}");
+    let Some(prereqs) =
+        check_e2e_prerequisites("guest_with_failed_network_marker_reports_not_ready")
+    else {
         return;
-    }
-
-    let bin = binaries_dir().unwrap();
+    };
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
+    let bin = prereqs.bin;
     let dir = test_tempdir();
     let mut config = JailerConfig::new(dir.path(), 65534, 65534);
     config.jailer = bin.join("jailer");
@@ -514,19 +477,14 @@ async fn guest_with_failed_network_marker_reports_not_ready() {
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn guest_with_unusable_connectivity_reports_not_ready() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-
-    if let Some(reason) = missing_prerequisite(&kernel, &image) {
-        eprintln!("SKIPPED guest_with_unusable_connectivity_reports_not_ready: {reason}");
+    let Some(prereqs) =
+        check_e2e_prerequisites("guest_with_unusable_connectivity_reports_not_ready")
+    else {
         return;
-    }
-
-    let bin = binaries_dir().unwrap();
+    };
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
+    let bin = prereqs.bin;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");

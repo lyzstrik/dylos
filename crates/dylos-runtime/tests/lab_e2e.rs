@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use dylos_core::LabSpec;
@@ -10,12 +10,16 @@ use dylos_runtime::{Lab, LabConfig, ProcessState};
 use futures_util::future::join_all;
 
 mod support;
-use support::test_tempdir;
+use support::{check_e2e_prerequisites, test_tempdir};
 
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn abc_lab_ready_then_control_socket_teardown_leaves_nothing() {
-    run_lab(false).await;
+    run_lab(
+        "abc_lab_ready_then_control_socket_teardown_leaves_nothing",
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -44,11 +48,11 @@ async fn abc_lab_terminal_sigint_is_graceful() {
 #[ignore = "subprocess helper for terminal SIGINT e2e"]
 async fn terminal_sigint_helper() {
     if std::env::var_os("DYLOS_TEST_TERMINAL_SIGINT").is_some() {
-        run_lab(true).await;
+        run_lab("abc_lab_terminal_sigint_is_graceful", true).await;
     }
 }
 
-async fn run_lab(terminal_sigint: bool) {
+async fn run_lab(test: &str, terminal_sigint: bool) {
     use nix::sys::signal::{Signal, killpg};
     use nix::unistd::{Pid, getpgid, getpgrp};
 
@@ -56,7 +60,7 @@ async fn run_lab(terminal_sigint: bool) {
     let mut interrupt =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
     let dir = test_tempdir();
-    let Some(config) = lab_config(&dir) else {
+    let Some(config) = lab_config(test, &dir) else {
         return;
     };
     let id = if terminal_sigint {
@@ -145,43 +149,18 @@ async fn run_lab(terminal_sigint: bool) {
     Lab::teardown_by_name(&config, id).await.unwrap();
 }
 
-fn lab_config(dir: &tempfile::TempDir) -> Option<LabConfig> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
-        eprintln!("SKIPPED lab_e2e: DYLOS_FC_BIN_DIR is not set");
-        return None;
-    };
-    if std::fs::metadata("/proc/self").unwrap().uid() != 0 {
-        eprintln!("SKIPPED lab_e2e: must start as root");
-        return None;
-    }
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-    for path in [
-        Path::new("/dev/kvm"),
-        &bin.join("jailer"),
-        &bin.join("firecracker"),
-        &kernel,
-        &image,
-    ] {
-        if !path.exists() {
-            eprintln!("SKIPPED lab_e2e: {} is missing", path.display());
-            return None;
-        }
-    }
+fn lab_config(test: &str, dir: &tempfile::TempDir) -> Option<LabConfig> {
+    let prereqs = check_e2e_prerequisites(test)?;
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
-    jailer.jailer = bin.join("jailer");
-    jailer.firecracker = bin.join("firecracker");
+    jailer.jailer = prereqs.bin.join("jailer");
+    jailer.firecracker = prereqs.bin.join("firecracker");
     let config = LabConfig {
         store: dylos_store::Store {
             base: dir.path().join("labs"),
-            image,
+            image: prereqs.image,
         },
         jailer,
-        kernel,
+        kernel: prereqs.kernel,
         netns_dir: dir.path().join("netns"),
         boot_timeout: Duration::from_secs(30),
         ..LabConfig::default()

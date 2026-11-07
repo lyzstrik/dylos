@@ -19,7 +19,7 @@ use futures_util::FutureExt;
 use futures_util::future::join_all;
 
 mod support;
-use support::test_tempdir;
+use support::{check_e2e_prerequisites, test_tempdir};
 
 const A_V6: &str = "fd64:796c:6f73:1::2";
 const A_V4: &str = "10.0.1.2";
@@ -282,30 +282,14 @@ async fn down(config: &LabConfig, lab: Lab) {
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn fork_ten_simultaneous_clones_independent_and_isolated() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
-        eprintln!("SKIPPED fork_e2e: DYLOS_FC_BIN_DIR missing");
+    let Some(prereqs) =
+        check_e2e_prerequisites("fork_ten_simultaneous_clones_independent_and_isolated")
+    else {
         return;
     };
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-    if std::fs::metadata("/proc/self").unwrap().uid() != 0
-        || [
-            Path::new("/dev/kvm"),
-            &kernel,
-            &image,
-            &bin.join("jailer"),
-            &bin.join("firecracker"),
-        ]
-        .iter()
-        .any(|p| !p.exists())
-    {
-        eprintln!("SKIPPED fork_e2e: requires root, KVM and built images/binaries");
-        return;
-    }
+    let bin = prereqs.bin;
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
