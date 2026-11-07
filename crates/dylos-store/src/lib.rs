@@ -610,7 +610,7 @@ impl Snapshot {
         // Captured memory is already read-only; restore its mode on every outcome.
         let permissions = file
             .metadata()
-            .map_err(|e| contextual(&self.root, e))?
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?
             .permissions();
         file.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o200))
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
