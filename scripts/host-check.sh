@@ -112,12 +112,12 @@ probe_reflink_direction() {
     local dst_file
 
     if ! src_file="$(mktemp "$src_dir/.reflink_probe_src.XXXXXX" 2>/dev/null)"; then
-        return 1
+        fail "Cannot write a probe file in $src_dir (owner: $(stat -c '%U (%u)' -- "$src_dir")). Run as the directory owner or fix ownership/write permissions; also check available space."
     fi
     PROBE_FILES+=("$src_file")
     if ! dst_file="$(mktemp "$dst_dir/.reflink_probe_dst.XXXXXX" 2>/dev/null)"; then
         rm -f "$src_file"
-        return 1
+        fail "Cannot write a probe file in $dst_dir (owner: $(stat -c '%U (%u)' -- "$dst_dir")). Run as the directory owner or fix ownership/write permissions; also check available space."
     fi
     PROBE_FILES+=("$dst_file")
 

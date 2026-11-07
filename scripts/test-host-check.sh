@@ -27,6 +27,11 @@ fi
 case "$*" in *incompatible*) exit 1 ;; esac
 exec /bin/cp "${@:2}"
 BIN
+cat > "$TEST_ROOT/bin/mktemp" <<'BIN'
+#!/usr/bin/env bash
+case "$*" in *unwritable*) exit 1 ;; esac
+exec /usr/bin/mktemp "$@"
+BIN
 chmod +x "$TEST_ROOT/bin/"*
 export PATH="$TEST_ROOT/bin:$PATH"
 export DYLOS_FC_BIN_DIR="$TEST_ROOT/bin"
@@ -69,6 +74,25 @@ touch "$TEST_ROOT/incompatible/jails/keep"
 assert_result fail 'existing jail contents preserved' 'Reflink probe failed' \
     env DYLOS_LAB_DIR="$TEST_ROOT/incompatible/store" bash "$CHECK_SCRIPT"
 test -f "$TEST_ROOT/incompatible/jails/keep"
+
+# Inject a creation denial so this also exercises the failure when run as root.
+for variable in DYLOS_LAB_DIR DYLOS_IMAGE_DIR DYLOS_JAIL_DIR; do
+    output="$(env "$variable=$TEST_ROOT/unwritable" bash "$CHECK_SCRIPT" 2>&1)" && {
+        echo "FAIL: unwritable $variable unexpectedly passed" >&2
+        exit 1
+    }
+    for pattern in "Cannot write a probe file in $TEST_ROOT/unwritable" \
+        "owner: $(stat -c '%U (%u)' -- "$TEST_ROOT/unwritable")" \
+        'Run as the directory owner or fix ownership/write permissions'; do
+        grep -Fq "$pattern" <<< "$output"
+    done
+    if grep -Eq 'Reflink probe.*(FAIL|failed)|reflink-compatible mount' <<< "$output"; then
+        echo "FAIL: unwritable $variable diagnosed as reflink incompatibility" >&2
+        exit 1
+    fi
+    assert_clean
+    echo "PASS: unwritable $variable reports ownership instead of reflink failure"
+done
 
 ln -s "$TEST_ROOT/repo/labs" "$TEST_ROOT/labs-alias"
 for variable in DYLOS_LAB_DIR DYLOS_JAIL_DIR DYLOS_IMAGE_DIR DYLOS_IMAGE; do
