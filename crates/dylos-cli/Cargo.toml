@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "dylos"
 path = "src/main.rs"
@@ -18,7 +21,7 @@ clap.workspace = true
 dylos-core = { path = "../dylos-core" }
 dylos-runtime = { path = "../dylos-runtime" }
 serde_json.workspace = true
-nix = { workspace = true, features = ["fs"] }
+nix = { workspace = true, features = ["fs", "user"] }
 tokio = { workspace = true, features = ["signal", "rt-multi-thread", "fs"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }

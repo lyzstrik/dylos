@@ -1,5 +1,7 @@
-//! Read-only operator inspection of persisted labs.
+//! Library interface for the `dylos` CLI.
 #![forbid(unsafe_code)]
+
+pub mod binaries;
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
