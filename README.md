@@ -111,7 +111,7 @@ just images
 
 ### 5. Running the reference lab
 
-Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. By default, the CLI searches for static Firecracker and jailer binaries in `~/.local/share/dylos/bin` (as described in [`docs/host.md`](docs/host.md), resolving the invoking user's home when executed under `sudo`), followed by `/usr/local/lib/dylos/bin`. You can also set `DYLOS_FC_BIN_DIR` to override this directory.
+Running a lab configures network namespaces, bridges, and TAP devices, as well as jailer chroots, which requires root privileges. By default, the CLI searches for static Firecracker and jailer binaries in order: `~<SUDO_USER>/.local/share/dylos/bin` (when executed under `sudo` with consistent identity), `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin` (as described in [`docs/host.md`](docs/host.md)). You can also set `DYLOS_FC_BIN_DIR` to override this directory.
 
 Run with `sudo -E` if using user-installed Cargo or custom environment variables. Invoking the compiled binary directly is preferred because sudoers `secure_path` can override `PATH` and hide user-installed `cargo`:
 
@@ -152,7 +152,7 @@ sudo -E cargo run --release -p dylos-cli -- lab down abc
   ```text
   Failed to exec into Firecracker: No such file or directory
   ```
-  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md). The CLI automatically looks for these binaries in `~/.local/share/dylos/bin` (including under `sudo`) and `/usr/local/lib/dylos/bin`, or you can point directly to them by setting `DYLOS_FC_BIN_DIR`.
+  your Firecracker binary is dynamically linked. The jailer executes Firecracker inside a minimal, empty chroot jail lacking host shared libraries and the dynamic loader. Use the statically linked (`static-pie`) release binaries described in [`docs/host.md`](docs/host.md). The CLI automatically looks for these binaries in candidate search order (`~<SUDO_USER>/.local/share/dylos/bin` under `sudo`, `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin`), or you can point directly to them by setting `DYLOS_FC_BIN_DIR`.
 
 - **Cross-device link errors (`EXDEV`)**:
   If reflink preflight fails, your rootfs image, lab store directory, or jail directory reside on different filesystem mounts. Ensure they are colocated on the same reflink-capable filesystem mount (or configure `DYLOS_LAB_DIR` and `DYLOS_JAIL_DIR` to point to that mount).

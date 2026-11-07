@@ -72,7 +72,7 @@ fn pin_control_socket(base: &Path, id: &str) -> std::io::Result<File> {
     name = "dylos",
     version,
     about = "Engine for reproducible microVM lab networks",
-    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries (defaults to ~/.local/share/dylos/bin or /usr/local/lib/dylos/bin)\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
+    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries (defaults to search order: ~/.local/share/dylos/bin [resolving SUDO_USER under sudo], $HOME/.local/share/dylos/bin, /usr/local/lib/dylos/bin, /opt/dylos/bin)\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
 )]
 struct Cli {
     #[command(subcommand)]

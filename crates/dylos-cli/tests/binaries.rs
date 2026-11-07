@@ -5,8 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use dylos_cli::{
-    SecurityContext, candidate_search_dirs_with, check_binary_security, check_dir_security,
-    resolve_firecracker_binaries_with, validate_binary_path,
+    PasswdUser, SecurityContext, candidate_search_dirs_with, check_binary_security,
+    check_dir_security, resolve_firecracker_binaries_with, resolve_sudo_identity_with,
+    validate_binary_path,
 };
 
 fn test_temp_dir() -> tempfile::TempDir {
@@ -28,13 +29,29 @@ fn current_security_context() -> SecurityContext {
     }
 }
 
+fn fake_passwd_lookup(name: &str) -> Option<PasswdUser> {
+    if name == "alice" {
+        Some(PasswdUser {
+            name: "alice".into(),
+            uid: 1001,
+            gid: 1001,
+            dir: PathBuf::from("/home/alice"),
+        })
+    } else {
+        None
+    }
+}
+
 #[test]
 fn candidate_search_dirs_order_under_sudo() {
-    let dirs = candidate_search_dirs_with(Some("lyzi"), Some(Path::new("/root")));
+    let dirs = candidate_search_dirs_with(
+        Some(Path::new("/home/invoking_user")),
+        Some(Path::new("/root")),
+    );
     assert_eq!(
         dirs,
         vec![
-            PathBuf::from("/home/lyzi/.local/share/dylos/bin"),
+            PathBuf::from("/home/invoking_user/.local/share/dylos/bin"),
             PathBuf::from("/root/.local/share/dylos/bin"),
             PathBuf::from("/usr/local/lib/dylos/bin"),
             PathBuf::from("/opt/dylos/bin"),
@@ -44,11 +61,11 @@ fn candidate_search_dirs_order_under_sudo() {
 
 #[test]
 fn candidate_search_dirs_order_without_sudo() {
-    let dirs = candidate_search_dirs_with(None, Some(Path::new("/home/lyzi")));
+    let dirs = candidate_search_dirs_with(None, Some(Path::new("/home/user")));
     assert_eq!(
         dirs,
         vec![
-            PathBuf::from("/home/lyzi/.local/share/dylos/bin"),
+            PathBuf::from("/home/user/.local/share/dylos/bin"),
             PathBuf::from("/usr/local/lib/dylos/bin"),
             PathBuf::from("/opt/dylos/bin"),
         ]
@@ -57,15 +74,142 @@ fn candidate_search_dirs_order_without_sudo() {
 
 #[test]
 fn candidate_search_dirs_deduplicate() {
-    let dirs = candidate_search_dirs_with(Some("lyzi"), Some(Path::new("/home/lyzi")));
+    let dirs =
+        candidate_search_dirs_with(Some(Path::new("/home/user")), Some(Path::new("/home/user")));
     assert_eq!(
         dirs,
         vec![
-            PathBuf::from("/home/lyzi/.local/share/dylos/bin"),
+            PathBuf::from("/home/user/.local/share/dylos/bin"),
             PathBuf::from("/usr/local/lib/dylos/bin"),
             PathBuf::from("/opt/dylos/bin"),
         ]
     );
+}
+
+#[test]
+fn sudo_identity_resolves_when_consistent() {
+    let user = resolve_sudo_identity_with(
+        0,
+        Some("alice"),
+        Some("1001"),
+        Some("1001"),
+        fake_passwd_lookup,
+    );
+    assert_eq!(
+        user,
+        Some(PasswdUser {
+            name: "alice".into(),
+            uid: 1001,
+            gid: 1001,
+            dir: PathBuf::from("/home/alice"),
+        })
+    );
+}
+
+#[test]
+fn sudo_identity_resolves_when_sudo_gid_absent() {
+    let user = resolve_sudo_identity_with(0, Some("alice"), Some("1001"), None, fake_passwd_lookup);
+    assert_eq!(
+        user,
+        Some(PasswdUser {
+            name: "alice".into(),
+            uid: 1001,
+            gid: 1001,
+            dir: PathBuf::from("/home/alice"),
+        })
+    );
+}
+
+#[test]
+fn sudo_identity_rejected_when_process_not_root() {
+    let user = resolve_sudo_identity_with(
+        1001,
+        Some("alice"),
+        Some("1001"),
+        Some("1001"),
+        fake_passwd_lookup,
+    );
+    assert_eq!(user, None);
+}
+
+#[test]
+fn sudo_identity_rejected_when_user_unknown() {
+    let user = resolve_sudo_identity_with(
+        0,
+        Some("unknown_user"),
+        Some("1001"),
+        None,
+        fake_passwd_lookup,
+    );
+    assert_eq!(user, None);
+}
+
+#[test]
+fn sudo_identity_rejected_when_uid_mismatched() {
+    let user = resolve_sudo_identity_with(
+        0,
+        Some("alice"),
+        Some("9999"), // does not match passwd uid 1001
+        None,
+        fake_passwd_lookup,
+    );
+    assert_eq!(user, None);
+}
+
+#[test]
+fn sudo_identity_rejected_when_uid_unparsable() {
+    let user = resolve_sudo_identity_with(
+        0,
+        Some("alice"),
+        Some("not_a_number"),
+        None,
+        fake_passwd_lookup,
+    );
+    assert_eq!(user, None);
+}
+
+#[test]
+fn sudo_identity_rejected_when_gid_mismatched() {
+    let user = resolve_sudo_identity_with(
+        0,
+        Some("alice"),
+        Some("1001"),
+        Some("9999"), // does not match passwd gid 1001
+        fake_passwd_lookup,
+    );
+    assert_eq!(user, None);
+}
+
+#[test]
+fn security_context_from_resolved_trusts_root_only_on_inconsistent_identity() {
+    let ctx = SecurityContext::from_resolved(0, 0, None);
+    assert_eq!(ctx.orchestrator_uid, 0);
+    assert_eq!(ctx.invoking_uid, 0);
+}
+
+#[test]
+fn security_context_from_resolved_trusts_invoking_uid_when_consistent() {
+    let user = PasswdUser {
+        name: "alice".into(),
+        uid: 1001,
+        gid: 1001,
+        dir: PathBuf::from("/home/alice"),
+    };
+    let ctx = SecurityContext::from_resolved(0, 0, Some(&user));
+    assert_eq!(ctx.orchestrator_uid, 0);
+    assert_eq!(ctx.invoking_uid, 1001);
+}
+
+#[test]
+fn system_passwd_lookup_succeeds_for_current_user() {
+    let current_uid = nix::unistd::geteuid();
+    if let Ok(Some(current_user)) = nix::unistd::User::from_uid(current_uid) {
+        let looked_up = PasswdUser::from_system(&current_user.name);
+        assert!(looked_up.is_some());
+        let looked_up = looked_up.unwrap();
+        assert_eq!(looked_up.name, current_user.name);
+        assert_eq!(looked_up.uid, current_user.uid.as_raw());
+    }
 }
 
 #[test]
@@ -92,6 +236,60 @@ fn env_var_overrides_everything() {
     assert_eq!(resolved.bin_dir, override_dir);
     assert_eq!(resolved.firecracker, override_dir.join("firecracker"));
     assert_eq!(resolved.jailer, override_dir.join("jailer"));
+}
+
+#[test]
+fn explicit_override_fails_and_never_falls_back() {
+    let temp = test_temp_dir();
+    let bad_override = temp.path().join("bad_override");
+    fs::create_dir(&bad_override).unwrap();
+    make_executable(&bad_override.join("firecracker"));
+
+    let candidate_dir = temp.path().join("candidate");
+    fs::create_dir(&candidate_dir).unwrap();
+    make_executable(&candidate_dir.join("firecracker"));
+    make_executable(&candidate_dir.join("jailer"));
+
+    let ctx = current_security_context();
+    let err = resolve_firecracker_binaries_with(
+        Some(&bad_override),
+        &ctx,
+        std::slice::from_ref(&candidate_dir),
+    )
+    .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
+    assert!(
+        msg.contains("Both 'firecracker' and 'jailer' are required"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn explicit_override_insecure_fails_and_never_falls_back() {
+    let temp = test_temp_dir();
+    let insecure_override = temp.path().join("insecure_override");
+    fs::create_dir(&insecure_override).unwrap();
+    fs::set_permissions(&insecure_override, fs::Permissions::from_mode(0o777)).unwrap();
+    make_executable(&insecure_override.join("firecracker"));
+    make_executable(&insecure_override.join("jailer"));
+
+    let candidate_dir = temp.path().join("candidate");
+    fs::create_dir(&candidate_dir).unwrap();
+    make_executable(&candidate_dir.join("firecracker"));
+    make_executable(&candidate_dir.join("jailer"));
+
+    let ctx = current_security_context();
+    let err = resolve_firecracker_binaries_with(
+        Some(&insecure_override),
+        &ctx,
+        std::slice::from_ref(&candidate_dir),
+    )
+    .unwrap_err();
+
+    let msg = err.to_string();
+    assert!(msg.contains("world-writable"), "{msg}");
 }
 
 #[test]
@@ -225,22 +423,41 @@ fn permission_check_rejects_untrusted_parent_directory_owner() {
 }
 
 #[test]
-fn permission_check_rejects_group_writable_by_untrusted_gid() {
+fn permission_check_rejects_group_writable_binary_even_if_group_matches_invoking_gid() {
+    let temp = test_temp_dir();
+    let bin = temp.path().join("firecracker");
+    make_executable(&bin);
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o775)).unwrap();
+
+    let real_gid = nix::unistd::getegid().as_raw();
+    let ctx = SecurityContext {
+        orchestrator_uid: 0,
+        invoking_uid: nix::unistd::geteuid().as_raw(),
+        invoking_gid: real_gid, // matches the file's gid!
+    };
+    if real_gid != 0 {
+        let err = check_binary_security(&bin, &ctx).unwrap_err();
+        assert!(err.to_string().contains("group-writable"), "{err}");
+    }
+}
+
+#[test]
+fn permission_check_rejects_group_writable_parent_directory() {
     let temp = test_temp_dir();
     let sub_dir = temp.path().join("grp_dir");
     fs::create_dir(&sub_dir).unwrap();
     fs::set_permissions(&sub_dir, fs::Permissions::from_mode(0o775)).unwrap();
 
+    let real_gid = nix::unistd::getegid().as_raw();
     let ctx = SecurityContext {
-        orchestrator_uid: nix::unistd::geteuid().as_raw(),
+        orchestrator_uid: 0,
         invoking_uid: nix::unistd::geteuid().as_raw(),
-        invoking_gid: 99999, // different from real file gid
+        invoking_gid: real_gid,
     };
-    let err = check_dir_security(&sub_dir, &ctx).unwrap_err();
-    assert!(
-        err.to_string().contains("group-writable by untrusted gid"),
-        "{err}"
-    );
+    if real_gid != 0 {
+        let err = check_dir_security(&sub_dir, &ctx).unwrap_err();
+        assert!(err.to_string().contains("group-writable"), "{err}");
+    }
 }
 
 #[test]
@@ -270,6 +487,26 @@ fn permission_check_rejects_untrusted_symlink() {
             .contains("only trusts root (uid 0) and invoking owner"),
         "{err}"
     );
+}
+
+#[test]
+fn symlink_target_in_insecure_parent_is_rejected() {
+    let temp = test_temp_dir();
+    let bad_parent = temp.path().join("bad_parent_dir");
+    fs::create_dir(&bad_parent).unwrap();
+    fs::set_permissions(&bad_parent, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let target = bad_parent.join("firecracker");
+    make_executable(&target);
+
+    let link_dir = temp.path().join("safe_dir");
+    fs::create_dir(&link_dir).unwrap();
+    let link = link_dir.join("firecracker");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let ctx = current_security_context();
+    let err = validate_binary_path(&link, &ctx).unwrap_err();
+    assert!(err.to_string().contains("world-writable"), "{err}");
 }
 
 #[test]

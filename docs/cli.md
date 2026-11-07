@@ -16,7 +16,7 @@ target/release/dylos lab <subcommand> [options]
 
 ### Privileges
 
-Operating network namespaces, TAP devices, and Firecracker jailer chroots requires root privileges on the host. By default, Dylos looks for static Firecracker and jailer binaries in `~/.local/share/dylos/bin` (resolving the invoking user's home under `sudo`), as well as `/usr/local/lib/dylos/bin`. You can override the directory with `DYLOS_FC_BIN_DIR`. Run with `sudo -E`:
+Operating network namespaces, TAP devices, and Firecracker jailer chroots requires root privileges on the host. By default, Dylos searches for static Firecracker and jailer binaries in order: `~<SUDO_USER>/.local/share/dylos/bin` (under `sudo`), `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin`. You can override the directory with `DYLOS_FC_BIN_DIR`. Run with `sudo -E`:
 
 ```bash
 sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
@@ -30,7 +30,7 @@ sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
 1. **Guest kernel**: Pinned kernel image located at `kernels/vmlinux.bin` (see [docs/host.md](host.md)).
 2. **Rootfs image**: Built using `just images`, defaulting to `target/images/rootfs.ext4`. Reflink-cloned for each VM.
 3. **Reflink storage**: Rootfs image, lab storage directory, and jail directory must reside on the same filesystem mount supporting reflink copies (`ioctl_ficlone` on btrfs or XFS with reflink enabled).
-4. **Firecracker & jailer**: Statically linked upstream binaries (defaults to `~/.local/share/dylos/bin` per [docs/host.md](host.md), resolving the invoking user's home under `sudo`, followed by `/usr/local/lib/dylos/bin`; no PATH lookup). Override with `DYLOS_FC_BIN_DIR`.
+4. **Firecracker & jailer**: Statically linked upstream binaries (defaults to search order: `~<SUDO_USER>/.local/share/dylos/bin` under `sudo`, `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin` per [docs/host.md](host.md); no PATH lookup). Override with `DYLOS_FC_BIN_DIR`.
 
 > [!CAUTION]
 > **Dynamic binaries fail inside chroots:** Distro packages (e.g. Arch Linux) dynamically link glibc. When the jailer copies Firecracker into an isolated chroot without dynamic libraries, execution fails with `Failed to exec into Firecracker: No such file or directory`. Use pinned static binaries from [docs/host.md](host.md).
@@ -251,7 +251,7 @@ Exits with `0` when cleanly stopped. Exits with `2` on argument parsing errors (
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `DYLOS_FC_BIN_DIR` | Directory containing static `firecracker` and `jailer` binaries. Link to [docs/host.md](host.md). | `~/.local/share/dylos/bin` (resolves `SUDO_USER` under `sudo`), `/usr/local/lib/dylos/bin` (no PATH lookup) |
+| `DYLOS_FC_BIN_DIR` | Directory containing static `firecracker` and `jailer` binaries. Link to [docs/host.md](host.md). | `~<SUDO_USER>/.local/share/dylos/bin` (under `sudo`), `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, `/opt/dylos/bin` (no PATH lookup) |
 | `DYLOS_LAB_DIR` | Base directory for lab state storage, per-VM disks, and snapshots (`<base>/snapshots/...`). | `target/labs` |
 | `DYLOS_JAIL_DIR` | Base directory for Firecracker jailer chroots. Must be on same mount as `DYLOS_LAB_DIR` and images. Short paths keep Unix domain sockets under 108 bytes. | Sibling `jails` alongside lab store (e.g. `target/jails`) |
 | `DYLOS_TEARDOWN_TIMEOUT_MS` | Timeout in milliseconds when waiting for supervisor teardown over `control.sock`. | `30000` (30 seconds) |
