@@ -23,6 +23,7 @@ check:
     just doc
     just test
     just test-selection-check
+    just host-check-test
     just deny
     just agent-check
     just ci-lint
@@ -75,6 +76,10 @@ test-selection-check:
             exit 1
         fi
     done
+
+# Test host-check with private fixtures and fake host prerequisites
+host-check-test:
+    ./scripts/test-host-check.sh
 
 # Verify host prerequisites (KVM, Firecracker, reflink)
 host-check:
