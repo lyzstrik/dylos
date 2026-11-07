@@ -16,8 +16,30 @@ jobs:
   check:
     name: Check
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
+      - name: Enable unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Set up reflink-capable lab storage
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE"
+          if ! command -v mkfs.xfs >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y xfsprogs
+          fi
+          sudo truncate -s 10G /mnt/dylos-xfs.img
+          sudo mkfs.xfs -m reflink=1 /mnt/dylos-xfs.img
+          sudo mount -o loop /mnt/dylos-xfs.img "$GITHUB_WORKSPACE"
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
+
+          # Verify reflink support on the mounted workspace
+          TMP_SRC=$(mktemp "$GITHUB_WORKSPACE/reflink_test_src.XXXXXX")
+          TMP_DST=$(mktemp -u "$GITHUB_WORKSPACE/reflink_test_dst.XXXXXX")
+          echo "test-reflink" > "$TMP_SRC"
+          cp --reflink=always "$TMP_SRC" "$TMP_DST"
+          rm -f "$TMP_SRC" "$TMP_DST"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -47,7 +69,13 @@ jobs:
           echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
 
       - name: Run checks
-        run: just check
+        run: |
+          set -o pipefail
+          env "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" just check 2>&1 | tee check.log
+          if grep -q "SKIPPED" check.log; then
+            echo "::error::A test was skipped for missing prerequisites" >&2
+            exit 1
+          fi
 
   fuzz-check:
     name: Fuzz check

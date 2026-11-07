@@ -343,13 +343,13 @@ struct Run {
     sections: Vec<String>,
 }
 
-fn can_unshare() -> bool {
+fn can_unshare(test: &str) -> bool {
     let ok = Command::new("unshare")
         .args(["-Urn", "true"])
         .output()
         .is_ok_and(|o| o.status.success());
     if !ok {
-        eprintln!("SKIPPED: unprivileged user+net namespaces unavailable");
+        eprintln!("SKIPPED {test}: unprivileged user+net namespaces unavailable");
     }
     ok
 }
@@ -478,7 +478,7 @@ const SYSCTL_KEYS: [&str; 6] = [
 
 #[test]
 fn script_configures_each_abc_node_with_exactly_the_declared_addresses() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_configures_each_abc_node_with_exactly_the_declared_addresses") {
         return Ok(());
     }
     let lab = abc()?;
@@ -520,7 +520,7 @@ fn script_configures_each_abc_node_with_exactly_the_declared_addresses() -> Test
 
 #[test]
 fn script_matches_interfaces_by_mac_not_by_enumeration_order() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_matches_interfaces_by_mac_not_by_enumeration_order") {
         return Ok(());
     }
     let lab = abc()?;
@@ -544,7 +544,7 @@ fn script_matches_interfaces_by_mac_not_by_enumeration_order() -> TestResult {
 
 #[test]
 fn script_static_ipv6_has_no_dad_and_link_local_is_eui64() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_static_ipv6_has_no_dad_and_link_local_is_eui64") {
         return Ok(());
     }
     let lab = abc()?;
@@ -576,7 +576,7 @@ fn script_static_ipv6_has_no_dad_and_link_local_is_eui64() -> TestResult {
 
 #[test]
 fn script_installs_exactly_the_declared_gateway_routes_per_family() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_installs_exactly_the_declared_gateway_routes_per_family") {
         return Ok(());
     }
     let lab = abc()?;
@@ -619,7 +619,7 @@ fn script_installs_exactly_the_declared_gateway_routes_per_family() -> TestResul
 
 #[test]
 fn script_forwarding_follows_the_fwd_flag_for_both_families() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_forwarding_follows_the_fwd_flag_for_both_families") {
         return Ok(());
     }
     let lab = abc()?;
@@ -643,7 +643,7 @@ fn script_forwarding_follows_the_fwd_flag_for_both_families() -> TestResult {
 
 #[test]
 fn script_handles_ipv6_only_interface_without_touching_ipv4() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_handles_ipv6_only_interface_without_touching_ipv4") {
         return Ok(());
     }
     let mac = "02:aa:bb:cc:dd:01";
@@ -659,7 +659,7 @@ fn script_handles_ipv6_only_interface_without_touching_ipv4() -> TestResult {
 
 #[test]
 fn script_ignores_foreign_arguments_and_trailing_newline() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_ignores_foreign_arguments_and_trailing_newline") {
         return Ok(());
     }
     let lab = abc()?;
@@ -681,7 +681,7 @@ fn script_ignores_foreign_arguments_and_trailing_newline() -> TestResult {
 
 #[test]
 fn script_fails_when_no_interface_has_the_declared_mac() -> TestResult {
-    if !can_unshare() {
+    if !can_unshare("script_fails_when_no_interface_has_the_declared_mac") {
         return Ok(());
     }
     let cmdline = "dylos.if=eth0,02:00:00:00:00:99,fd00:1::5/64,10.0.0.5/24";
