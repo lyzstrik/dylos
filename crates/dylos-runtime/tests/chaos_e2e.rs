@@ -5,6 +5,44 @@ use futures_util::FutureExt;
 use std::time::Duration;
 mod support;
 
+async fn connected(lab: &Lab, family: &str, address: &str) {
+    let ready = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let output = lab
+                .exec(
+                    "A",
+                    &format!("ping {family} -c 1 -W 2 {address}"),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            if output.success() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    if ready.is_err() {
+        for node in ["A", "B", "C"] {
+            let output = lab
+                .exec(
+                    node,
+                    "ip -6 neigh; ip -4 neigh; ip -s link; ip -6 route; ip -4 route",
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            eprintln!("{} {node}: {output:?}", lab.id());
+        }
+    }
+    assert!(
+        ready.is_ok(),
+        "{} {family}: connectivity never became ready",
+        lab.id()
+    );
+}
+
 async fn rtt(lab: &Lab, family: &str, address: &str) -> f64 {
     let output = lab
         .exec(
@@ -14,7 +52,7 @@ async fn rtt(lab: &Lab, family: &str, address: &str) -> f64 {
         )
         .await
         .unwrap();
-    assert!(output.success(), "{output:?}");
+    assert!(output.success(), "{} {family}: {output:?}", lab.id());
     let summary = output
         .stdout
         .lines()
@@ -76,6 +114,10 @@ async fn fork_chaos_delays_only_selected_clone_dual_stack() {
         .unwrap();
         // A -> B -> C -> B -> A crosses four shaped TAP egress queues.
         for (family, address) in [("-6", "fd64:796c:6f73:2::2"), ("-4", "10.0.2.2")] {
+            // Restored neighbor transitions are independent of the netem delay under test.
+            for clone in &clones {
+                connected(clone, family, address).await;
+            }
             let control = rtt(&clones[1], family, address).await;
             let slow = rtt(&clones[0], family, address).await;
             eprintln!("CHAOS {family}: control={control}ms slow={slow}ms");
@@ -90,6 +132,7 @@ async fn fork_chaos_delays_only_selected_clone_dual_stack() {
         }
         // Freeze/thaw preserves the independent netem qdiscs.
         clones[0].snapshot("shaped").await.unwrap();
+        connected(&clones[0], "-6", "fd64:796c:6f73:2::2").await;
         assert!(rtt(&clones[0], "-6", "fd64:796c:6f73:2::2").await >= 150.0);
     })
     .catch_unwind()
