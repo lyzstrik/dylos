@@ -53,12 +53,15 @@ jobs:
             sudo apt-get update && sudo apt-get install -y btrfs-progs fsverity
           fi
           sudo truncate -s 10G /mnt/dylos-btrfs.img
-          sudo mkfs.btrfs -f /mnt/dylos-btrfs.img
-          sudo mount -o loop,compress=zstd:3 /mnt/dylos-btrfs.img "$GITHUB_WORKSPACE"
+          # Direct I/O on the loop device eliminates the host page cache layer (LYZ-122).
+          # In CI, loop-backed btrfs double-caches guest memory writes into the host ext4
+          # page cache, triggering synchronous writeback stalls (balance_dirty_pages_ratelimited).
+          # Bypassing the host page cache keeps 5-VM snapshot pause well below the 1 s bound
+          # without modifying host kernel dirty ratios.
+          LOOP_DEV=$(sudo losetup --find --show --direct-io=on /mnt/dylos-btrfs.img)
+          sudo mkfs.btrfs -f "$LOOP_DEV"
+          sudo mount -o compress=zstd:3 "$LOOP_DEV" "$GITHUB_WORKSPACE"
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
-
-          sudo sysctl -w vm.dirty_ratio=50
-          sudo sysctl -w vm.dirty_background_ratio=20
 
           # Verify reflink support on the mounted workspace
           TMP_SRC=$(mktemp "$GITHUB_WORKSPACE/reflink_test_src.XXXXXX")
