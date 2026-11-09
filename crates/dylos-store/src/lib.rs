@@ -1171,14 +1171,21 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
     dest.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let zeros = vec![0u8; buffer.len()];
+    let started = Instant::now();
+    let mut read_time = std::time::Duration::ZERO;
+    let mut write_time = std::time::Duration::ZERO;
+    let mut written = 0usize;
+    let mut runs = 0usize;
     let mut copied = 0u64;
     loop {
+        let started_read = Instant::now();
         let n = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
+        read_time += started_read.elapsed();
         copied = copied
             .checked_add(n as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "copy size overflow"))?;
@@ -1198,16 +1205,36 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
             if page != &zeros[..page.len()] {
                 run_start.get_or_insert(offset);
             } else if let Some(start) = run_start.take() {
+                let started_write = Instant::now();
                 dest.seek(SeekFrom::Start(copied - n as u64 + start as u64))?;
                 dest.write_all(&buffer[start..offset])?;
+                write_time += started_write.elapsed();
+                written += offset - start;
+                runs += 1;
             }
         }
         if let Some(start) = run_start {
+            let started_write = Instant::now();
             dest.seek(SeekFrom::Start(copied - n as u64 + start as u64))?;
             dest.write_all(&buffer[start..n])?;
+            write_time += started_write.elapsed();
+            written += n - start;
+            runs += 1;
         }
     }
     dest.set_len(copied)?;
+    tracing::info!(
+        copied,
+        written,
+        runs,
+        read_ms = read_time.as_millis(),
+        write_ms = write_time.as_millis(),
+        scan_ms = started
+            .elapsed()
+            .saturating_sub(read_time + write_time)
+            .as_millis(),
+        "bounded copy timing"
+    );
     Ok(())
 }
 
