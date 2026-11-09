@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use dylos_core::LabSpec;
+use dylos_runtime::jailer::{JailPaths, JailerConfig};
 use dylos_runtime::{LabError, MAX_UNIX_SOCKET_PATH};
 use xtask::bench::{
     BenchOptions, BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
-    SnapshotStages, cleanup_private_bench_dir, lab_failure, longest_bench_socket_path,
-    parse_bench_args, percentile, render_markdown_report, run_in_private_dir,
-    select_default_bench_parent, select_default_bench_parent_with_tmp, settle_pss,
-    setup_private_bench_dir, validate_bench_socket_path,
+    SnapshotStages, cleanup_private_bench_dir, is_writable_dir, lab_failure,
+    longest_bench_socket_path, parse_bench_args, percentile, render_markdown_report,
+    run_in_private_dir, select_default_bench_parent, settle_pss, setup_private_bench_dir,
+    validate_bench_socket_path,
 };
 
 fn samples(values: &[f64]) -> MetricSamples {
@@ -770,9 +771,7 @@ fn default_parent_selection_handles_deep_workspace_and_cross_fs_fallback() {
         "target/b on deep checkout must exceed socket path limit"
     );
 
-    // Pass /proc as tmp_dir to force skipping non-workspace filesystem mounts
-    let parent =
-        select_default_bench_parent_with_tmp(&deep_ws, &options, &spec, fc_bin, Path::new("/proc"));
+    let parent = select_default_bench_parent(&deep_ws, &options, &spec, fc_bin);
 
     let child = setup_private_bench_dir(&parent).unwrap();
     let deep_dev = fs::metadata(&deep_ws).unwrap().dev();
@@ -829,34 +828,7 @@ fn longest_bench_socket_path_computes_largest_fork_count_and_longest_vm_name() {
         fork_counts: vec![1, 10, 25],
         ..BenchOptions::default()
     };
-    let spec = LabSpec::from_yaml_str(
-        r"
-segments:
-  - name: lan
-    ipv6: fd64:796c:6f73:1::/64
-    ipv4: 10.0.1.0/24
-nodes:
-  - name: short
-    image: alpine
-    vcpus: 1
-    memory: 256
-    interfaces:
-      - name: eth0
-        segment: lan
-        ipv6: fd64:796c:6f73:1::1/64
-        ipv4: 10.0.1.1/24
-  - name: very-long-node-identifier
-    image: alpine
-    vcpus: 1
-    memory: 256
-    interfaces:
-      - name: eth0
-        segment: lan
-        ipv6: fd64:796c:6f73:1::2/64
-        ipv4: 10.0.1.2/24
-",
-    )
-    .unwrap();
+    let spec = LabSpec::from_yaml_str(include_str!("fixtures/long_node_bench_lab.yaml")).unwrap();
     let fc_bin = Path::new("/opt/bin/firecracker-custom");
 
     let longest = longest_bench_socket_path(run_dir, &options, &spec, fc_bin);
@@ -867,8 +839,8 @@ nodes:
         "must use fc_bin exec name: {s}"
     );
     assert!(
-        s.contains("f-n25-r7-c25"),
-        "must choose largest fork count and repetition: {s}"
+        s.contains("lab12-f-n25-r7-c25"),
+        "must include length-prefixed largest clone identifier: {s}"
     );
     assert!(
         s.contains("very-long-node-identifier"),
@@ -902,4 +874,86 @@ fn tmp_dir_override_keeps_working_and_is_validated() {
 
     cleanup_private_bench_dir(&child).unwrap();
     fs::remove_dir_all(&custom).unwrap();
+}
+
+#[test]
+fn socket_preflight_matches_runtime_jail_paths_naming() {
+    let run_dir = Path::new("/tmp/test-run");
+    let options = BenchOptions {
+        repetitions: 20,
+        fork_counts: vec![1, 10, 20],
+        ..BenchOptions::default()
+    };
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let preflight = longest_bench_socket_path(run_dir, &options, &spec, fc_bin);
+
+    let mut jailer = JailerConfig::new(run_dir.join("j"), 0, 0);
+    jailer.firecracker = fc_bin.to_path_buf();
+    let runtime_paths = JailPaths::for_lab_node(&jailer, "f-n20-r20-c20", "node5").unwrap();
+
+    assert_eq!(preflight, runtime_paths.api_socket());
+    assert!(
+        preflight
+            .to_str()
+            .unwrap()
+            .contains("lab13-f-n20-r20-c20-node5"),
+        "preflight must contain the runtime's length-prefixed lab identity: {}",
+        preflight.display()
+    );
+}
+
+#[test]
+fn writability_probe_refuses_preexisting_file_and_preserves_content() {
+    let dir = scratch("probe-regular");
+    let target = dir.join("important.txt");
+    fs::write(&target, b"precious data").unwrap();
+
+    assert!(is_writable_dir(&dir).unwrap());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert_eq!(fs::read(&target).unwrap(), b"precious data");
+
+    let link = dir.join("link_to_target");
+    symlink(&target, &link).unwrap();
+    assert!(!is_writable_dir(&link).unwrap());
+    assert_eq!(fs::read(&target).unwrap(), b"precious data");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn writability_probe_in_read_only_dir_fails_safely_without_leftover() {
+    let dir = scratch("probe-ro");
+    let sentinel = dir.join("keep.txt");
+    fs::write(&sentinel, b"safe").unwrap();
+
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&dir, perms.clone()).unwrap();
+
+    let result = is_writable_dir(&dir).unwrap();
+    assert!(!result, "read-only directory must not be writable");
+
+    perms.set_mode(0o700);
+    fs::set_permissions(&dir, perms).unwrap();
+    assert_eq!(fs::read(&sentinel).unwrap(), b"safe");
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn oversized_socket_path_fails_before_measurements_at_orchestration_boundary() {
+    let parent = scratch("orchestration-oversized");
+    let long_child = parent.join("p".repeat(70));
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let err = validate_bench_socket_path(&long_child, &options, &spec, fc_bin).unwrap_err();
+    assert!(err.to_string().contains("exceeds limit of 107 bytes"));
+    assert_eq!(run_dirs(&parent), Vec::<PathBuf>::new());
+
+    fs::remove_dir_all(&parent).unwrap();
 }
