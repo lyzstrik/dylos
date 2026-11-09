@@ -1242,6 +1242,44 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
     Ok((sha256, total_size))
 }
 
+/// Reserves the temporary memory output before freeze, owned like the VM jail.
+/// The snapshot operation must unlink `snap.mem` on success or recovery.
+/// # Errors
+/// Rejects existing outputs and reports allocation/ownership errors after removing partial output.
+pub fn preallocate_snapshot_memory(root: &Path, size: u64) -> Result<(), Error> {
+    let path = root.join("snap.mem");
+    let length =
+        i64::try_from(size).map_err(|_| contextual(&path, io::ErrorKind::InvalidInput.into()))?;
+    let dir = directory(root, false).map_err(|e| contextual(root, e))?;
+    let file = open(
+        &dir,
+        "snap.mem".as_ref(),
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+    )
+    .map_err(|e| contextual(&path, e))?;
+    let allocate = || -> io::Result<()> {
+        let owner = dir.metadata()?;
+        let meta = file.metadata()?;
+        if meta.uid() != owner.uid() || meta.gid() != owner.gid() {
+            nix::unistd::fchown(
+                &file,
+                Some(nix::unistd::Uid::from_raw(owner.uid())),
+                Some(nix::unistd::Gid::from_raw(owner.gid())),
+            )?;
+        }
+        // Firecracker truncates an existing output to zero when its size differs
+        // from guest RAM. KEEP_SIZE would therefore discard the reservation.
+        nix::fcntl::fallocate(&file, nix::fcntl::FallocateFlags::empty(), 0, length)?;
+        Ok(())
+    };
+    allocate().map_err(|e| {
+        contextual(
+            &path,
+            with_cleanup(e, cleanup_dest(&dir, "snap.mem", &path)),
+        )
+    })
+}
+
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {
     let size = read_sparse_bounded(source, max_bytes, |offset, bytes| {
         dest.seek(SeekFrom::Start(offset))?;

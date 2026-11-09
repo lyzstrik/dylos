@@ -1588,3 +1588,23 @@ async fn completed_vm_capture_does_not_wait_for_another_snapshot_api() {
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
+
+#[tokio::test]
+async fn memory_reservation_failure_precedes_pause_and_cleans_all_outputs() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("reserve-fail").await;
+    for vm in &lab.vms {
+        fs::write(vm.paths().root.join("stall-pause"), b"").unwrap();
+    }
+    fs::write(lab.vms[1].paths().root.join("snap.mem"), b"existing").unwrap();
+    assert!(lab.snapshot("snap").await.is_err());
+    for vm in &lab.vms {
+        assert!(!vm.paths().root.join("pause-started").exists());
+        assert!(!vm.paths().root.join("is-paused").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
+    }
+    assert!(!store.snapshot_dir("reserve-fail", ".staging-snap").exists());
+    assert!(!store.snapshot_dir("reserve-fail", "snap").exists());
+    lab.teardown().await.unwrap();
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
