@@ -610,6 +610,7 @@ impl Snapshot {
     /// Rejects missing files and changes in captured size.
     pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
         let opener = SnapshotOpener {
+            root: self.root.clone(),
             base: self
                 .directory
                 .try_clone()
@@ -1444,6 +1445,7 @@ impl SharedBacking {
 /// descriptors rather than reopening joined paths after verification.
 pub struct SnapshotOpener {
     base: File,
+    root: PathBuf,
 }
 
 impl SnapshotOpener {
@@ -1453,7 +1455,10 @@ impl SnapshotOpener {
     /// Returns an error if the path cannot be opened safely.
     pub fn new(path: &Path) -> io::Result<Self> {
         let base = directory(path, false)?;
-        Ok(Self { base })
+        Ok(Self {
+            base,
+            root: path.to_path_buf(),
+        })
     }
 
     /// Opens a file relative to the snapshot directory.
@@ -1467,6 +1472,7 @@ impl SnapshotOpener {
 
     /// Loads and validates the snapshot manifest, checking that manifest VMs
     /// match the lab specification's declared nodes.
+    /// This does not verify file contents; callers must verify before trusting file metadata.
     ///
     /// # Errors
     /// Returns an error if opening or reading `manifest.json` fails, if the manifest
@@ -1475,18 +1481,27 @@ impl SnapshotOpener {
     pub fn load_manifest(&self) -> Result<SnapshotManifest, Error> {
         let mut json = String::new();
         self.open(Path::new("manifest.json"))
-            .map_err(|e| contextual(Path::new("manifest.json"), e))?
+            .map_err(|e| contextual(&self.root.join("manifest.json"), e))?
             .take(1024 * 1024 + 1)
             .read_to_string(&mut json)
-            .map_err(|e| contextual(Path::new("manifest.json"), e))?;
+            .map_err(|e| contextual(&self.root.join("manifest.json"), e))?;
         if json.len() > 1024 * 1024 {
             return Err(contextual(
-                Path::new("manifest.json"),
+                &self.root.join("manifest.json"),
                 io::Error::new(io::ErrorKind::InvalidData, "manifest exceeds 1 MiB"),
             ));
         }
-        let manifest = SnapshotManifest::from_json_str(&json)?;
-        manifest.lab_spec.validate()?;
+        let manifest = SnapshotManifest::from_json_str(&json)
+            .and_then(|manifest| {
+                manifest.lab_spec.validate()?;
+                Ok(manifest)
+            })
+            .map_err(|error| {
+                contextual(
+                    &self.root.join("manifest.json"),
+                    io::Error::new(io::ErrorKind::InvalidData, error),
+                )
+            })?;
         if manifest.vms.len() != manifest.lab_spec.nodes.len()
             || manifest
                 .lab_spec
@@ -1495,7 +1510,7 @@ impl SnapshotOpener {
                 .any(|n| !manifest.vms.contains_key(&n.name))
         {
             return Err(contextual(
-                Path::new("manifest.json"),
+                &self.root.join("manifest.json"),
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "manifest VMs do not match lab spec nodes",
@@ -1607,6 +1622,7 @@ impl SnapshotOpener {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             base: self.base.try_clone()?,
+            root: self.root.clone(),
         })
     }
 
