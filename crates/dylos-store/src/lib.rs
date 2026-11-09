@@ -1167,11 +1167,19 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
         }
         // Guest pages are often mostly zero even inside a populated 1 MiB chunk.
         // Preserve page-sized holes so scattered data does not dirty the entire chunk.
+        let mut run_start = None;
         for (index, page) in buffer[..n].chunks(4096).enumerate() {
+            let offset = index * 4096;
             if page != &zeros[..page.len()] {
-                dest.seek(SeekFrom::Start(copied - n as u64 + (index * 4096) as u64))?;
-                dest.write_all(page)?;
+                run_start.get_or_insert(offset);
+            } else if let Some(start) = run_start.take() {
+                dest.seek(SeekFrom::Start(copied - n as u64 + start as u64))?;
+                dest.write_all(&buffer[start..offset])?;
             }
+        }
+        if let Some(start) = run_start {
+            dest.seek(SeekFrom::Start(copied - n as u64 + start as u64))?;
+            dest.write_all(&buffer[start..n])?;
         }
     }
     dest.set_len(copied)?;
