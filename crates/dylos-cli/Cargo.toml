@@ -27,7 +27,6 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 
 [dev-dependencies]
-dylos-runtime = { path = "../dylos-runtime", features = ["test-hooks"] }
 nix = { workspace = true, features = ["signal"] }
 sha2.workspace = true
 tempfile.workspace = true
