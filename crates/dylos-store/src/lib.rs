@@ -518,6 +518,7 @@ impl Snapshot {
         if source.meta.dev() != destination.metadata().map_err(fail)?.dev() {
             return Err(fail(io::Error::from_raw_os_error(libc::EXDEV)));
         }
+        tracing::info!(node, file_name, created = ?source.meta.created(), modified = ?source.meta.modified(), "snapshot source timestamps");
         let mut chunks = Vec::new();
         let size = read_sparse_bounded(&source.file, source.max_bytes, |offset, bytes| {
             chunks.push((offset, bytes.to_vec()));
