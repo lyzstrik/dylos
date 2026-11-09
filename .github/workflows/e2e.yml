@@ -53,14 +53,17 @@ jobs:
             sudo apt-get update && sudo apt-get install -y btrfs-progs fsverity
           fi
           sudo truncate -s 10G /mnt/dylos-btrfs.img
-          # Direct I/O on the loop device eliminates the host page cache layer (LYZ-122).
-          # In CI, loop-backed btrfs double-caches guest memory writes into the host ext4
-          # page cache, triggering synchronous writeback stalls (balance_dirty_pages_ratelimited).
-          # Bypassing the host page cache keeps 5-VM snapshot pause well below the 1 s bound
-          # without modifying host kernel dirty ratios.
           LOOP_DEV=$(sudo losetup --find --show --direct-io=on /mnt/dylos-btrfs.img)
           sudo mkfs.btrfs -f "$LOOP_DEV"
           sudo mount -o compress=zstd:3 "$LOOP_DEV" "$GITHUB_WORKSPACE"
+          # In CI, loop-backed btrfs double-caches guest memory writes into the host ext4
+          # page cache, triggering synchronous writeback stalls (balance_dirty_pages_ratelimited)
+          # when 5 VMs concurrently dump memory (5 * 256 MiB = 1.25 GiB).
+          # Direct I/O eliminates the host page cache layer, and tuning dirty ratios on the
+          # disposable runner ensures adequate dirty headroom without sleep stalls during VM freeze.
+          # Note: dirty ratios apply to dirtyable available memory (not total RAM).
+          sudo sysctl -w vm.dirty_ratio=50
+          sudo sysctl -w vm.dirty_background_ratio=20
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
           # Verify reflink support on the mounted workspace
