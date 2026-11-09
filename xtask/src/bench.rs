@@ -794,7 +794,7 @@ pub fn setup_private_bench_dir(parent_dir: &Path) -> anyhow::Result<PathBuf> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 disambig += 1;
                 run_dir = parent_dir.join(format!("r{pid:x}-{disambig:x}"));
-                if disambig > 255 {
+                if disambig > 15 {
                     bail!(
                         "cannot create exclusive run directory under {}",
                         parent_dir.display()
@@ -998,9 +998,9 @@ fn candidate_socket_path_fits(
     spec: &LabSpec,
     fc_bin: &Path,
 ) -> bool {
-    // setup_private_bench_dir uses r{pid:x} or r{pid:x}-{disambig:x} up to disambig = 255 (0xff).
-    // The longest possible run directory component is r{pid:x}-ff.
-    let test_run_dir = candidate.join(format!("r{:x}-ff", std::process::id()));
+    // setup_private_bench_dir uses r{pid:x} or r{pid:x}-{disambig:x} up to disambig = 15 (0xf).
+    // The longest possible run directory component is r{pid:x}-f.
+    let test_run_dir = candidate.join(format!("r{:x}-f", std::process::id()));
     let longest_socket = longest_bench_socket_path(&test_run_dir, options, spec, fc_bin);
     validate_unix_socket_path(&longest_socket).is_ok()
 }

@@ -1026,7 +1026,7 @@ fn candidate_socket_path_budget_includes_collision_suffix() {
     fs::create_dir_all(&base).unwrap();
 
     let pid_comp = format!("r{pid:x}");
-    let ff_comp = format!("r{pid:x}-ff");
+    let f_comp = format!("r{pid:x}-f");
 
     // Measure suffix length below run_dir
     let dummy = base.join("test");
@@ -1035,7 +1035,7 @@ fn candidate_socket_path_budget_includes_collision_suffix() {
     let suffix_len = sample_socket.as_os_str().len() - dummy_run.as_os_str().len();
 
     // Construct a candidate directory where candidate.join(r{pid:x}) would produce
-    // a socket path of exactly 107 bytes, but candidate.join(r{pid:x}-ff) produces 110 bytes (> 107).
+    // a socket path of exactly 107 bytes, but candidate.join(r{pid:x}-f) produces 109 bytes (> 107).
     let target_cand_len = 107 - suffix_len - pid_comp.len() - 1;
     let base_len = base.as_os_str().len();
     assert!(
@@ -1049,7 +1049,7 @@ fn candidate_socket_path_budget_includes_collision_suffix() {
     let initial_socket =
         longest_bench_socket_path(&boundary_cand.join(&pid_comp), &options, &spec, fc_bin);
     let collision_socket =
-        longest_bench_socket_path(&boundary_cand.join(&ff_comp), &options, &spec, fc_bin);
+        longest_bench_socket_path(&boundary_cand.join(&f_comp), &options, &spec, fc_bin);
 
     assert_eq!(
         initial_socket.as_os_str().len(),
