@@ -786,9 +786,9 @@ pub fn setup_private_bench_dir(parent_dir: &Path) -> anyhow::Result<PathBuf> {
 
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| (d.as_millis() % 1_000_000) as u64);
+        .map_or(0, |d| (d.as_millis() % 0x10000) as u32);
     // Kept short: the VM control socket paths below it must fit in sockaddr_un (108 bytes).
-    let run_dir = parent_dir.join(format!("r{}-{}", std::process::id(), timestamp));
+    let run_dir = parent_dir.join(format!("r{}-{timestamp:x}", std::process::id()));
 
     DirBuilder::new()
         .mode(0o700)
@@ -945,7 +945,7 @@ fn candidate_socket_path_fits(
     spec: &LabSpec,
     fc_bin: &Path,
 ) -> bool {
-    let test_run_dir = candidate.join(format!("r{:07}-999999", std::process::id()));
+    let test_run_dir = candidate.join(format!("r{}-{:04x}", std::process::id(), 0xffff));
     let longest_socket = longest_bench_socket_path(&test_run_dir, options, spec, fc_bin);
     validate_unix_socket_path(&longest_socket).is_ok()
 }
@@ -1025,6 +1025,10 @@ pub fn select_default_bench_parent_with_tmp(
         if check_candidate(&home_b) {
             return home_b;
         }
+        let home_b_plain = home.join("b");
+        if check_candidate(&home_b_plain) {
+            return home_b_plain;
+        }
     }
 
     // 5. Mount root of the required filesystem
@@ -1040,6 +1044,10 @@ pub fn select_default_bench_parent_with_tmp(
     if check_candidate(&mount_b) {
         return mount_b;
     }
+    let mount_b_plain = mount_root.join("b");
+    if check_candidate(&mount_b_plain) {
+        return mount_b_plain;
+    }
 
     // 6. Shallowest writable ancestor towards workspace
     if let Ok(rel) = canonical_ws.strip_prefix(&mount_root) {
@@ -1050,13 +1058,21 @@ pub fn select_default_bench_parent_with_tmp(
             if check_candidate(&candidate) {
                 return candidate;
             }
+            let candidate_plain = current.join("b");
+            if check_candidate(&candidate_plain) {
+                return candidate_plain;
+            }
         }
     }
 
-    // 7. Hidden .b directory directly under workspace
+    // 7. Hidden .b or b directory directly under workspace
     let ws_b = canonical_ws.join(".b");
     if check_candidate(&ws_b) {
         return ws_b;
+    }
+    let ws_b_plain = canonical_ws.join("b");
+    if check_candidate(&ws_b_plain) {
+        return ws_b_plain;
     }
 
     // Fallback: target/b (will fail early during pre-measurement validation with clear error)
