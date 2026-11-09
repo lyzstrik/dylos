@@ -6,7 +6,7 @@ use dylos_store::{SnapshotOpener, Store, VmFileSource};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn setup() -> (tempfile::TempDir, Store, LabSpec) {
     let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -566,6 +566,43 @@ fn deferred_hash_reads_isolated_capture_despite_source_writer() {
         fs::read(snapshot.root().join(&meta.path)).unwrap(),
         b"disk capture"
     );
+}
+
+#[test]
+fn deferred_sources_close_after_finalization_or_snapshot_drop() {
+    fn source_is_open(source: &Path) -> bool {
+        let deleted = PathBuf::from(format!("{} (deleted)", source.display()));
+        for entry in fs::read_dir("/proc/self/fd").unwrap() {
+            match fs::read_link(entry.unwrap().path()) {
+                Ok(target) if target == deleted => return true,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot inspect own file descriptors: {error}"),
+            }
+        }
+        false
+    }
+    for finalize in [true, false] {
+        let (temp, store, _spec) = setup();
+        let snapshot = store.stage_snapshot("lab", "retained").unwrap();
+        let source = temp.path().join("memory");
+        fs::write(&source, b"captured").unwrap();
+        let (mut meta, _) = snapshot
+            .capture_vm_source(
+                VmFileSource::open(&source, 1024).unwrap(),
+                "node1",
+                "vm.mem",
+            )
+            .unwrap();
+        assert!(!source.exists());
+        assert!(source_is_open(&source));
+        if finalize {
+            snapshot.hash_file(&mut meta).unwrap();
+            assert!(!source_is_open(&source));
+        }
+        drop(snapshot);
+        assert!(!source_is_open(&source));
+    }
 }
 
 #[test]

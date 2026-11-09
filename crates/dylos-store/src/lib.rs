@@ -36,6 +36,7 @@ use std::{
         unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
+    sync::Mutex,
     time::{Instant, SystemTime},
 };
 
@@ -193,6 +194,7 @@ pub struct Snapshot {
     id: String,
     owned: bool,
     publication_id: Option<String>,
+    captured_sources: Mutex<BTreeMap<PathBuf, File>>,
 }
 
 /// Timings recorded during a VM disk clone operation.
@@ -379,14 +381,7 @@ impl Snapshot {
             .map_err(|e| contextual(source_path, e))?;
         let fsync_ms = u64::try_from(t_fsync.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        };
+        let vm_dir = self.vm_directory(node)?;
 
         let dest_path = self.root.join("vms").join(node).join(disk_name);
         let dest_file = open(
@@ -511,14 +506,7 @@ impl Snapshot {
         } = source;
         let source_path = source_path.as_path();
 
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        };
+        let vm_dir = self.vm_directory(node)?;
 
         let dest_path = self.root.join("vms").join(node).join(file_name);
         let mut dest_file = open(
@@ -601,6 +589,13 @@ impl Snapshot {
             source: e,
         })?;
 
+        if !hash {
+            self.retain_capture_source(
+                PathBuf::from(format!("vms/{node}/{file_name}")),
+                source_file,
+            );
+        }
+
         Ok((
             FileMeta {
                 fsverity: None,
@@ -612,11 +607,40 @@ impl Snapshot {
         ))
     }
 
+    fn vm_directory(&self, node: &str) -> Result<File, Error> {
+        let vms = open(&self.directory, "vms".as_ref(), dirs())
+            .map_err(|e| contextual(&self.root.join("vms"), e))?;
+        Ok(match open(&vms, node.as_ref(), dirs()) {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
+                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
+            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
+        })
+    }
+
+    fn retain_capture_source(&self, path: PathBuf, source: File) {
+        // Last-close eviction of a large dirty Btrfs inode can wait for writeback.
+        // Keep the unlinked source alive until post-thaw finalization; the captured
+        // destination is already a distinct inode, isolated from source writers.
+        self.captured_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(path, source);
+    }
+
     /// Syncs captured content, seals it with fs-verity where supported, then hashes it.
     /// The captured size is an upper bound; unsupported storage retains full hashing.
     /// # Errors
     /// Rejects missing files and changes in captured size.
     pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
+        let source = self
+            .captured_sources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&meta.path);
+        let started_release = Instant::now();
+        drop(source);
+        tracing::info!(path = %meta.path.display(), release_ms = started_release.elapsed().as_millis(), "captured source released during finalization");
         let opener = SnapshotOpener {
             root: self.root.clone(),
             base: self
@@ -1080,6 +1104,7 @@ impl Store {
             id: snapshot_id.into(),
             owned: true,
             publication_id,
+            captured_sources: Mutex::default(),
         };
 
         if let Err(err) = make_directory(&snapshot.directory, "vms") {
