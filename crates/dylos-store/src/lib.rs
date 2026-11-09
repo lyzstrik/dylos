@@ -215,6 +215,17 @@ pub struct VmFileSource {
     max_bytes: u64,
 }
 
+/// Isolated sparse VM bytes owned until they are persisted after thaw.
+pub struct BufferedVmFile {
+    source_device: u64,
+    destination: File,
+    path: PathBuf,
+    node: String,
+    file_name: String,
+    size: u64,
+    chunks: Vec<(u64, Vec<u8>)>,
+}
+
 impl VmFileSource {
     /// # Errors
     /// Rejects symlinks in any component, non-regular files and files over `max_bytes`.
@@ -371,14 +382,7 @@ impl Snapshot {
             .map_err(|e| contextual(source_path, e))?;
         let fsync_ms = u64::try_from(t_fsync.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        };
+        let vm_dir = self.vm_directory(node)?;
 
         let dest_path = self.root.join("vms").join(node).join(disk_name);
         let dest_file = open(
@@ -484,6 +488,111 @@ impl Snapshot {
         self.save_vm_source_impl(source, node, file_name, false)
     }
 
+    /// Captures bounded, private sparse bytes without writing to the filesystem.
+    /// Persist the result after thaw, then finalize it with `hash_file`.
+    /// # Errors
+    /// Rejects invalid names, cross-device sources, read errors and excessive growth.
+    pub fn buffer_vm_source(
+        &self,
+        source: VmFileSource,
+        node: &str,
+        file_name: &str,
+    ) -> Result<BufferedVmFile, Error> {
+        valid_id(node)?;
+        valid_file_name(file_name)?;
+        let vm_dir = self.vm_directory(node)?;
+        let path = PathBuf::from(format!("vms/{node}/{file_name}"));
+        let dest_path = self.root.join(&path);
+        let destination = open(
+            &vm_dir,
+            file_name.as_ref(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        )
+        .map_err(|e| contextual(&dest_path, e))?;
+        let fail = |e| {
+            contextual(
+                &dest_path,
+                with_cleanup(e, cleanup_dest(&vm_dir, file_name, &dest_path)),
+            )
+        };
+        if source.meta.dev() != destination.metadata().map_err(fail)?.dev() {
+            return Err(fail(io::Error::from_raw_os_error(libc::EXDEV)));
+        }
+        tracing::info!(node, file_name, created = ?source.meta.created(), modified = ?source.meta.modified(), "snapshot source timestamps");
+        let mut chunks = Vec::new();
+        let size = read_sparse_bounded(&source.file, source.max_bytes, |offset, bytes| {
+            chunks.push((offset, bytes.to_vec()));
+            Ok(())
+        })
+        .map_err(fail)?;
+        safe_unlink_source(&source.dir, &source.name, &source.meta).map_err(fail)?;
+        let source_device = source.meta.dev();
+        drop(source);
+        Ok(BufferedVmFile {
+            source_device,
+            destination,
+            path,
+            node: node.into(),
+            file_name: file_name.into(),
+            size,
+            chunks,
+        })
+    }
+
+    /// Writes private buffered bytes into staging; sync, seal and hash before publication.
+    /// # Errors
+    /// Returns contextual directory, write and cross-device errors; removes partial output.
+    pub fn persist_buffered_vm_file(&self, captured: BufferedVmFile) -> Result<FileMeta, Error> {
+        let BufferedVmFile {
+            source_device,
+            destination: mut file,
+            path,
+            node,
+            file_name,
+            size,
+            chunks,
+        } = captured;
+        let vm_dir = self.vm_directory(&node)?;
+        let dest_path = self.root.join(&path);
+        let write = || -> io::Result<()> {
+            if source_device != file.metadata()?.dev() {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
+            for (offset, bytes) in chunks {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&bytes)?;
+            }
+            file.set_len(size)?;
+            if file_name == "vm.mem" {
+                file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+            }
+            Ok(())
+        };
+        write().map_err(|e| {
+            contextual(
+                &dest_path,
+                with_cleanup(e, cleanup_dest(&vm_dir, &file_name, &dest_path)),
+            )
+        })?;
+        Ok(FileMeta {
+            fsverity: None,
+            path,
+            sha256: String::new(),
+            size,
+        })
+    }
+
+    fn vm_directory(&self, node: &str) -> Result<File, Error> {
+        let vms = open(&self.directory, "vms".as_ref(), dirs())
+            .map_err(|e| contextual(&self.root.join("vms"), e))?;
+        match open(&vms, node.as_ref(), dirs()) {
+            Ok(dir) => Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
+                .map_err(|e| contextual(&self.root.join("vms").join(node), e)),
+            Err(e) => Err(contextual(&self.root.join("vms").join(node), e)),
+        }
+    }
+
     fn save_vm_source_impl(
         &self,
         source: VmFileSource,
@@ -503,14 +612,7 @@ impl Snapshot {
         } = source;
         let source_path = source_path.as_path();
 
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        };
+        let vm_dir = self.vm_directory(node)?;
 
         let dest_path = self.root.join("vms").join(node).join(file_name);
         let mut dest_file = open(
@@ -733,6 +835,14 @@ impl Drop for Snapshot {
     }
 }
 impl Store {
+    /// Drains pending writes before a latency-sensitive capture.
+    /// # Errors
+    /// Reports filesystem writeback errors, including those from earlier operations.
+    pub fn sync_filesystem(&self) -> Result<(), Error> {
+        let base = directory(&self.base, true).map_err(|e| contextual(&self.base, e))?;
+        nix::unistd::syncfs(&base).map_err(|e| contextual(&self.base, e.into()))
+    }
+
     /// Checks image/store and jail/store reflinks before any lab resources are created.
     /// Missing directories are probed at their nearest existing ancestor. Unnamed temporary
     /// files are removed by the kernel when their descriptors close, including on failure.
@@ -1133,9 +1243,20 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
 }
 
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {
+    let size = read_sparse_bounded(source, max_bytes, |offset, bytes| {
+        dest.seek(SeekFrom::Start(offset))?;
+        dest.write_all(bytes)
+    })?;
+    dest.set_len(size)
+}
+
+fn read_sparse_bounded(
+    source: &File,
+    max_bytes: u64,
+    mut write: impl FnMut(u64, &[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
     let mut reader = source.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
-    dest.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let zeros = vec![0u8; buffer.len()];
     let mut copied = 0u64;
@@ -1157,16 +1278,22 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
                 ),
             ));
         }
-        // Guest memory commonly has large untouched regions. Keep zero chunks
-        // sparse instead of dirtying a second set of page-cache pages.
-        if buffer[..n] == zeros[..n] {
-            dest.seek(SeekFrom::Start(copied))?;
-        } else {
-            dest.write_all(&buffer[..n])?;
+        // Guest pages are often mostly zero even inside a populated 1 MiB chunk.
+        // Preserve page-sized holes so scattered data does not dirty the entire chunk.
+        let mut run_start = None;
+        for (index, page) in buffer[..n].chunks(4096).enumerate() {
+            let offset = index * 4096;
+            if page != &zeros[..page.len()] {
+                run_start.get_or_insert(offset);
+            } else if let Some(start) = run_start.take() {
+                write(copied - n as u64 + start as u64, &buffer[start..offset])?;
+            }
+        }
+        if let Some(start) = run_start {
+            write(copied - n as u64 + start as u64, &buffer[start..n])?;
         }
     }
-    dest.set_len(copied)?;
-    Ok(())
+    Ok(copied)
 }
 
 fn safe_unlink_source(
