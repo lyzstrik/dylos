@@ -6,7 +6,7 @@ use dylos_store::{SnapshotOpener, Store, VmFileSource};
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn setup() -> (tempfile::TempDir, Store, LabSpec) {
     let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -569,43 +569,6 @@ fn deferred_hash_reads_isolated_capture_despite_source_writer() {
 }
 
 #[test]
-fn deferred_sources_close_after_finalization_or_snapshot_drop() {
-    fn source_is_open(source: &Path) -> bool {
-        let deleted = PathBuf::from(format!("{} (deleted)", source.display()));
-        for entry in fs::read_dir("/proc/self/fd").unwrap() {
-            match fs::read_link(entry.unwrap().path()) {
-                Ok(target) if target == deleted => return true,
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("cannot inspect own file descriptors: {error}"),
-            }
-        }
-        false
-    }
-    for finalize in [true, false] {
-        let (temp, store, _spec) = setup();
-        let snapshot = store.stage_snapshot("lab", "retained").unwrap();
-        let source = temp.path().join("memory");
-        fs::write(&source, b"captured").unwrap();
-        let (mut meta, _) = snapshot
-            .capture_vm_source(
-                VmFileSource::open(&source, 1024).unwrap(),
-                "node1",
-                "vm.mem",
-            )
-            .unwrap();
-        assert!(!source.exists());
-        assert!(source_is_open(&source));
-        if finalize {
-            snapshot.hash_file(&mut meta).unwrap();
-            assert!(!source_is_open(&source));
-        }
-        drop(snapshot);
-        assert!(!source_is_open(&source));
-    }
-}
-
-#[test]
 fn staging_with_manifest_cannot_restore_and_publication_is_atomic() {
     let (_temp, store, spec) = setup();
     let mut snapshot = store.stage_snapshot("lab", "snap").unwrap();
@@ -751,6 +714,44 @@ fn deferred_capture_keeps_scattered_guest_pages_sparse() {
         metadata.blocks() * 512,
     );
     snapshot.hash_file(&mut meta).unwrap();
+    assert_eq!(meta.size, bytes.len() as u64);
+    assert_eq!(
+        meta.sha256,
+        dylos_core::manifest::sha256_hex(&sha2::Sha256::digest(&bytes).into())
+    );
+}
+
+#[test]
+fn buffered_capture_is_private_sparse_and_durable_after_persistence() {
+    use sha2::Digest;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    let (temp, store, _spec) = setup();
+    let snapshot = store.stage_snapshot("lab", "buffered").unwrap();
+    let source = temp.path().join("memory");
+    let mut bytes = vec![0; 3 * 1024 * 1024 + 17];
+    for offset in [0, 1024 * 1024, bytes.len() - 1] {
+        bytes[offset] = 42;
+    }
+    fs::write(&source, &bytes).unwrap();
+    let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
+    let capture = snapshot
+        .buffer_vm_source(
+            VmFileSource::open(&source, bytes.len() as u64).unwrap(),
+            "node1",
+            "vm.mem",
+        )
+        .unwrap();
+    assert!(!source.exists());
+    let destination = snapshot.root().join("vms/node1/vm.mem");
+    assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+    writer.write_all(b"modified").unwrap();
+    let mut meta = snapshot.persist_buffered_vm_file(capture).unwrap();
+    snapshot.hash_file(&mut meta).unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    let metadata = fs::metadata(&destination).unwrap();
+    assert!(metadata.permissions().readonly());
+    assert!(metadata.blocks() * 512 < 128 * 1024);
     assert_eq!(meta.size, bytes.len() as u64);
     assert_eq!(
         meta.sha256,

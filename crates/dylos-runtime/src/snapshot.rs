@@ -424,7 +424,7 @@ async fn run_snapshot_steps(
 
         let handle = tokio::task::spawn_blocking(move || {
             let started = Instant::now();
-            // Finish disk sync before memory copying adds dirty page-cache pressure.
+            // Disk sync and reflink complete before buffering VM bytes.
             let mut disks = Vec::new();
             let mut fsync_ms = 0u64;
             let mut reflink_ms = 0u64;
@@ -434,27 +434,18 @@ async fn run_snapshot_steps(
                 fsync_ms = timings.fsync_ms;
                 reflink_ms = timings.reflink_ms;
             }
-            let (state_file, _) = snap.capture_vm_source(
+            let state_file = snap.buffer_vm_source(
                 dylos_store::VmFileSource::open(&state_src, state_max_bytes)?,
                 &node,
                 "vm.state",
             )?;
-            let (memory_file, _) = snap.capture_vm_source(
+            let memory_file = snap.buffer_vm_source(
                 dylos_store::VmFileSource::open(&mem_src, mem_max_bytes)?,
                 &node,
                 "vm.mem",
             )?;
             tracing::info!(vm = %node, capture_ms = started.elapsed().as_millis(), fsync_ms, reflink_ms, "VM snapshot capture completed");
-            Ok::<_, LabError>((
-                node,
-                VmManifest {
-                    state_file,
-                    memory_file,
-                    disks,
-                },
-                fsync_ms,
-                reflink_ms,
-            ))
+            Ok::<_, LabError>((node, (disks, state_file, memory_file), fsync_ms, reflink_ms))
         });
         storage_handles.push(handle);
     }
@@ -464,14 +455,14 @@ async fn run_snapshot_steps(
     let storage_ms = u64::try_from(started_storage.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut first_storage_error = None;
-    let mut vms_manifest = BTreeMap::new();
+    let mut captured_vms = BTreeMap::new();
     let mut max_fsync_ms = 0u64;
     let mut max_reflink_ms = 0u64;
 
     for result in storage_results {
         match result {
             Ok(Ok((node, manifest, fsync, reflink))) => {
-                vms_manifest.insert(node, manifest);
+                captured_vms.insert(node, manifest);
                 max_fsync_ms = max_fsync_ms.max(fsync);
                 max_reflink_ms = max_reflink_ms.max(reflink);
             }
@@ -546,7 +537,7 @@ async fn run_snapshot_steps(
     let freeze_to_thaw_ms =
         u64::try_from(started_freeze_to_thaw.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Hash only isolated captured files, after every VM is resumed and the fabric is thawed.
+    // Persist private VM bytes and finalize all captured files only after thaw.
     let snapshot = poisoned(&state.partial_snapshot)
         .take()
         .ok_or_else(|| LabError::Invalid {
@@ -555,11 +546,16 @@ async fn run_snapshot_steps(
         })?;
     let snapshot = Arc::new(snapshot);
     let started_hash = Instant::now();
-    let handles = vms_manifest
+    let handles = captured_vms
         .into_iter()
-        .map(|(node, mut vm)| {
+        .map(|(node, (disks, state, memory))| {
             let snapshot = Arc::clone(&snapshot);
             tokio::task::spawn_blocking(move || {
+                let mut vm = VmManifest {
+                    state_file: snapshot.persist_buffered_vm_file(state)?,
+                    memory_file: snapshot.persist_buffered_vm_file(memory)?,
+                    disks,
+                };
                 snapshot.hash_file(&mut vm.state_file)?;
                 snapshot.hash_file(&mut vm.memory_file)?;
                 for disk in &mut vm.disks {
@@ -575,7 +571,7 @@ async fn run_snapshot_steps(
         message: "snapshot handle leaked across hashing tasks".into(),
     })?;
     *poisoned(&state.partial_snapshot) = Some(snapshot);
-    vms_manifest = BTreeMap::new();
+    let mut vms_manifest = BTreeMap::new();
     for result in results {
         let (node, vm) = result.map_err(|source| LabError::Task {
             lab: job.lab_id.clone(),

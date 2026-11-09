@@ -36,7 +36,6 @@ use std::{
         unix::fs::{MetadataExt, PermissionsExt},
     },
     path::{Component, Path, PathBuf},
-    sync::Mutex,
     time::{Instant, SystemTime},
 };
 
@@ -194,7 +193,6 @@ pub struct Snapshot {
     id: String,
     owned: bool,
     publication_id: Option<String>,
-    captured_sources: Mutex<BTreeMap<PathBuf, File>>,
 }
 
 /// Timings recorded during a VM disk clone operation.
@@ -215,6 +213,18 @@ pub struct VmFileSource {
     file: File,
     meta: std::fs::Metadata,
     max_bytes: u64,
+}
+
+/// Isolated sparse VM bytes owned until they are persisted after thaw.
+/// The unlinked source stays open so final-close reclamation also follows thaw.
+pub struct BufferedVmFile {
+    source: VmFileSource,
+    destination: File,
+    path: PathBuf,
+    node: String,
+    file_name: String,
+    size: u64,
+    chunks: Vec<(u64, Vec<u8>)>,
 }
 
 impl VmFileSource {
@@ -487,6 +497,125 @@ impl Snapshot {
         self.save_vm_source_impl(source, node, file_name, false)
     }
 
+    /// Captures bounded, private sparse bytes without writing to the filesystem.
+    /// Persist the result after thaw, then finalize it with `hash_file`.
+    /// # Errors
+    /// Rejects invalid names, cross-device sources, read errors and excessive growth.
+    pub fn buffer_vm_source(
+        &self,
+        source: VmFileSource,
+        node: &str,
+        file_name: &str,
+    ) -> Result<BufferedVmFile, Error> {
+        valid_id(node)?;
+        valid_file_name(file_name)?;
+        let vm_dir = self.vm_directory(node)?;
+        let path = PathBuf::from(format!("vms/{node}/{file_name}"));
+        let dest_path = self.root.join(&path);
+        let destination = open(
+            &vm_dir,
+            file_name.as_ref(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        )
+        .map_err(|e| contextual(&dest_path, e))?;
+        let fail = |e| {
+            contextual(
+                &dest_path,
+                with_cleanup(e, cleanup_dest(&vm_dir, file_name, &dest_path)),
+            )
+        };
+        if source.meta.dev() != destination.metadata().map_err(fail)?.dev() {
+            return Err(fail(io::Error::from_raw_os_error(libc::EXDEV)));
+        }
+        let mut chunks = Vec::new();
+        let started = Instant::now();
+        let size = read_sparse_bounded(&source.file, source.max_bytes, |offset, bytes| {
+            chunks.push((offset, bytes.to_vec()));
+            Ok(())
+        })
+        .map_err(fail)?;
+        safe_unlink_source(&source.dir, &source.name, &source.meta).map_err(fail)?;
+        tracing::info!(
+            node,
+            file_name,
+            size,
+            buffered_bytes = chunks.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+            capture_ms = started.elapsed().as_millis(),
+            "VM bytes captured in memory"
+        );
+        Ok(BufferedVmFile {
+            source,
+            destination,
+            path,
+            node: node.into(),
+            file_name: file_name.into(),
+            size,
+            chunks,
+        })
+    }
+
+    /// Writes private buffered bytes into staging; sync, seal and hash before publication.
+    /// # Errors
+    /// Returns contextual directory, write and cross-device errors; removes partial output.
+    pub fn persist_buffered_vm_file(&self, captured: BufferedVmFile) -> Result<FileMeta, Error> {
+        let BufferedVmFile {
+            source,
+            destination: mut file,
+            path,
+            node,
+            file_name,
+            size,
+            chunks,
+        } = captured;
+        let vm_dir = self.vm_directory(&node)?;
+        let dest_path = self.root.join(&path);
+        let write = || -> io::Result<()> {
+            if source.meta.dev() != file.metadata()?.dev() {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
+            for (offset, bytes) in chunks {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&bytes)?;
+            }
+            file.set_len(size)?;
+            if file_name == "vm.mem" {
+                file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+            }
+            Ok(())
+        };
+        write().map_err(|e| {
+            contextual(
+                &dest_path,
+                with_cleanup(e, cleanup_dest(&vm_dir, &file_name, &dest_path)),
+            )
+        })?;
+        let started = Instant::now();
+        drop(source);
+        tracing::info!(
+            node,
+            file_name,
+            release_ms = started.elapsed().as_millis(),
+            "captured source released after persistence"
+        );
+        Ok(FileMeta {
+            fsverity: None,
+            path,
+            sha256: String::new(),
+            size,
+        })
+    }
+
+    fn vm_directory(&self, node: &str) -> Result<File, Error> {
+        let vms = open(&self.directory, "vms".as_ref(), dirs())
+            .map_err(|e| contextual(&self.root.join("vms"), e))?;
+        match open(&vms, node.as_ref(), dirs()) {
+            Ok(dir) => Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
+                .map_err(|e| contextual(&self.root.join("vms").join(node), e)),
+            Err(e) => Err(contextual(&self.root.join("vms").join(node), e)),
+        }
+    }
+
     fn save_vm_source_impl(
         &self,
         source: VmFileSource,
@@ -589,13 +718,6 @@ impl Snapshot {
             source: e,
         })?;
 
-        if !hash {
-            self.retain_capture_source(
-                PathBuf::from(format!("vms/{node}/{file_name}")),
-                source_file,
-            );
-        }
-
         Ok((
             FileMeta {
                 fsverity: None,
@@ -607,40 +729,11 @@ impl Snapshot {
         ))
     }
 
-    fn vm_directory(&self, node: &str) -> Result<File, Error> {
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        Ok(match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        })
-    }
-
-    fn retain_capture_source(&self, path: PathBuf, source: File) {
-        // Last-close eviction of a large dirty Btrfs inode can wait for writeback.
-        // Keep the unlinked source alive until post-thaw finalization; the captured
-        // destination is already a distinct inode, isolated from source writers.
-        self.captured_sources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(path, source);
-    }
-
     /// Syncs captured content, seals it with fs-verity where supported, then hashes it.
     /// The captured size is an upper bound; unsupported storage retains full hashing.
     /// # Errors
     /// Rejects missing files and changes in captured size.
     pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
-        let source = self
-            .captured_sources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&meta.path);
-        let started_release = Instant::now();
-        drop(source);
-        tracing::info!(path = %meta.path.display(), release_ms = started_release.elapsed().as_millis(), "captured source released during finalization");
         let opener = SnapshotOpener {
             root: self.root.clone(),
             base: self
@@ -1104,7 +1197,6 @@ impl Store {
             id: snapshot_id.into(),
             owned: true,
             publication_id,
-            captured_sources: Mutex::default(),
         };
 
         if let Err(err) = make_directory(&snapshot.directory, "vms") {
@@ -1166,26 +1258,30 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
 }
 
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {
+    let size = read_sparse_bounded(source, max_bytes, |offset, bytes| {
+        dest.seek(SeekFrom::Start(offset))?;
+        dest.write_all(bytes)
+    })?;
+    dest.set_len(size)
+}
+
+fn read_sparse_bounded(
+    source: &File,
+    max_bytes: u64,
+    mut write: impl FnMut(u64, &[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
     let mut reader = source.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
-    dest.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let zeros = vec![0u8; buffer.len()];
-    let started = Instant::now();
-    let mut read_time = std::time::Duration::ZERO;
-    let mut write_time = std::time::Duration::ZERO;
-    let mut written = 0usize;
-    let mut runs = 0usize;
     let mut copied = 0u64;
     loop {
-        let started_read = Instant::now();
         let n = match reader.read(&mut buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
-        read_time += started_read.elapsed();
         copied = copied
             .checked_add(n as u64)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "copy size overflow"))?;
@@ -1205,37 +1301,14 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
             if page != &zeros[..page.len()] {
                 run_start.get_or_insert(offset);
             } else if let Some(start) = run_start.take() {
-                let started_write = Instant::now();
-                dest.seek(SeekFrom::Start(copied - n as u64 + start as u64))?;
-                dest.write_all(&buffer[start..offset])?;
-                write_time += started_write.elapsed();
-                written += offset - start;
-                runs += 1;
+                write(copied - n as u64 + start as u64, &buffer[start..offset])?;
             }
         }
         if let Some(start) = run_start {
-            let started_write = Instant::now();
-            dest.seek(SeekFrom::Start(copied - n as u64 + start as u64))?;
-            dest.write_all(&buffer[start..n])?;
-            write_time += started_write.elapsed();
-            written += n - start;
-            runs += 1;
+            write(copied - n as u64 + start as u64, &buffer[start..n])?;
         }
     }
-    dest.set_len(copied)?;
-    tracing::info!(
-        copied,
-        written,
-        runs,
-        read_ms = read_time.as_millis(),
-        write_ms = write_time.as_millis(),
-        scan_ms = started
-            .elapsed()
-            .saturating_sub(read_time + write_time)
-            .as_millis(),
-        "bounded copy timing"
-    );
-    Ok(())
+    Ok(copied)
 }
 
 fn safe_unlink_source(
