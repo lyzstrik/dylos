@@ -17,6 +17,23 @@ use support::{
     StaleSummaryCounters, check_e2e_prerequisites, test_tempdir, verify_e2fsck_readonly_output,
 };
 
+async fn assert_vms_running_stably(vms: &[Vm]) {
+    join_all(vms.iter().map(|vm| async move {
+        let mut state = vm.state();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                state.wait_for(|s| *s != ProcessState::Running),
+            )
+            .await
+            .is_err(),
+            "VM {} exited unexpectedly",
+            vm.paths().id
+        );
+    }))
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn five_vms_snapshot_measurement_and_integrity() {
@@ -51,21 +68,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         .expect("lab bring-up failed");
     assert_eq!(lab.vms().len(), 5);
 
-    // Wait until all VMs are running stably
-    join_all(lab.vms().iter().map(|vm| async move {
-        let mut state = vm.state();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                state.wait_for(|s| *s != ProcessState::Running),
-            )
-            .await
-            .is_err(),
-            "VM {} exited unexpectedly",
-            vm.paths().id
-        );
-    }))
-    .await;
+    assert_vms_running_stably(lab.vms()).await;
 
     // Snapshot the lab with detailed timings
     let started = Instant::now();
@@ -96,12 +99,13 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     compare_verification(&opener, &manifest, verify_ms).await;
 
     eprintln!(
-        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
+        "5-VM snapshot timing breakdown: total={}ms freeze_to_thaw={}ms freeze={}ms pause={}ms API_snapshot={}ms capture={}ms fsync={}ms reflink={}ms hashing={}ms manifest_write={}ms resume={}ms thaw={}ms manifest_verify={}ms",
         total_ms,
         timings.freeze_to_thaw_ms,
         manifest.step_durations_ms.freeze,
         manifest.step_durations_ms.pause,
         timings.api_snapshot_ms,
+        timings.storage_ms,
         timings.fsync_ms,
         timings.reflink_ms,
         timings.hash_ms,
@@ -109,6 +113,14 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         manifest.step_durations_ms.resume,
         manifest.step_durations_ms.thaw,
         verify_ms,
+    );
+
+    assert!(
+        timings.freeze_to_thaw_ms < 1000,
+        "5-VM pause must stay below 1 second, got {}ms (API={}ms, capture={}ms)",
+        timings.freeze_to_thaw_ms,
+        timings.api_snapshot_ms,
+        timings.storage_ms,
     );
 
     // Firecracker memory snapshot I/O depends on the runner's disk. Bound only the

@@ -472,7 +472,7 @@ impl Snapshot {
         self.save_vm_source_impl(source, node, file_name, true)
     }
 
-    /// Captures an isolated state or memory file without hashing it.
+    /// Captures an isolated state or memory file without hashing or syncing it.
     /// # Errors
     /// Enforces the same source and size checks as `save_vm_source`.
     pub fn capture_vm_source(
@@ -532,15 +532,26 @@ impl Snapshot {
             ));
         }
 
-        match reflink(&source_file, &dest_file) {
+        // FICLONE flushes dirty source pages before remapping extents. Deferred
+        // capture uses buffered copy to defer explicit writeback until after thaw.
+        let capture = if hash {
+            reflink(&source_file, &dest_file)
+        } else {
+            copy_bounded(&source_file, &mut dest_file, max_bytes)
+        };
+        match capture {
             Ok(()) => {}
+            Err(err) if !hash => return Err(contextual(&dest_path, fail(err))),
             Err(err)
-                if matches!(
-                    err.raw_os_error(),
-                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
-                ) =>
+                if hash
+                    && matches!(
+                        err.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+                    ) =>
             {
-                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
+                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes)
+                    .and_then(|()| dest_file.sync_all())
+                {
                     return Err(contextual(&dest_path, fail(copy_err)));
                 }
             }
@@ -593,7 +604,7 @@ impl Snapshot {
         ))
     }
 
-    /// Seals captured content with fs-verity where supported, then hashes it.
+    /// Syncs captured content, seals it with fs-verity where supported, then hashes it.
     /// The captured size is an upper bound; unsupported storage retains full hashing.
     /// # Errors
     /// Rejects missing files and changes in captured size.
@@ -607,6 +618,9 @@ impl Snapshot {
         };
         let file = opener
             .open(&meta.path)
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        // Deferred captures are written back here, after thaw and before sealing.
+        file.sync_all()
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         // Enabling verity requires write permission even on an O_RDONLY descriptor.
         // Captured memory is already read-only; restore its mode on every outcome.
@@ -1123,6 +1137,7 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
     reader.seek(SeekFrom::Start(0))?;
     dest.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
+    let zeros = vec![0u8; buffer.len()];
     let mut copied = 0u64;
     loop {
         let n = match reader.read(&mut buffer) {
@@ -1142,9 +1157,15 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
                 ),
             ));
         }
-        dest.write_all(&buffer[..n])?;
+        // Guest memory commonly has large untouched regions. Keep zero chunks
+        // sparse instead of dirtying a second set of page-cache pages.
+        if buffer[..n] == zeros[..n] {
+            dest.seek(SeekFrom::Start(copied))?;
+        } else {
+            dest.write_all(&buffer[..n])?;
+        }
     }
-    dest.sync_all()?;
+    dest.set_len(copied)?;
     Ok(())
 }
 
