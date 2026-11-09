@@ -259,6 +259,7 @@ Usage: dylos lab diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
 
 - `<SNAPSHOT_A>`: Path to the first snapshot directory containing `manifest.json`. Required.
 - `<SNAPSHOT_B>`: Path to the second snapshot directory containing `manifest.json`. Required.
+- `--content`: Stream changed disks in fixed 4096-byte blocks on the blocking pool. Report differing blocks and bytes covered by those blocks (the final partial block counts only its actual length). Missing sides count as absent; added/removed disks count all their blocks. JSON adds `content: {"changed_blocks": N, "changed_bytes": N}` only for compared disks.
 - `--json`: Emit stable machine-readable JSON format on `stdout`.
 - `-h, --help`: Print help and exit `0`.
 
@@ -266,6 +267,7 @@ Usage: dylos lab diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
 
 - **Read-only**: `dylos lab diff` creates, modifies, and deletes nothing on the host or in storage.
 - **Verification first**: Both snapshots are verified (manifest validity, file sizes, inventory, and the fs-verity digest for sealed files or SHA-256 for unsealed files) before comparison. A corrupted or tampered snapshot is treated as a fatal verification error, never as a diff. Unsealed verification reads all bytes (O(total unsealed size)); sealed verification measures kernel digests without rehashing file contents. Identity uses size and the verified digest; mixed sealed/unsealed pairs conservatively report `changed`.
+- **Verification limits**: Verification checks integrity against the supplied manifest, not its authenticity, guest filesystem consistency, application state, or whether snapshots represent a coordinated instant. Snapshot directories and ancestors must remain operator-controlled and immutable during comparison. Duplicate disk paths are rejected; `./` components do not change disk identity.
 - **Topology comparison**: Compares `LabSpec` definitions across segments (added, removed, IP prefix changes), nodes (added, removed, image/vCPU/memory/route changes), and per-node interfaces (added, removed, segment/IP changes).
 - **Per-VM file comparison**: Compares VM state, memory, and disk files, reporting presence status (`identical`, `changed`, `added`, `removed`), with sizes in snapshot A and snapshot B (missing side reported as `null`).
 

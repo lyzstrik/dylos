@@ -307,3 +307,17 @@ fn opener_verify_rejects_symlinked_manifest_and_declared_files() {
         Err(dylos_core::Error::UnexpectedEntry { ref path }) if path == Path::new("file")
     ));
 }
+
+#[test]
+fn manifest_cap_and_errors_include_snapshot_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let opener = SnapshotOpener::new(tmp.path()).unwrap();
+    for contents in [vec![b' '; 1024 * 1024 + 1], b"invalid JSON".to_vec()] {
+        std::fs::write(tmp.path().join("manifest.json"), &contents).unwrap();
+        let error = opener.load_manifest().unwrap_err().to_string();
+        assert!(error.contains(tmp.path().to_str().unwrap()), "{error}");
+        if contents.len() > 1024 * 1024 {
+            assert!(error.contains("manifest exceeds 1 MiB"), "{error}");
+        }
+    }
+}
