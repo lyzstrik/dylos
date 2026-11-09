@@ -280,30 +280,14 @@ async fn run_snapshot_steps(
 ) -> Result<(SnapshotManifest, SnapshotTimings), LabError> {
     let started_all = Instant::now();
 
-    // Drain earlier filesystem work while guests are running. Source disks are still
-    // synced again during step 3, after pause.
+    // Drain earlier filesystem work while guests are running; disks are synced again paused.
     let store = job.store.clone();
-    let lab_id_clone = job.lab_id.clone();
-    let snapshot_id_clone = job.snapshot_id.clone();
-    let roots: Vec<_> = job.vms.iter().map(|vm| vm.root_dir.clone()).collect();
-    let snapshot = tokio::task::spawn_blocking(move || {
-        let started = Instant::now();
-        for root in roots { dylos_store::prepare_snapshot_memory(&root)?; }
-        let snapshot = store.stage_snapshot(&lab_id_clone, &snapshot_id_clone)?;
-        snapshot.sync_filesystem()?;
-        tracing::info!(lab = %lab_id_clone, prepare_ms = started.elapsed().as_millis(), "snapshot filesystem prepared before freeze");
-        Ok::<_, LabError>(snapshot)
-    })
-    .await
-    .map_err(|join_err| LabError::Task {
-        lab: job.lab_id.clone(),
-        source: join_err,
-    })??;
-
-    {
-        let mut lock = poisoned(&state.partial_snapshot);
-        *lock = Some(snapshot);
-    }
+    tokio::task::spawn_blocking(move || store.sync_filesystem())
+        .await
+        .map_err(|source| LabError::Task {
+            lab: job.lab_id.clone(),
+            source,
+        })??;
 
     let started_freeze_to_thaw = Instant::now();
 
@@ -348,62 +332,28 @@ async fn run_snapshot_steps(
     }
     let pause_ms = u64::try_from(started_pause.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Step 3a: Concurrent Firecracker API snapshot requests
-    let started_api = Instant::now();
-    let mut api_handles = Vec::new();
-    for vm in &job.vms {
-        let node = vm.node.clone();
-        let api = vm.client.clone();
-        let lab_id_for_api = job.lab_id.clone();
-        let handle = tokio::spawn(async move {
-            // Captured files are synced after thaw, before manifest publication.
-            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
-                .with_sync_snapshot_files(false);
-            let started = Instant::now();
-            let result = api.create_snapshot(&params).await;
-            tracing::info!(lab = %lab_id_for_api, vm = %node, api_snapshot_ms = started.elapsed().as_millis(), "VM snapshot API completed");
-            result.map_err(|source| LabError::Api {
-                lab: lab_id_for_api,
-                vm: node,
-                source: Box::new(source),
-            })
-        });
-        api_handles.push(handle);
+    // Step 3: Create snapshot directory layout in spawn_blocking
+    let store = job.store.clone();
+    let lab_id_clone = job.lab_id.clone();
+    let snapshot_id_clone = job.snapshot_id.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        store
+            .stage_snapshot(&lab_id_clone, &snapshot_id_clone)
+            .map_err(LabError::Store)
+    })
+    .await
+    .map_err(|join_err| LabError::Task {
+        lab: job.lab_id.clone(),
+        source: join_err,
+    })??;
+
+    {
+        let mut lock = poisoned(&state.partial_snapshot);
+        *lock = Some(snapshot);
     }
 
-    // Await EVERY dispatched API handle to completion
-    let api_results = join_all(api_handles).await;
-    let api_snapshot_ms = u64::try_from(started_api.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-    let mut first_api_error = None;
-    for res in api_results {
-        match res {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                if first_api_error.is_none() {
-                    first_api_error = Some(e);
-                }
-            }
-            Err(join_err) => {
-                if first_api_error.is_none() {
-                    if join_err.is_panic() {
-                        std::panic::resume_unwind(join_err.into_panic());
-                    }
-                    first_api_error = Some(LabError::Task {
-                        lab: job.lab_id.clone(),
-                        source: join_err,
-                    });
-                }
-            }
-        }
-    }
-
-    if let Some(err) = first_api_error {
-        return Err(err);
-    }
-
-    // Step 3b: Concurrent owned blocking storage tasks
-    let started_storage = Instant::now();
+    // Step 3: Capture each completed API output immediately so dirty memory files
+    // do not accumulate behind an API-only barrier. All captures still precede resume.
     let snapshot = {
         let mut lock = poisoned(&state.partial_snapshot);
         lock.take().ok_or_else(|| LabError::Invalid {
@@ -417,6 +367,8 @@ async fn run_snapshot_steps(
     for vm in &job.vms {
         let snap = Arc::clone(&snapshot_arc);
         let node = vm.node.clone();
+        let api = vm.client.clone();
+        let lab = job.lab_id.clone();
         let state_src = vm.root_dir.join("snap.state");
         let mem_src = vm.root_dir.join("snap.mem");
         let disk_src = vm.disk_path.clone();
@@ -424,7 +376,8 @@ async fn run_snapshot_steps(
         let state_max_bytes = 16 * 1024 * 1024;
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
 
-        let handle = tokio::task::spawn_blocking(move || {
+        let vm_node = node.clone();
+        let capture = move |api_ms| {
             let started = Instant::now();
             // Disk sync and reflink complete before buffering VM bytes.
             let mut disks = Vec::new();
@@ -447,23 +400,55 @@ async fn run_snapshot_steps(
                 "vm.mem",
             )?;
             tracing::info!(vm = %node, capture_ms = started.elapsed().as_millis(), fsync_ms, reflink_ms, "VM snapshot capture completed");
-            Ok::<_, LabError>((node, (disks, state_file, memory_file), fsync_ms, reflink_ms))
+            let storage_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            Ok::<_, LabError>((
+                node,
+                (disks, state_file, memory_file),
+                fsync_ms,
+                reflink_ms,
+                api_ms,
+                storage_ms,
+            ))
+        };
+        let handle = tokio::spawn(async move {
+            let started_api = Instant::now();
+            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
+                .with_sync_snapshot_files(false);
+            api.create_snapshot(&params)
+                .await
+                .map_err(|source| LabError::Api {
+                    lab: lab.clone(),
+                    vm: vm_node.clone(),
+                    source: Box::new(source),
+                })?;
+            let api_ms = u64::try_from(started_api.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::info!(lab = %lab, vm = %vm_node, api_snapshot_ms = api_ms, "VM snapshot API completed");
+            let capture = tokio::task::spawn_blocking(move || capture(api_ms));
+            capture.await.map_err(|source| {
+                if source.is_panic() {
+                    std::panic::resume_unwind(source.into_panic());
+                }
+                LabError::Task { lab, source }
+            })?
         });
         storage_handles.push(handle);
     }
 
     // Await EVERY dispatched storage handle to completion
     let storage_results = join_all(storage_handles).await;
-    let storage_ms = u64::try_from(started_storage.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     let mut first_storage_error = None;
     let mut captured_vms = BTreeMap::new();
+    let mut api_snapshot_ms = 0u64;
+    let mut storage_ms = 0u64;
     let mut max_fsync_ms = 0u64;
     let mut max_reflink_ms = 0u64;
 
     for result in storage_results {
         match result {
-            Ok(Ok((node, manifest, fsync, reflink))) => {
+            Ok(Ok((node, manifest, fsync, reflink, api, storage))) => {
+                api_snapshot_ms = api_snapshot_ms.max(api);
+                storage_ms = storage_ms.max(storage);
                 captured_vms.insert(node, manifest);
                 max_fsync_ms = max_fsync_ms.max(fsync);
                 max_reflink_ms = max_reflink_ms.max(reflink);

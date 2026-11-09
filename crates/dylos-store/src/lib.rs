@@ -216,9 +216,8 @@ pub struct VmFileSource {
 }
 
 /// Isolated sparse VM bytes owned until they are persisted after thaw.
-/// The unlinked source stays open so final-close reclamation also follows thaw.
 pub struct BufferedVmFile {
-    source: VmFileSource,
+    source_device: u64,
     destination: File,
     path: PathBuf,
     node: String,
@@ -305,14 +304,6 @@ impl Snapshot {
             rootfs: directory.join("rootfs.ext4"),
             directory,
         })
-    }
-
-    /// Drains pending writes on the lab filesystem before the latency-sensitive freeze.
-    /// This does not replace syncing captured files before publication.
-    /// # Errors
-    /// Reports filesystem writeback errors, including those from earlier operations.
-    pub fn sync_filesystem(&self) -> Result<(), Error> {
-        nix::unistd::syncfs(&self.directory).map_err(|e| contextual(&self.root, e.into()))
     }
 
     /// Clones a VM disk into the snapshot by reflink after an fsync of the source disk.
@@ -534,8 +525,10 @@ impl Snapshot {
         })
         .map_err(fail)?;
         safe_unlink_source(&source.dir, &source.name, &source.meta).map_err(fail)?;
+        let source_device = source.meta.dev();
+        drop(source);
         Ok(BufferedVmFile {
-            source,
+            source_device,
             destination,
             path,
             node: node.into(),
@@ -550,7 +543,7 @@ impl Snapshot {
     /// Returns contextual directory, write and cross-device errors; removes partial output.
     pub fn persist_buffered_vm_file(&self, captured: BufferedVmFile) -> Result<FileMeta, Error> {
         let BufferedVmFile {
-            source,
+            source_device,
             destination: mut file,
             path,
             node,
@@ -561,7 +554,7 @@ impl Snapshot {
         let vm_dir = self.vm_directory(&node)?;
         let dest_path = self.root.join(&path);
         let write = || -> io::Result<()> {
-            if source.meta.dev() != file.metadata()?.dev() {
+            if source_device != file.metadata()?.dev() {
                 return Err(io::Error::from_raw_os_error(libc::EXDEV));
             }
             for (offset, bytes) in chunks {
@@ -841,6 +834,14 @@ impl Drop for Snapshot {
     }
 }
 impl Store {
+    /// Drains pending writes before a latency-sensitive capture.
+    /// # Errors
+    /// Reports filesystem writeback errors, including those from earlier operations.
+    pub fn sync_filesystem(&self) -> Result<(), Error> {
+        let base = directory(&self.base, true).map_err(|e| contextual(&self.base, e))?;
+        nix::unistd::syncfs(&base).map_err(|e| contextual(&self.base, e.into()))
+    }
+
     /// Checks image/store and jail/store reflinks before any lab resources are created.
     /// Missing directories are probed at their nearest existing ancestor. Unnamed temporary
     /// files are removed by the kernel when their descriptors close, including on failure.
@@ -1238,51 +1239,6 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
     }
     let sha256 = dylos_core::manifest::sha256_hex(&hasher.finalize().into());
     Ok((sha256, total_size))
-}
-
-/// Creates a temporary memory output without compression, owned like the VM jail.
-/// # Errors
-/// Reports creation, ownership and supported-filesystem ioctl errors, removing partial output.
-pub fn prepare_snapshot_memory(root: &Path) -> Result<(), Error> {
-    let dir = directory(root, false).map_err(|e| contextual(root, e))?;
-    let path = root.join("snap.mem");
-    let file = open(
-        &dir,
-        "snap.mem".as_ref(),
-        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
-    )
-    .map_err(|e| contextual(&path, e))?;
-    let prepare = || -> io::Result<()> {
-        let owner = dir.metadata()?;
-        let meta = file.metadata()?;
-        if meta.uid() != owner.uid() || meta.gid() != owner.gid() {
-            nix::unistd::fchown(
-                &file,
-                Some(nix::unistd::Uid::from_raw(owner.uid())),
-                Some(nix::unistd::Gid::from_raw(owner.gid())),
-            )?;
-        }
-        let mut flags: libc::c_int = 0;
-        for request in [libc::FS_IOC_GETFLAGS, libc::FS_IOC_SETFLAGS] {
-            // SAFETY: these Linux ioctls read/write one int; flags is initialized,
-            // correctly aligned and live, and file remains open for both calls.
-            if unsafe { libc::ioctl(file.as_raw_fd(), request, &raw mut flags) } < 0 {
-                let error = io::Error::last_os_error();
-                return match error.raw_os_error() {
-                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL) => Ok(()),
-                    _ => Err(error),
-                };
-            }
-            flags |= 0x400; // FS_NOCOMP_FL: raw outputs are discarded after capture.
-        }
-        Ok(())
-    };
-    prepare().map_err(|e| {
-        contextual(
-            &path,
-            with_cleanup(e, cleanup_dest(&dir, "snap.mem", &path)),
-        )
-    })
 }
 
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {

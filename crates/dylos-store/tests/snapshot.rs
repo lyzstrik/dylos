@@ -694,8 +694,6 @@ fn deferred_capture_keeps_scattered_guest_pages_sparse() {
         let (temp, store, _spec) = setup();
         let snapshot = store.stage_snapshot("lab", "pages").unwrap();
         let source = temp.path().join("snap.mem");
-        dylos_store::prepare_snapshot_memory(temp.path()).unwrap();
-        assert!(dylos_store::prepare_snapshot_memory(temp.path()).is_err());
         let mut bytes = vec![0; 3 * 1024 * 1024 + 17];
         for offset in [0, 1024 * 1024 + 4096, 2 * 1024 * 1024, bytes.len() - 1] {
             bytes[offset] = 42;
@@ -720,7 +718,7 @@ fn deferred_capture_keeps_scattered_guest_pages_sparse() {
             writer.write_all(b"modified").unwrap();
             meta
         };
-        snapshot.sync_filesystem().unwrap();
+        store.sync_filesystem().unwrap();
         assert_eq!(fs::read(&destination).unwrap(), bytes);
         let metadata = fs::metadata(&destination).unwrap();
         assert!(metadata.permissions().readonly());
