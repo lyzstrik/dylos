@@ -17,6 +17,23 @@ use support::{
     StaleSummaryCounters, check_e2e_prerequisites, test_tempdir, verify_e2fsck_readonly_output,
 };
 
+async fn assert_vms_running_stably(vms: &[Vm]) {
+    join_all(vms.iter().map(|vm| async move {
+        let mut state = vm.state();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                state.wait_for(|s| *s != ProcessState::Running),
+            )
+            .await
+            .is_err(),
+            "VM {} exited unexpectedly",
+            vm.paths().id
+        );
+    }))
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn five_vms_snapshot_measurement_and_integrity() {
@@ -51,21 +68,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         .expect("lab bring-up failed");
     assert_eq!(lab.vms().len(), 5);
 
-    // Wait until all VMs are running stably
-    join_all(lab.vms().iter().map(|vm| async move {
-        let mut state = vm.state();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_secs(3),
-                state.wait_for(|s| *s != ProcessState::Running),
-            )
-            .await
-            .is_err(),
-            "VM {} exited unexpectedly",
-            vm.paths().id
-        );
-    }))
-    .await;
+    assert_vms_running_stably(lab.vms()).await;
 
     // Snapshot the lab with detailed timings
     let started = Instant::now();
