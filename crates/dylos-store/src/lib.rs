@@ -528,21 +528,12 @@ impl Snapshot {
             return Err(fail(io::Error::from_raw_os_error(libc::EXDEV)));
         }
         let mut chunks = Vec::new();
-        let started = Instant::now();
         let size = read_sparse_bounded(&source.file, source.max_bytes, |offset, bytes| {
             chunks.push((offset, bytes.to_vec()));
             Ok(())
         })
         .map_err(fail)?;
         safe_unlink_source(&source.dir, &source.name, &source.meta).map_err(fail)?;
-        tracing::info!(
-            node,
-            file_name,
-            size,
-            buffered_bytes = chunks.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
-            capture_ms = started.elapsed().as_millis(),
-            "VM bytes captured in memory"
-        );
         Ok(BufferedVmFile {
             source,
             destination,
@@ -589,14 +580,6 @@ impl Snapshot {
                 with_cleanup(e, cleanup_dest(&vm_dir, &file_name, &dest_path)),
             )
         })?;
-        let started = Instant::now();
-        drop(source);
-        tracing::info!(
-            node,
-            file_name,
-            release_ms = started.elapsed().as_millis(),
-            "captured source released after persistence"
-        );
         Ok(FileMeta {
             fsverity: None,
             path,
@@ -1255,6 +1238,51 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
     }
     let sha256 = dylos_core::manifest::sha256_hex(&hasher.finalize().into());
     Ok((sha256, total_size))
+}
+
+/// Creates a temporary memory output without compression, owned like the VM jail.
+/// # Errors
+/// Reports creation, ownership and supported-filesystem ioctl errors, removing partial output.
+pub fn prepare_snapshot_memory(root: &Path) -> Result<(), Error> {
+    let dir = directory(root, false).map_err(|e| contextual(root, e))?;
+    let path = root.join("snap.mem");
+    let file = open(
+        &dir,
+        "snap.mem".as_ref(),
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+    )
+    .map_err(|e| contextual(&path, e))?;
+    let prepare = || -> io::Result<()> {
+        let owner = dir.metadata()?;
+        let meta = file.metadata()?;
+        if meta.uid() != owner.uid() || meta.gid() != owner.gid() {
+            nix::unistd::fchown(
+                &file,
+                Some(nix::unistd::Uid::from_raw(owner.uid())),
+                Some(nix::unistd::Gid::from_raw(owner.gid())),
+            )?;
+        }
+        let mut flags: libc::c_int = 0;
+        for request in [libc::FS_IOC_GETFLAGS, libc::FS_IOC_SETFLAGS] {
+            // SAFETY: these Linux ioctls read/write one int; flags is initialized,
+            // correctly aligned and live, and file remains open for both calls.
+            if unsafe { libc::ioctl(file.as_raw_fd(), request, &raw mut flags) } < 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL) => Ok(()),
+                    _ => Err(error),
+                };
+            }
+            flags |= 0x400; // FS_NOCOMP_FL: raw outputs are discarded after capture.
+        }
+        Ok(())
+    };
+    prepare().map_err(|e| {
+        contextual(
+            &path,
+            with_cleanup(e, cleanup_dest(&dir, "snap.mem", &path)),
+        )
+    })
 }
 
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {

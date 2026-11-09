@@ -285,8 +285,10 @@ async fn run_snapshot_steps(
     let store = job.store.clone();
     let lab_id_clone = job.lab_id.clone();
     let snapshot_id_clone = job.snapshot_id.clone();
+    let roots: Vec<_> = job.vms.iter().map(|vm| vm.root_dir.clone()).collect();
     let snapshot = tokio::task::spawn_blocking(move || {
         let started = Instant::now();
+        for root in roots { dylos_store::prepare_snapshot_memory(&root)?; }
         let snapshot = store.stage_snapshot(&lab_id_clone, &snapshot_id_clone)?;
         snapshot.sync_filesystem()?;
         tracing::info!(lab = %lab_id_clone, prepare_ms = started.elapsed().as_millis(), "snapshot filesystem prepared before freeze");
