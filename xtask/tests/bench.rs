@@ -7,11 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use dylos_runtime::LabError;
+use dylos_core::LabSpec;
+use dylos_runtime::{LabError, MAX_UNIX_SOCKET_PATH};
 use xtask::bench::{
-    BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
-    SnapshotStages, cleanup_private_bench_dir, lab_failure, parse_bench_args, percentile,
-    render_markdown_report, run_in_private_dir, settle_pss, setup_private_bench_dir,
+    BenchOptions, BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
+    SnapshotStages, cleanup_private_bench_dir, lab_failure, longest_bench_socket_path,
+    parse_bench_args, percentile, render_markdown_report, run_in_private_dir,
+    select_default_bench_parent, select_default_bench_parent_with_tmp, settle_pss,
+    setup_private_bench_dir, validate_bench_socket_path,
 };
 
 fn samples(values: &[f64]) -> MetricSamples {
@@ -698,4 +701,205 @@ fn control_socket_path_fits_sun_len() {
         sock.display()
     );
     fs::remove_dir_all(&parent).unwrap();
+}
+
+fn five_vm_spec() -> LabSpec {
+    LabSpec::from_yaml_str(include_str!("../../labs/five.yaml")).unwrap()
+}
+
+#[test]
+fn default_bench_parent_picks_short_dir_on_same_mount() {
+    use std::os::unix::fs::MetadataExt;
+
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let parent = select_default_bench_parent(&ws, &options, &spec, fc_bin);
+    let child = setup_private_bench_dir(&parent).unwrap();
+    assert!(child.starts_with(&parent));
+    assert_eq!(
+        fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&parent).unwrap().dev(),
+        fs::metadata(&ws).unwrap().dev(),
+        "chosen parent must reside on the same filesystem mount as workspace"
+    );
+
+    let longest = validate_bench_socket_path(&child, &options, &spec, fc_bin).unwrap();
+    assert!(
+        longest.as_os_str().len() <= MAX_UNIX_SOCKET_PATH,
+        "longest socket path length {} exceeds limit {}",
+        longest.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH
+    );
+
+    cleanup_private_bench_dir(&child).unwrap();
+    assert!(!child.exists());
+    assert!(parent.exists());
+}
+
+#[test]
+fn default_parent_selection_handles_deep_workspace_and_cross_fs_fallback() {
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch_base = scratch("deep-ws");
+    let deep_ws = scratch_base
+        .join("d".repeat(35))
+        .join("e".repeat(35))
+        .join("p".repeat(35))
+        .join("workspace");
+    fs::create_dir_all(&deep_ws).unwrap();
+    let ws_canonical = deep_ws.canonicalize().unwrap();
+
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    // With a deep workspace, target/b would make socket paths far too long
+    let target_b_run = ws_canonical.join("target/b/r1234567-999999");
+    assert!(
+        validate_bench_socket_path(&target_b_run, &options, &spec, fc_bin).is_err(),
+        "target/b on deep checkout must exceed socket path limit"
+    );
+
+    // Pass /proc as tmp_dir to force skipping non-workspace filesystem mounts
+    let parent =
+        select_default_bench_parent_with_tmp(&deep_ws, &options, &spec, fc_bin, Path::new("/proc"));
+
+    let child = setup_private_bench_dir(&parent).unwrap();
+    let deep_dev = fs::metadata(&deep_ws).unwrap().dev();
+    let parent_dev = fs::metadata(&parent).unwrap().dev();
+    assert_eq!(
+        deep_dev, parent_dev,
+        "selected parent must reside on the same filesystem mount as deep workspace"
+    );
+    assert!(
+        !parent.starts_with(&deep_ws),
+        "selected parent {parent:?} must not embed deep workspace path"
+    );
+    let longest = validate_bench_socket_path(&child, &options, &spec, fc_bin).unwrap();
+    assert!(
+        longest.as_os_str().len() <= MAX_UNIX_SOCKET_PATH,
+        "socket path {} must stay under limit {}",
+        longest.display(),
+        MAX_UNIX_SOCKET_PATH
+    );
+
+    cleanup_private_bench_dir(&child).unwrap();
+    fs::remove_dir_all(&scratch_base).unwrap();
+}
+
+#[test]
+fn early_failure_on_oversized_socket_path_names_path_limit_and_suggests_tmp_dir() {
+    let long_run_dir = PathBuf::from("/").join("p".repeat(70));
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let err = validate_bench_socket_path(&long_run_dir, &options, &spec, fc_bin).unwrap_err();
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains(&long_run_dir.display().to_string()),
+        "error message must name the path: {msg}"
+    );
+    assert!(
+        msg.contains("exceeds limit of 107 bytes"),
+        "error message must state the 107-byte limit: {msg}"
+    );
+    assert!(
+        msg.contains("--tmp-dir"),
+        "error message must suggest --tmp-dir: {msg}"
+    );
+}
+
+#[test]
+fn longest_bench_socket_path_computes_largest_fork_count_and_longest_vm_name() {
+    let run_dir = Path::new("/run/test");
+    let options = BenchOptions {
+        repetitions: 7,
+        fork_counts: vec![1, 10, 25],
+        ..BenchOptions::default()
+    };
+    let spec = LabSpec::from_yaml_str(
+        r"
+segments:
+  - name: lan
+    ipv6: fd64:796c:6f73:1::/64
+    ipv4: 10.0.1.0/24
+nodes:
+  - name: short
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: lan
+        ipv6: fd64:796c:6f73:1::1/64
+        ipv4: 10.0.1.1/24
+  - name: very-long-node-identifier
+    image: alpine
+    vcpus: 1
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: lan
+        ipv6: fd64:796c:6f73:1::2/64
+        ipv4: 10.0.1.2/24
+",
+    )
+    .unwrap();
+    let fc_bin = Path::new("/opt/bin/firecracker-custom");
+
+    let longest = longest_bench_socket_path(run_dir, &options, &spec, fc_bin);
+    let s = longest.to_str().unwrap();
+
+    assert!(
+        s.contains("firecracker-custom"),
+        "must use fc_bin exec name: {s}"
+    );
+    assert!(
+        s.contains("f-n25-r7-c25"),
+        "must choose largest fork count and repetition: {s}"
+    );
+    assert!(
+        s.contains("very-long-node-identifier"),
+        "must choose longest VM node name: {s}"
+    );
+    assert!(
+        s.ends_with("root/run/firecracker.socket"),
+        "must end with root/run/firecracker.socket: {s}"
+    );
+}
+
+#[test]
+fn tmp_dir_override_keeps_working_and_is_validated() {
+    let custom = std::env::temp_dir().join(format!("dylos-custom-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&custom);
+    fs::create_dir_all(&custom).unwrap();
+
+    let options = BenchOptions {
+        tmp_dir: Some(custom.clone()),
+        ..BenchOptions::default()
+    };
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let parent = options.tmp_dir.clone().unwrap();
+    assert_eq!(parent, custom);
+
+    let child = setup_private_bench_dir(&parent).unwrap();
+    assert!(child.starts_with(&custom));
+    assert!(validate_bench_socket_path(&child, &options, &spec, fc_bin).is_ok());
+
+    cleanup_private_bench_dir(&child).unwrap();
+    fs::remove_dir_all(&custom).unwrap();
 }

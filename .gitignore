@@ -23,6 +23,7 @@ target
 /kernels/*.bin
 /target/
 /.t/
+/.b/
 
 # Generated fuzz inputs and crash artifacts
 /fuzz/corpus/
