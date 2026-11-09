@@ -34,6 +34,27 @@ async fn assert_vms_running_stably(vms: &[Vm]) {
     .await;
 }
 
+fn record_runner_io() {
+    tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_ansi(false)
+        .try_init()
+        .unwrap();
+    for path in ["/proc/meminfo", "/proc/pressure/io", "/proc/mounts"] {
+        let contents = fs::read_to_string(path).unwrap();
+        for line in contents.lines().filter(|line| {
+            line.starts_with("MemAvailable:")
+                || line.starts_with("Dirty:")
+                || line.starts_with("Writeback:")
+                || line.contains("btrfs")
+                || line.starts_with("some ")
+                || line.starts_with("full ")
+        }) {
+            eprintln!("Runner {path}: {line}");
+        }
+    }
+}
+
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn five_vms_snapshot_measurement_and_integrity() {
@@ -41,6 +62,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     else {
         return;
     };
+    record_runner_io();
     let bin = prereqs.bin;
     let kernel = prereqs.kernel;
     let image = prereqs.image;

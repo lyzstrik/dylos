@@ -295,6 +295,14 @@ impl Snapshot {
         })
     }
 
+    /// Drains pending writes on the lab filesystem before the latency-sensitive freeze.
+    /// This does not replace syncing captured files before publication.
+    /// # Errors
+    /// Reports filesystem writeback errors, including those from earlier operations.
+    pub fn sync_filesystem(&self) -> Result<(), Error> {
+        nix::unistd::syncfs(&self.directory).map_err(|e| contextual(&self.root, e.into()))
+    }
+
     /// Clones a VM disk into the snapshot by reflink after an fsync of the source disk.
     ///
     /// # Errors
@@ -1157,12 +1165,13 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
                 ),
             ));
         }
-        // Guest memory commonly has large untouched regions. Keep zero chunks
-        // sparse instead of dirtying a second set of page-cache pages.
-        if buffer[..n] == zeros[..n] {
-            dest.seek(SeekFrom::Start(copied))?;
-        } else {
-            dest.write_all(&buffer[..n])?;
+        // Guest pages are often mostly zero even inside a populated 1 MiB chunk.
+        // Preserve page-sized holes so scattered data does not dirty the entire chunk.
+        for (index, page) in buffer[..n].chunks(4096).enumerate() {
+            if page != &zeros[..page.len()] {
+                dest.seek(SeekFrom::Start(copied - n as u64 + (index * 4096) as u64))?;
+                dest.write_all(page)?;
+            }
         }
     }
     dest.set_len(copied)?;

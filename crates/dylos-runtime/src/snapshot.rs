@@ -280,6 +280,31 @@ async fn run_snapshot_steps(
 ) -> Result<(SnapshotManifest, SnapshotTimings), LabError> {
     let started_all = Instant::now();
 
+    // Drain earlier filesystem work while guests are running. Source disks are still
+    // synced again during step 3, after pause.
+    let store = job.store.clone();
+    let lab_id_clone = job.lab_id.clone();
+    let snapshot_id_clone = job.snapshot_id.clone();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        let snapshot = store.stage_snapshot(&lab_id_clone, &snapshot_id_clone)?;
+        snapshot.sync_filesystem()?;
+        tracing::info!(lab = %lab_id_clone, prepare_ms = started.elapsed().as_millis(), "snapshot filesystem prepared before freeze");
+        Ok::<_, LabError>(snapshot)
+    })
+    .await
+    .map_err(|join_err| LabError::Task {
+        lab: job.lab_id.clone(),
+        source: join_err,
+    })??;
+
+    {
+        let mut lock = poisoned(&state.partial_snapshot);
+        *lock = Some(snapshot);
+    }
+
+    let started_freeze_to_thaw = Instant::now();
+
     // Step 1: Freeze fabric
     let started_freeze = Instant::now();
     if let Some(fabric) = &job.fabric {
@@ -321,26 +346,6 @@ async fn run_snapshot_steps(
     }
     let pause_ms = u64::try_from(started_pause.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Step 3: Create snapshot directory layout in spawn_blocking
-    let store = job.store.clone();
-    let lab_id_clone = job.lab_id.clone();
-    let snapshot_id_clone = job.snapshot_id.clone();
-    let snapshot = tokio::task::spawn_blocking(move || {
-        store
-            .stage_snapshot(&lab_id_clone, &snapshot_id_clone)
-            .map_err(LabError::Store)
-    })
-    .await
-    .map_err(|join_err| LabError::Task {
-        lab: job.lab_id.clone(),
-        source: join_err,
-    })??;
-
-    {
-        let mut lock = poisoned(&state.partial_snapshot);
-        *lock = Some(snapshot);
-    }
-
     // Step 3a: Concurrent Firecracker API snapshot requests
     let started_api = Instant::now();
     let mut api_handles = Vec::new();
@@ -352,13 +357,14 @@ async fn run_snapshot_steps(
             // Captured files are synced after thaw, before manifest publication.
             let params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
                 .with_sync_snapshot_files(false);
-            api.create_snapshot(&params)
-                .await
-                .map_err(|source| LabError::Api {
-                    lab: lab_id_for_api,
-                    vm: node,
-                    source: Box::new(source),
-                })
+            let started = Instant::now();
+            let result = api.create_snapshot(&params).await;
+            tracing::info!(lab = %lab_id_for_api, vm = %node, api_snapshot_ms = started.elapsed().as_millis(), "VM snapshot API completed");
+            result.map_err(|source| LabError::Api {
+                lab: lab_id_for_api,
+                vm: node,
+                source: Box::new(source),
+            })
         });
         api_handles.push(handle);
     }
@@ -417,6 +423,7 @@ async fn run_snapshot_steps(
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
 
         let handle = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
             // Finish disk sync before memory copying adds dirty page-cache pressure.
             let mut disks = Vec::new();
             let mut fsync_ms = 0u64;
@@ -437,6 +444,7 @@ async fn run_snapshot_steps(
                 &node,
                 "vm.mem",
             )?;
+            tracing::info!(vm = %node, capture_ms = started.elapsed().as_millis(), fsync_ms, reflink_ms, "VM snapshot capture completed");
             Ok::<_, LabError>((
                 node,
                 VmManifest {
@@ -535,7 +543,8 @@ async fn run_snapshot_steps(
     }
     let thaw_ms = u64::try_from(started_thaw.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    let freeze_to_thaw_ms = u64::try_from(started_all.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let freeze_to_thaw_ms =
+        u64::try_from(started_freeze_to_thaw.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     // Hash only isolated captured files, after every VM is resumed and the fabric is thawed.
     let snapshot = poisoned(&state.partial_snapshot)
