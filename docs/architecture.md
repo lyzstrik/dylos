@@ -5,11 +5,13 @@ This document provides a high-level overview of the Dylos architecture, its depe
 ## Current status of the spike
 
 The following outlines the current implementation status on `main` vs the target design constraints:
-- **`dylos-cli`**: Currently a placeholder.
-- **`dylos-store`**: Implements the lab directory layout and reflink rootfs copies (LYZ-50). Lab bring-up (LYZ-51) and the CLI (LYZ-52) are still to come.
-- **`dylos-runtime`**: Currently launches and shuts down single VMs.
-- **Lab-wide features**: No lab-wide snapshot, restore, or fork exists yet (LYZ-19, LYZ-22, LYZ-23).
-- **Fabric features**: No fabric freeze/thaw exist yet (LYZ-24).
+- **`dylos-cli`**: Implements `dylos lab up`, `down`, `list`, `snapshot`, `restore`, `fork`, and `diff`. `up`, `restore`, and `fork` supervise running labs in the foreground; `list` reports persisted lab state and `diff` compares verified snapshots. See the [CLI reference](cli.md).
+- **`dylos-runtime`**: Orchestrates multi-VM lab bring-up and teardown, lab-wide snapshot and restore, and parallel independent clone labs through fork. Restore resynchronizes guest wall time through the guest agent before thawing the fabric.
+- **`dylos-net`**: Implements per-lab network namespaces, bridges, TAP devices, and fabric freeze/thaw used by snapshot and restore.
+- **`dylos-store`**: Implements lab directories, reflink disk copies, snapshot publication, and content verification. Captured files are sealed with fs-verity where supported, with full SHA-256 verification for unsupported storage and legacy snapshots, as specified by [ADR-0005](adr/0005-snapshot-content-verity.md).
+- **Benchmarks**: `just bench` runs the spike benchmark suite for the five-VM reference lab. Results and measurement limits are documented in the [spike report](bench/spike.md); implementation does not by itself establish that every performance target is met.
+
+The project remains a technical spike. Web UI, multi-host operation, Windows guests, eBPF, and a public API remain out of scope.
 
 ## Target Design Constraints
 

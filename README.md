@@ -9,7 +9,9 @@ It aims to run networks of [Firecracker](https://github.com/firecracker-microvm/
 
 ## Status
 
-Technical spike. `dylos lab up` and `dylos lab down` work for the reference `A -- B -- C` lab (`labs/abc.yaml`). Snapshot and fork are not implemented yet.
+Technical spike. The CLI implements `dylos lab up`, `down`, `list`, `snapshot`, `restore`, `fork`, and `diff` for multi-VM labs, including the reference `A -- B -- C` lab (`labs/abc.yaml`). Lab-wide snapshot and restore use fabric freeze/thaw; fork restores independent clone labs. Snapshots use fs-verity sealing where supported, with full SHA-256 verification as the fallback ([ADR-0005](docs/adr/0005-snapshot-content-verity.md)).
+
+`just bench` runs the spike benchmark suite. See the [benchmark report](docs/bench/spike.md) for results and measurement limits, and the [architecture status](docs/architecture.md) for implementation details. The go criteria below remain the targets against which the spike is evaluated.
 
 The spike must prove that a network of microVMs can be snapshotted consistently and forked quickly. Reference topology: `A -- B -- C`, with B acting as a Linux router between two segments, extended to 5 VMs for measurements.
 
@@ -25,9 +27,9 @@ Out of scope for now: web UI, multi-host, Windows guests, eBPF, public API.
 
 ## How consistency works
 
-The network fabric is frozen before the VMs are paused. Under the revised freeze contract ([ADR-0001](docs/adr/0001-consistency-by-fabric-freeze.md)), "no frame sent after freeze completion (T) is received by a lab VM before thaw". Frames queued host-side before freeze completion (pre-T) may still be received during the freeze, and captured RX state survives in clones. Frames still host-side at capture are omitted from clones, which use fresh TAP devices in a separate network namespace. Ethernet allows packet loss, and TCP recovers by retransmitting. Capture boundaries, Firecracker device buffers (including deferred RX in `Net::prepare_save`), and the freeze implementation remain unverified on the pinned host with real microVMs. Each clone is then restored into its own network namespace, so clones can reuse the same addresses without conflicting.
+The network fabric is frozen before the VMs are paused. Under the revised freeze contract ([ADR-0001](docs/adr/0001-consistency-by-fabric-freeze.md)), "no frame sent after freeze completion (T) is received by a lab VM before thaw". Frames queued host-side before freeze completion (pre-T) may still be received during the freeze, and captured RX state survives in clones. Frames still host-side at capture are omitted from clones, which use fresh TAP devices in a separate network namespace. Ethernet allows packet loss, and TCP recovers by retransmitting. End-to-end tests exercise fabric freeze under real traffic and restored IPv6 and IPv4 TCP connections; this does not establish exhaustive coverage of Firecracker device buffers or every capture boundary. Each clone is then restored into its own network namespace, so clones can reuse the same addresses without conflicting.
 
-## Planned layout
+## Repository layout
 
 ```
 crates/
@@ -138,12 +140,11 @@ sudo -E ./target/release/dylos lab down abc
 sudo -E cargo run --release -p dylos-cli -- lab down abc
 ```
 
-> [!NOTE]
-> There is no `lab list` command; labs are managed by their identifier (`abc`, or an explicit name passed via `--id <ID>`). See available CLI subcommands with:
->
-> ```bash
-> cargo run -p dylos-cli -- lab --help
-> ```
+List persisted labs and their observed lifecycle state with `dylos lab list`. See the [CLI reference](docs/cli.md) for snapshot, restore, fork, and diff usage, or inspect available subcommands with:
+
+```bash
+cargo run -p dylos-cli -- lab --help
+```
 
 ### Troubleshooting
 
