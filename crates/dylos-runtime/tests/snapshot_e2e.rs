@@ -1,8 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -14,44 +13,20 @@ use futures_util::future::join_all;
 
 mod support;
 
-use support::{StaleSummaryCounters, test_tempdir, verify_e2fsck_readonly_output};
-
-fn check_prerequisites() -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap();
-    let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
-        eprintln!("SKIPPED snapshot_e2e: DYLOS_FC_BIN_DIR is not set");
-        return None;
-    };
-    if std::fs::metadata("/proc/self").unwrap().uid() != 0 {
-        eprintln!("SKIPPED snapshot_e2e: must start as root");
-        return None;
-    }
-    let kernel = workspace.join("kernels/vmlinux.bin");
-    let image = workspace.join("target/images/rootfs.ext4");
-    for path in [
-        Path::new("/dev/kvm"),
-        &bin.join("jailer"),
-        &bin.join("firecracker"),
-        &kernel,
-        &image,
-    ] {
-        if !path.exists() {
-            eprintln!("SKIPPED snapshot_e2e: {} is missing", path.display());
-            return None;
-        }
-    }
-    Some((workspace, bin, kernel, image))
-}
+use support::{
+    StaleSummaryCounters, check_e2e_prerequisites, test_tempdir, verify_e2fsck_readonly_output,
+};
 
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn five_vms_snapshot_measurement_and_integrity() {
-    let Some((_workspace, bin, kernel, image)) = check_prerequisites() else {
+    let Some(prereqs) = check_e2e_prerequisites("five_vms_snapshot_measurement_and_integrity")
+    else {
         return;
     };
+    let bin = prereqs.bin;
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
@@ -175,9 +150,13 @@ async fn five_vms_snapshot_measurement_and_integrity() {
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 #[allow(clippy::too_many_lines)]
 async fn continuous_disk_writes_cloned_disk_consistent() {
-    let Some((_workspace, bin, kernel, image)) = check_prerequisites() else {
+    let Some(prereqs) = check_e2e_prerequisites("continuous_disk_writes_cloned_disk_consistent")
+    else {
         return;
     };
+    let bin = prereqs.bin;
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
     let dir = test_tempdir();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = bin.join("jailer");
@@ -449,9 +428,14 @@ async fn default_store_and_jail_paths_support_up_and_snapshot() {
         assert!(status.success(), "default-path subprocess failed: {status}");
         return;
     }
-    let Some((_workspace, bin, kernel, image)) = check_prerequisites() else {
+    let Some(prereqs) =
+        check_e2e_prerequisites("default_store_and_jail_paths_support_up_and_snapshot")
+    else {
         return;
     };
+    let bin = prereqs.bin;
+    let kernel = prereqs.kernel;
+    let image = prereqs.image;
     let mut jailer = LabConfig::default().jailer;
     jailer.jailer = bin.join("jailer");
     jailer.firecracker = bin.join("firecracker");

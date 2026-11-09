@@ -1,0 +1,32 @@
+segments:
+  - name: lan1
+    ipv6: fd64:796c:6f73:10::/64
+    ipv4: 10.0.10.0/24
+  - name: lan3
+    ipv6: fd64:796c:6f73:3::/64
+    ipv4: 10.0.3.0/24
+nodes:
+  - name: vm1
+    image: alpine-3-19
+    vcpus: 2
+    memory: 256
+    interfaces:
+      - name: eth0
+        segment: lan1
+        ipv6: fd64:796c:6f73:10::2/64
+        ipv4: 10.0.10.2/24
+      - name: eth1
+        segment: lan3
+        ipv6: fd64:796c:6f73:3::2/64
+        ipv4: 10.0.3.2/24
+    static_routes: []
+  - name: vm2
+    image: alpine-3-18
+    vcpus: 1
+    memory: 128
+    interfaces:
+      - name: eth0
+        segment: lan3
+        ipv6: fd64:796c:6f73:3::3/64
+        ipv4: 10.0.3.3/24
+    static_routes: []

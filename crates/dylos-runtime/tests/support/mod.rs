@@ -1252,3 +1252,45 @@ fn spawn_echo_responder(mode: &str, sandbox: &Path) {
         }
     });
 }
+
+pub struct E2ePrerequisites {
+    pub workspace: PathBuf,
+    pub bin: PathBuf,
+    pub kernel: PathBuf,
+    pub image: PathBuf,
+}
+
+pub fn check_e2e_prerequisites(test: &str) -> Option<E2ePrerequisites> {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let Some(bin) = std::env::var_os("DYLOS_FC_BIN_DIR").map(PathBuf::from) else {
+        eprintln!("SKIPPED {test}: DYLOS_FC_BIN_DIR is not set");
+        return None;
+    };
+    if std::fs::metadata("/proc/self").unwrap().uid() != 0 {
+        eprintln!("SKIPPED {test}: must start as root");
+        return None;
+    }
+    let kernel = workspace.join("kernels/vmlinux.bin");
+    let image = workspace.join("target/images/rootfs.ext4");
+    for path in [
+        Path::new("/dev/kvm"),
+        &bin.join("jailer"),
+        &bin.join("firecracker"),
+        &kernel,
+        &image,
+    ] {
+        if !path.exists() {
+            eprintln!("SKIPPED {test}: {} is missing", path.display());
+            return None;
+        }
+    }
+    Some(E2ePrerequisites {
+        workspace,
+        bin,
+        kernel,
+        image,
+    })
+}

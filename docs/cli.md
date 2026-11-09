@@ -16,10 +16,9 @@ target/release/dylos lab <subcommand> [options]
 
 ### Privileges
 
-Operating network namespaces, TAP devices, and Firecracker jailer chroots requires root privileges on the host. Set `DYLOS_FC_BIN_DIR` if using the static installation from [docs/host.md](host.md), then run with `sudo -E`:
+Operating network namespaces, TAP devices, and Firecracker jailer chroots requires root privileges on the host. By default, Dylos searches for static Firecracker and jailer binaries in order: `~<SUDO_USER>/.local/share/dylos/bin` (under `sudo`), `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin`. You can override the directory with `DYLOS_FC_BIN_DIR`. Run with `sudo -E`:
 
 ```bash
-export DYLOS_FC_BIN_DIR="$HOME/.local/share/dylos/bin"
 sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
 ```
 
@@ -31,7 +30,7 @@ sudo -E cargo run --release -p dylos-cli -- lab up labs/abc.yaml
 1. **Guest kernel**: Pinned kernel image located at `kernels/vmlinux.bin` (see [docs/host.md](host.md)).
 2. **Rootfs image**: Built using `just images`, defaulting to `target/images/rootfs.ext4`. Reflink-cloned for each VM.
 3. **Reflink storage**: Rootfs image, lab storage directory, and jail directory must reside on the same filesystem mount supporting reflink copies (`ioctl_ficlone` on btrfs or XFS with reflink enabled).
-4. **Firecracker & jailer**: Statically linked upstream binaries (defaults to `/usr/bin/firecracker` and `/usr/bin/jailer`; no PATH lookup). If installed to `~/.local/share/dylos/bin` per [docs/host.md](host.md), set `DYLOS_FC_BIN_DIR` as shown above.
+4. **Firecracker & jailer**: Statically linked upstream binaries (defaults to search order: `~<SUDO_USER>/.local/share/dylos/bin` under `sudo`, `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, and `/opt/dylos/bin` per [docs/host.md](host.md); no PATH lookup). Override with `DYLOS_FC_BIN_DIR`.
 
 > [!CAUTION]
 > **Dynamic binaries fail inside chroots:** Distro packages (e.g. Arch Linux) dynamically link glibc. When the jailer copies Firecracker into an isolated chroot without dynamic libraries, execution fails with `Failed to exec into Firecracker: No such file or directory`. Use pinned static binaries from [docs/host.md](host.md).
@@ -248,11 +247,62 @@ Exits with `0` when cleanly stopped. Exits with `2` on argument parsing errors (
 
 ---
 
+### `dylos lab diff`
+
+Compare two snapshots of a lab to identify topology changes and per-VM file differences.
+
+```text
+Usage: dylos lab diff [OPTIONS] <SNAPSHOT_A> <SNAPSHOT_B>
+```
+
+#### Arguments & Options
+
+- `<SNAPSHOT_A>`: Path to the first snapshot directory containing `manifest.json`. Required.
+- `<SNAPSHOT_B>`: Path to the second snapshot directory containing `manifest.json`. Required.
+- `--json`: Emit stable machine-readable JSON format on `stdout`.
+- `-h, --help`: Print help and exit `0`.
+
+#### Behavior
+
+- **Read-only**: `dylos lab diff` creates, modifies, and deletes nothing on the host or in storage.
+- **Verification first**: Both snapshots are verified (manifest validity, file sizes, inventory, and the fs-verity digest for sealed files or SHA-256 for unsealed files) before comparison. A corrupted or tampered snapshot is treated as a fatal verification error, never as a diff. Unsealed verification reads all bytes (O(total unsealed size)); sealed verification measures kernel digests without rehashing file contents. Identity uses size and the verified digest; mixed sealed/unsealed pairs conservatively report `changed`.
+- **Topology comparison**: Compares `LabSpec` definitions across segments (added, removed, IP prefix changes), nodes (added, removed, image/vCPU/memory/route changes), and per-node interfaces (added, removed, segment/IP changes).
+- **Per-VM file comparison**: Compares VM state, memory, and disk files, reporting presence status (`identical`, `changed`, `added`, `removed`), with sizes in snapshot A and snapshot B (missing side reported as `null`).
+
+#### Standard Output
+
+Default human output lists topology changes and each VM's state, memory and disk status with byte sizes.
+When `--json` is supplied, a structured JSON document is emitted:
+```json
+{
+  "topology": {
+    "segments": {"added": [], "removed": [], "changed": []},
+    "nodes": {"added": [], "removed": [], "changed": []},
+    "interfaces": {"added": [], "removed": [], "changed": []}
+  },
+  "vms": {
+    "vm1": {
+      "status": "identical",
+      "state": {"status": "identical", "size_a": 13, "size_b": 13},
+      "memory": {"status": "identical", "size_a": 33, "size_b": 33},
+      "disks": [{"path": "vms/vm1/rootfs.ext4", "status": "identical", "size_a": 4, "size_b": 4}]
+    }
+  }
+}
+```
+All keys are emitted; unchanged topology fields are `null` and missing file sizes are `null`.
+
+#### Exit Status
+
+Exits with `0` on success. Exits with `2` on command-line argument parsing errors. Exits with `1` if either snapshot directory cannot be accessed, contains corrupted files, fails manifest validation, or encounters I/O errors during reading.
+
+---
+
 ## Environment Variables
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `DYLOS_FC_BIN_DIR` | Directory containing static `firecracker` and `jailer` binaries. Link to [docs/host.md](host.md). | `/usr/bin` (no PATH lookup) |
+| `DYLOS_FC_BIN_DIR` | Directory containing static `firecracker` and `jailer` binaries. Link to [docs/host.md](host.md). | `~<SUDO_USER>/.local/share/dylos/bin` (under `sudo`), `$HOME/.local/share/dylos/bin`, `/usr/local/lib/dylos/bin`, `/opt/dylos/bin` (no PATH lookup) |
 | `DYLOS_LAB_DIR` | Base directory for lab state storage, per-VM disks, and snapshots (`<base>/snapshots/...`). | `target/labs` |
 | `DYLOS_JAIL_DIR` | Base directory for Firecracker jailer chroots. Must be on same mount as `DYLOS_LAB_DIR` and images. Short paths keep Unix domain sockets under 108 bytes. | Sibling `jails` alongside lab store (e.g. `target/jails`) |
 | `DYLOS_TEARDOWN_TIMEOUT_MS` | Timeout in milliseconds when waiting for supervisor teardown over `control.sock`. | `30000` (30 seconds) |

@@ -785,25 +785,11 @@ impl Store {
             return Err(contextual(path, io::ErrorKind::InvalidInput.into()));
         }
         let opener = SnapshotOpener::new(path).map_err(|e| contextual(path, e))?;
-        let mut json = String::new();
-        opener
-            .open(Path::new("manifest.json"))
-            .map_err(|e| contextual(path, e))?
-            .take(1024 * 1024 + 1)
-            .read_to_string(&mut json)
-            .map_err(|e| contextual(path, e))?;
-        if json.len() > 1024 * 1024 {
-            return Err(contextual(path, io::ErrorKind::InvalidData.into()));
-        }
-        let manifest = SnapshotManifest::from_json_str(&json)?;
-        manifest.lab_spec.validate()?;
+        let manifest = opener.load_manifest().map_err(|e| match e {
+            Error::Io { source, .. } => contextual(path, source),
+            other => other,
+        })?;
         if manifest.firecracker_version != "1.17.0"
-            || manifest.vms.len() != manifest.lab_spec.nodes.len()
-            || manifest
-                .lab_spec
-                .nodes
-                .iter()
-                .any(|n| !manifest.vms.contains_key(&n.name))
             || manifest.vms.values().any(|vm| vm.disks.len() != 1)
         {
             return Err(contextual(path, io::ErrorKind::InvalidData.into()));
@@ -1477,6 +1463,46 @@ impl SnapshotOpener {
     /// or non-regular leaves.
     pub fn open(&self, path: &Path) -> io::Result<File> {
         self.open_impl(path, None, &mut |_| {})
+    }
+
+    /// Loads and validates the snapshot manifest, checking that manifest VMs
+    /// match the lab specification's declared nodes.
+    ///
+    /// # Errors
+    /// Returns an error if opening or reading `manifest.json` fails, if the manifest
+    /// exceeds 1 MiB, if JSON parsing or spec validation fails, or if manifest VMs
+    /// do not match lab spec nodes.
+    pub fn load_manifest(&self) -> Result<SnapshotManifest, Error> {
+        let mut json = String::new();
+        self.open(Path::new("manifest.json"))
+            .map_err(|e| contextual(Path::new("manifest.json"), e))?
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut json)
+            .map_err(|e| contextual(Path::new("manifest.json"), e))?;
+        if json.len() > 1024 * 1024 {
+            return Err(contextual(
+                Path::new("manifest.json"),
+                io::Error::new(io::ErrorKind::InvalidData, "manifest exceeds 1 MiB"),
+            ));
+        }
+        let manifest = SnapshotManifest::from_json_str(&json)?;
+        manifest.lab_spec.validate()?;
+        if manifest.vms.len() != manifest.lab_spec.nodes.len()
+            || manifest
+                .lab_spec
+                .nodes
+                .iter()
+                .any(|n| !manifest.vms.contains_key(&n.name))
+        {
+            return Err(contextual(
+                Path::new("manifest.json"),
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "manifest VMs do not match lab spec nodes",
+                ),
+            ));
+        }
+        Ok(manifest)
     }
 
     /// Forces a resolver and pauses immediately before each resolution step.

@@ -157,7 +157,7 @@ async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Parts) {
 }
 
 /// Brings up a full lab on the fake jailer; `None` when reflinks are unavailable here.
-async fn up_lab(sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfig, Lab)> {
+async fn up_lab(test: &str, sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfig, Lab)> {
     let kernel = sandbox.dir.path().join("vmlinux.bin");
     fs::write(&kernel, b"kernel").unwrap();
     let image = sandbox.dir.path().join("rootfs.ext4");
@@ -186,7 +186,7 @@ async fn up_lab(sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfig, Lab)> {
             dylos_store::Error::Reflink { source, .. }
             | dylos_store::Error::ReflinkPreflight { source, .. },
         )) => {
-            eprintln!("SKIPPED {lab_id}: reflinks unavailable: {source}");
+            eprintln!("SKIPPED {test}: reflinks unavailable: {source}");
             None
         }
         Err(error) => panic!("lab bring-up failed: {error}"),
@@ -216,6 +216,10 @@ async fn snapshot_full_sequence_succeeds_and_creates_valid_manifest() {
         for vm in manifest.vms.values() {
             assert_eq!(vm.disks.len(), 1);
         }
+    } else {
+        eprintln!(
+            "SKIPPED snapshot_full_sequence_succeeds_and_creates_valid_manifest: disk assertions require storage reflink support"
+        );
     }
 
     for vm in &lab.vms {
@@ -451,7 +455,9 @@ async fn snapshot_fails_at_snapshot_create_cleans_up_and_resumes_all_vms() {
 async fn snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms() {
     let (sandbox, store, _spec, mut lab) = setup_lab("lfd").await;
     if lab.storage.as_ref().is_none() {
-        eprintln!("SKIP: disk clone test requires storage reflink support");
+        eprintln!(
+            "SKIPPED snapshot_fails_at_disk_clone_cleans_up_and_resumes_all_vms: disk clone test requires storage reflink support"
+        );
         lab.teardown().await.unwrap();
         sandbox.assert_no_jail_left();
         return;
@@ -887,7 +893,7 @@ async fn snapshot_via_control_socket() {
         return;
     }
     let sandbox = Sandbox::in_target(Mode::LabSnapshot);
-    let Some((config, lab)) = up_lab(&sandbox, "lc").await else {
+    let Some((config, lab)) = up_lab("snapshot_via_control_socket", &sandbox, "lc").await else {
         return;
     };
     let socket = lab.control_socket();
@@ -1062,7 +1068,13 @@ async fn teardown_cancellation_during_pending_snapshot_retains_ownership_for_ret
         return;
     }
     let sandbox = Sandbox::in_target(Mode::LabSnapshot);
-    let Some((config, mut lab)) = up_lab(&sandbox, "ltret").await else {
+    let Some((config, mut lab)) = up_lab(
+        "teardown_cancellation_during_pending_snapshot_retains_ownership_for_retry",
+        &sandbox,
+        "ltret",
+    )
+    .await
+    else {
         return;
     };
     let vm0_root = lab.vms()[0].paths().root.clone();
@@ -1125,7 +1137,13 @@ async fn teardown_cancellation_during_pending_snapshot_retains_ownership_for_dro
         return;
     }
     let sandbox = Sandbox::in_target(Mode::LabSnapshot);
-    let Some((config, mut lab)) = up_lab(&sandbox, "ltdrp").await else {
+    let Some((config, mut lab)) = up_lab(
+        "teardown_cancellation_during_pending_snapshot_retains_ownership_for_drop",
+        &sandbox,
+        "ltdrp",
+    )
+    .await
+    else {
         return;
     };
     let vm0_root = lab.vms()[0].paths().root.clone();

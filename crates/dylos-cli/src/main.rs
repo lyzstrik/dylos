@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
-use dylos_runtime::{Fleet, Lab, LabConfig, LabError};
+use dylos_runtime::{Fleet, Lab, LabConfig, LabError, diff_snapshots};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 
@@ -72,7 +72,7 @@ fn pin_control_socket(base: &Path, id: &str) -> std::io::Result<File> {
     name = "dylos",
     version,
     about = "Engine for reproducible microVM lab networks",
-    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
+    after_help = "Environment variables:\n  DYLOS_FC_BIN_DIR  Directory containing firecracker and jailer binaries (defaults to search order: ~/.local/share/dylos/bin [resolving SUDO_USER under sudo], $HOME/.local/share/dylos/bin, /usr/local/lib/dylos/bin, /opt/dylos/bin)\n  DYLOS_LAB_DIR     Base directory for lab state storage (overrides target/labs)\n  DYLOS_JAIL_DIR    Jail base directory (defaults to jails alongside the lab store)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -105,6 +105,21 @@ enum LabCommands {
     Down(DownArgs),
     /// Snapshot a running lab's microVMs and disks
     Snapshot(SnapshotArgs),
+    /// Compare two snapshots of a lab
+    Diff(DiffArgs),
+}
+
+#[derive(Args, Debug)]
+struct DiffArgs {
+    /// First snapshot directory containing manifest.json
+    snapshot_a: PathBuf,
+
+    /// Second snapshot directory containing manifest.json
+    snapshot_b: PathBuf,
+
+    /// Output machine-readable JSON
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -156,7 +171,7 @@ struct DownArgs {
     id: String,
 }
 
-fn build_config() -> LabConfig {
+fn build_base_config() -> LabConfig {
     let mut config = LabConfig::default();
     if let Some(bin_dir) = std::env::var_os("DYLOS_FC_BIN_DIR").filter(|d| !d.is_empty()) {
         let bin = PathBuf::from(bin_dir);
@@ -173,6 +188,16 @@ fn build_config() -> LabConfig {
             PathBuf::from,
         );
     config
+}
+
+fn build_launch_config() -> Result<LabConfig> {
+    let mut config = build_base_config();
+    let env_bin = std::env::var_os("DYLOS_FC_BIN_DIR").filter(|d| !d.is_empty());
+    let resolved =
+        dylos_cli::binaries::resolve_firecracker_binaries(env_bin.as_deref().map(Path::new))?;
+    config.jailer.jailer = resolved.jailer;
+    config.jailer.firecracker = resolved.firecracker;
+    Ok(config)
 }
 
 fn init_tracing() {
@@ -193,7 +218,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Lab(lab_args) => match lab_args.command {
             LabCommands::List => {
-                let config = build_config();
+                let config = build_base_config();
                 let labs = tokio::task::spawn_blocking(move || {
                     dylos_cli::list_labs(&config, Path::new("/proc"))
                 })
@@ -214,6 +239,7 @@ async fn main() -> Result<()> {
             LabCommands::Fork(args) => lab_fork(args).await,
             LabCommands::Down(down_args) => lab_down(down_args).await,
             LabCommands::Snapshot(snapshot_args) => lab_snapshot(snapshot_args).await,
+            LabCommands::Diff(diff_args) => lab_diff(diff_args).await,
         },
     }
 }
@@ -243,21 +269,22 @@ async fn lab_up(args: UpArgs) -> Result<()> {
         .context("failed to register SIGTERM handler")?;
     tracing::info!(lab = %id, "registered termination signal handlers for bring-up");
 
-    let config = build_config();
     let up_future = async {
         let spec_content = tokio::fs::read_to_string(&args.spec)
             .await
             .with_context(|| format!("failed to read lab spec from {}", args.spec.display()))?;
         let spec = LabSpec::from_yaml_str(&spec_content)
             .with_context(|| format!("failed to parse lab spec from {}", args.spec.display()))?;
-        Lab::up_with(&config, &spec, &id)
+        let config = build_launch_config()?;
+        let lab = Lab::up_with(&config, &spec, &id)
             .await
-            .with_context(|| format!("failed to bring up lab '{id}'"))
+            .with_context(|| format!("failed to bring up lab '{id}'"))?;
+        Ok::<_, anyhow::Error>((lab, config))
     };
     tokio::pin!(up_future);
 
     let mut interrupted = false;
-    let lab = loop {
+    let (lab, config) = loop {
         tokio::select! {
             // Consume ready signals before a simultaneous bring-up error can exit.
             biased;
@@ -296,7 +323,7 @@ async fn lab_restore(args: RestoreArgs) -> Result<()> {
         .context("failed to register SIGINT handler")?;
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
-    let config = build_config();
+    let config = build_launch_config()?;
     let restore = Lab::restore_with(&config, &args.snapshot, &id);
     tokio::pin!(restore);
     let mut interrupted = false;
@@ -363,7 +390,7 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
 
-    let config = build_config();
+    let config = build_launch_config()?;
     let fork_future = Lab::fork_with(&config, &args.snapshot, &clone_ids);
     tokio::pin!(fork_future);
 
@@ -430,7 +457,7 @@ async fn supervise(
 async fn lab_down(args: DownArgs) -> Result<()> {
     validate_lab_id(&args.id)?;
 
-    let config = build_config();
+    let config = build_base_config();
     let timeout = teardown_timeout();
 
     let pinned = pin_control_socket(&config.store.base, &args.id);
@@ -489,7 +516,7 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
             .map_err(|reason| anyhow!("invalid snapshot id '{snap_id}': {reason}"))?;
     }
 
-    let config = build_config();
+    let config = build_base_config();
     // Total deadline gives 60s budget beyond the 120s Firecracker API snapshot deadline
     let timeout = Duration::from_secs(180);
 
@@ -524,6 +551,208 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
     };
     println!("lab {} snapshotted successfully as {}", args.id, snap_id);
     Ok(())
+}
+
+async fn lab_diff(args: DiffArgs) -> Result<()> {
+    let diff = diff_snapshots(&args.snapshot_a, &args.snapshot_b)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to diff snapshots '{}' and '{}'",
+                args.snapshot_a.display(),
+                args.snapshot_b.display()
+            )
+        })?;
+
+    if args.json {
+        let json =
+            serde_json::to_string_pretty(&diff).context("failed to serialize diff to JSON")?;
+        println!("{json}");
+    } else {
+        print_human_topology(&diff.topology);
+        print_human_vms(&diff.vms);
+    }
+    Ok(())
+}
+
+fn format_ipv4_change<T: std::fmt::Display>(
+    ipv4: Option<&dylos_core::diff::ValueChange<Option<T>>>,
+) -> Option<String> {
+    ipv4.map(|c| {
+        let from_s = c
+            .from
+            .as_ref()
+            .map_or_else(|| "none".to_string(), ToString::to_string);
+        let to_s =
+            c.to.as_ref()
+                .map_or_else(|| "none".to_string(), ToString::to_string);
+        format!("ipv4: {from_s} -> {to_s}")
+    })
+}
+
+fn format_file_status(
+    status: dylos_core::diff::DiffStatus,
+    size_a: Option<u64>,
+    size_b: Option<u64>,
+) -> String {
+    match status {
+        dylos_core::diff::DiffStatus::Identical => {
+            format!("identical ({} bytes)", size_a.unwrap_or(0))
+        }
+        dylos_core::diff::DiffStatus::Changed => format!(
+            "changed ({} bytes -> {} bytes)",
+            size_a.unwrap_or(0),
+            size_b.unwrap_or(0)
+        ),
+        dylos_core::diff::DiffStatus::Added => {
+            format!("added ({} bytes)", size_b.unwrap_or(0))
+        }
+        dylos_core::diff::DiffStatus::Removed => {
+            format!("removed ({} bytes)", size_a.unwrap_or(0))
+        }
+    }
+}
+
+fn print_human_topology(topology: &dylos_core::diff::TopologyDiff) {
+    if topology.is_empty() {
+        println!("Topology: no changes");
+        return;
+    }
+    println!("Topology:");
+    print_human_segments(&topology.segments);
+    print_human_nodes(&topology.nodes);
+    print_human_interfaces(&topology.interfaces);
+}
+
+fn print_human_segments(segments: &dylos_core::diff::SegmentDiff) {
+    if segments.is_empty() {
+        return;
+    }
+    println!("  Segments:");
+    for (sign, names) in [("+", &segments.added), ("-", &segments.removed)] {
+        for name in names {
+            println!("    {sign} {}", name.escape_debug());
+        }
+    }
+    for changed in &segments.changed {
+        print!("    ~ {}:", changed.name.escape_debug());
+        if let Some(ref ipv6) = changed.ipv6 {
+            print!(" ipv6: {} -> {}", ipv6.from, ipv6.to);
+        }
+        if let Some(msg) = format_ipv4_change(changed.ipv4.as_ref()) {
+            print!(" {msg}");
+        }
+        println!();
+    }
+}
+
+fn format_routes(routes: &[dylos_core::StaticRoute]) -> String {
+    routes
+        .iter()
+        .map(|r| format!("{} via {}", r.destination, r.gateway))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn print_human_nodes(nodes: &dylos_core::diff::NodeDiff) {
+    if nodes.is_empty() {
+        return;
+    }
+    println!("  Nodes:");
+    for (sign, names) in [("+", &nodes.added), ("-", &nodes.removed)] {
+        for name in names {
+            println!("    {sign} {}", name.escape_debug());
+        }
+    }
+    for changed in &nodes.changed {
+        print!("    ~ {}:", changed.name.escape_debug());
+        let mut parts = Vec::new();
+        if let Some(ref image) = changed.image {
+            parts.push(format!("image: {} -> {}", image.from, image.to));
+        }
+        if let Some(ref vcpus) = changed.vcpus {
+            parts.push(format!("vcpus: {} -> {}", vcpus.from, vcpus.to));
+        }
+        if let Some(ref memory) = changed.memory {
+            parts.push(format!("memory: {} -> {}", memory.from, memory.to));
+        }
+        if let Some(ref routes) = changed.static_routes {
+            parts.push(format!(
+                "static_routes: {} -> {}",
+                format_routes(&routes.from),
+                format_routes(&routes.to)
+            ));
+        }
+        println!(" {}", parts.join(", "));
+    }
+}
+
+fn print_human_interfaces(interfaces: &dylos_core::diff::InterfaceDiff) {
+    if interfaces.is_empty() {
+        return;
+    }
+    println!("  Interfaces:");
+    for (sign, items) in [("+", &interfaces.added), ("-", &interfaces.removed)] {
+        for item in items {
+            let v4 = item
+                .ipv4
+                .map_or_else(String::new, |v| format!(", ipv4: {v}"));
+            println!(
+                "    {sign} {}/{} (segment: {}, ipv6: {}{v4})",
+                item.node.escape_debug(),
+                item.interface.escape_debug(),
+                item.segment.escape_debug(),
+                item.ipv6
+            );
+        }
+    }
+    for changed in &interfaces.changed {
+        print!(
+            "    ~ {}/{}:",
+            changed.node.escape_debug(),
+            changed.interface.escape_debug()
+        );
+        let mut parts = Vec::new();
+        if let Some(ref seg) = changed.segment {
+            parts.push(format!("segment: {} -> {}", seg.from, seg.to));
+        }
+        if let Some(ref ipv6) = changed.ipv6 {
+            parts.push(format!("ipv6: {} -> {}", ipv6.from, ipv6.to));
+        }
+        if let Some(msg) = format_ipv4_change(changed.ipv4.as_ref()) {
+            parts.push(msg);
+        }
+        println!(" {}", parts.join(", "));
+    }
+}
+
+fn print_human_vms(vms: &std::collections::BTreeMap<String, dylos_core::diff::VmDiff>) {
+    if vms.is_empty() {
+        println!("VMs: no VMs declared");
+        return;
+    }
+    println!("VMs:");
+    for (vm_name, vm_diff) in vms {
+        let escaped_vm = vm_name.escape_debug();
+        match vm_diff.status {
+            dylos_core::diff::DiffStatus::Added => println!("  {escaped_vm} (added):"),
+            dylos_core::diff::DiffStatus::Removed => println!("  {escaped_vm} (removed):"),
+            _ => println!("  {escaped_vm}:"),
+        }
+        for (label, file) in [("state: ", &vm_diff.state), ("memory:", &vm_diff.memory)] {
+            println!(
+                "    {label} {}",
+                format_file_status(file.status, file.size_a, file.size_b)
+            );
+        }
+        for disk in &vm_diff.disks {
+            let escaped_path = disk.path.display().to_string().escape_debug().to_string();
+            println!(
+                "    disk \"{escaped_path}\": {}",
+                format_file_status(disk.status, disk.size_a, disk.size_b)
+            );
+        }
+    }
 }
 
 #[cfg(test)]
