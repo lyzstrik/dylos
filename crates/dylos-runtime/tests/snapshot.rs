@@ -1557,3 +1557,54 @@ async fn hashing_failure_after_resume_removes_unpublished_staging() {
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
+
+#[tokio::test]
+async fn completed_vm_capture_does_not_wait_for_another_snapshot_api() {
+    let (sandbox, _store, _spec, lab) = setup_lab("pipeline").await;
+    let a = lab.vms[0].paths().root.clone();
+    let b = lab.vms[1].paths().root.clone();
+    fs::write(b.join("stall-snapshot"), b"").unwrap();
+    let task = tokio::spawn(async move {
+        let result = lab.snapshot("snap").await;
+        (result, lab)
+    });
+    wait_until("second API stalled", Duration::from_secs(5), || {
+        b.join("snapshot-started").exists()
+    })
+    .await;
+    wait_until(
+        "first VM privately captured",
+        Duration::from_secs(5),
+        || a.join("capture-done").exists() && !a.join("snap.mem").exists(),
+    )
+    .await;
+    assert!(a.join("is-paused").exists());
+    assert!(b.join("is-paused").exists());
+    assert!(!a.join("resume-started").exists());
+    assert!(!b.join("resume-started").exists());
+    fs::remove_file(b.join("stall-snapshot")).unwrap();
+    let (result, mut lab) = task.await.unwrap();
+    result.unwrap();
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn memory_reservation_failure_precedes_pause_and_cleans_all_outputs() {
+    let (sandbox, store, _spec, mut lab) = setup_lab("reserve-fail").await;
+    for vm in &lab.vms {
+        fs::write(vm.paths().root.join("stall-pause"), b"").unwrap();
+    }
+    fs::write(lab.vms[1].paths().root.join("snap.mem"), b"existing").unwrap();
+    assert!(lab.snapshot("snap").await.is_err());
+    for vm in &lab.vms {
+        assert!(!vm.paths().root.join("pause-started").exists());
+        assert!(!vm.paths().root.join("is-paused").exists());
+        assert!(!vm.paths().root.join("snap.mem").exists());
+    }
+    assert!(!store.snapshot_dir("reserve-fail", ".staging-snap").exists());
+    assert!(!store.snapshot_dir("reserve-fail", "snap").exists());
+    lab.teardown().await.unwrap();
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}

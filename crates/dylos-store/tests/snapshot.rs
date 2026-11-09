@@ -686,6 +686,56 @@ fn deferred_capture_preserves_zero_chunks_and_trailing_holes() {
 }
 
 #[test]
+fn deferred_capture_keeps_scattered_guest_pages_sparse() {
+    use sha2::Digest;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+    for buffered in [false, true] {
+        let (temp, store, _spec) = setup();
+        let snapshot = store.stage_snapshot("lab", "pages").unwrap();
+        let source = temp.path().join("snap.mem");
+        let mut bytes = vec![0; 3 * 1024 * 1024 + 17];
+        for offset in [0, 1024 * 1024 + 4096, 2 * 1024 * 1024, bytes.len() - 1] {
+            bytes[offset] = 42;
+        }
+        fs::write(&source, &bytes).unwrap();
+        let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
+        let source_file = VmFileSource::open(&source, bytes.len() as u64).unwrap();
+        let destination = snapshot.root().join("vms/node1/vm.mem");
+        let mut meta = if buffered {
+            let capture = snapshot
+                .buffer_vm_source(source_file, "node1", "vm.mem")
+                .unwrap();
+            assert!(!source.exists());
+            assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
+            writer.write_all(b"modified").unwrap();
+            snapshot.persist_buffered_vm_file(capture).unwrap()
+        } else {
+            let (meta, _) = snapshot
+                .capture_vm_source(source_file, "node1", "vm.mem")
+                .unwrap();
+            assert!(!source.exists());
+            writer.write_all(b"modified").unwrap();
+            meta
+        };
+        store.sync_filesystem().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        let metadata = fs::metadata(&destination).unwrap();
+        assert!(metadata.permissions().readonly());
+        assert!(
+            metadata.blocks() * 512 < 128 * 1024,
+            "scattered pages must not allocate whole MiB chunks"
+        );
+        snapshot.hash_file(&mut meta).unwrap();
+        assert_eq!(meta.size, bytes.len() as u64);
+        assert_eq!(
+            meta.sha256,
+            dylos_core::manifest::sha256_hex(&sha2::Sha256::digest(&bytes).into())
+        );
+    }
+}
+
+#[test]
 fn restore_and_verify_refuse_changed_state_memory_and_disk() {
     for name in ["vm.mem", "rootfs.ext4", "vm.state"] {
         let (_temp, store, spec) = setup();
