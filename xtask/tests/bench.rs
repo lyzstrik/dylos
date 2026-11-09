@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -721,7 +722,7 @@ fn default_bench_parent_picks_short_dir_on_same_mount() {
     let spec = five_vm_spec();
     let fc_bin = Path::new("firecracker");
 
-    let parent = select_default_bench_parent(&ws, &options, &spec, fc_bin);
+    let parent = select_default_bench_parent(&ws, &options, &spec, fc_bin).unwrap();
     let child = setup_private_bench_dir(&parent).unwrap();
     assert!(child.starts_with(&parent));
     assert_eq!(
@@ -771,7 +772,7 @@ fn default_parent_selection_handles_deep_workspace_and_cross_fs_fallback() {
         "target/b on deep checkout must exceed socket path limit"
     );
 
-    let parent = select_default_bench_parent(&deep_ws, &options, &spec, fc_bin);
+    let parent = select_default_bench_parent(&deep_ws, &options, &spec, fc_bin).unwrap();
 
     let child = setup_private_bench_dir(&parent).unwrap();
     let deep_dev = fs::metadata(&deep_ws).unwrap().dev();
@@ -956,4 +957,165 @@ async fn oversized_socket_path_fails_before_measurements_at_orchestration_bounda
     assert_eq!(run_dirs(&parent), Vec::<PathBuf>::new());
 
     fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn probe_failure_rolls_back_partial_directory_and_propagates_error() {
+    let dir = scratch("probe-rollback");
+    let sentinel = dir.join("important.txt");
+    fs::write(&sentinel, b"preserve me").unwrap();
+
+    let acl_ok = Command::new("setfacl")
+        .arg("-d")
+        .arg("-m")
+        .arg("u::r-x,g::r-x,o::---")
+        .arg(&dir)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if acl_ok {
+        // Under this default ACL, probe directory creation succeeds (0700 masked to 0500),
+        // but creating the probe file inside it fails.
+        // is_writable_dir must roll back the probe directory and propagate the error.
+        let res = is_writable_dir(&dir);
+        assert!(
+            res.is_err(),
+            "must propagate error when probe file creation fails"
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot create probe file"),
+            "error message must describe probe file creation failure: {err_msg}"
+        );
+        // Ensure no leftover probe directory remains and sentinel is untouched
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "partial probe directory must be removed during rollback"
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+
+        // Verify that select_default_bench_parent propagates the error rather than suppressing it
+        let options = BenchOptions::default();
+        let spec = five_vm_spec();
+        let fc_bin = Path::new("firecracker");
+        let sel_res = select_default_bench_parent(&dir, &options, &spec, fc_bin);
+        assert!(
+            sel_res.is_err(),
+            "selector must propagate probe failure through the production boundary"
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "selection failure must leave no residual probe directory"
+        );
+    }
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn candidate_socket_path_budget_includes_collision_suffix() {
+    let spec = five_vm_spec();
+    let options = BenchOptions::default();
+    let fc_bin = Path::new("firecracker");
+
+    let pid = std::process::id();
+    let base = std::env::temp_dir().join(format!("cb-{pid}"));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let pid_comp = format!("r{pid:x}");
+    let ff_comp = format!("r{pid:x}-ff");
+
+    // Measure suffix length below run_dir
+    let dummy = base.join("test");
+    let dummy_run = dummy.join(&pid_comp);
+    let sample_socket = longest_bench_socket_path(&dummy_run, &options, &spec, fc_bin);
+    let suffix_len = sample_socket.as_os_str().len() - dummy_run.as_os_str().len();
+
+    // Construct a candidate directory where candidate.join(r{pid:x}) would produce
+    // a socket path of exactly 107 bytes, but candidate.join(r{pid:x}-ff) produces 110 bytes (> 107).
+    let target_cand_len = 107 - suffix_len - pid_comp.len() - 1;
+    let base_len = base.as_os_str().len();
+    assert!(
+        target_cand_len > base_len + 1,
+        "base path must be short enough to test boundary: target_cand_len={target_cand_len}, base_len={base_len}"
+    );
+    let pad = target_cand_len - base_len - 1;
+    let boundary_cand = base.join("b".repeat(pad));
+    fs::create_dir_all(&boundary_cand).unwrap();
+
+    let initial_socket =
+        longest_bench_socket_path(&boundary_cand.join(&pid_comp), &options, &spec, fc_bin);
+    let collision_socket =
+        longest_bench_socket_path(&boundary_cand.join(&ff_comp), &options, &spec, fc_bin);
+
+    assert_eq!(
+        initial_socket.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH,
+        "initial socket without collision suffix must be at the limit"
+    );
+    assert!(
+        collision_socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH,
+        "socket path with collision suffix must exceed 107 bytes"
+    );
+
+    // Pre-create the initial run directory to force setup_private_bench_dir to disambiguate
+    let existing_run = boundary_cand.join(&pid_comp);
+    fs::create_dir_all(&existing_run).unwrap();
+
+    let disambig_run = setup_private_bench_dir(&boundary_cand).unwrap();
+    assert_eq!(
+        disambig_run,
+        boundary_cand.join(format!("r{pid:x}-1")),
+        "pre-existing run dir must cause disambiguation to -1"
+    );
+    let disambig_socket = longest_bench_socket_path(&disambig_run, &options, &spec, fc_bin);
+    assert!(
+        disambig_socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH,
+        "disambiguated socket path {} must exceed limit {}",
+        disambig_socket.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH
+    );
+
+    cleanup_private_bench_dir(&disambig_run).unwrap();
+    cleanup_private_bench_dir(&existing_run).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn exhausted_candidates_fail_selection_with_clear_tmp_dir_error() {
+    let ws = scratch("exhausted-ws");
+    // Repetitions and clone count produce long clone IDs (f-n10000000-r10000000-c10000000)
+    // such that socket paths cannot fit in any candidate directory on the filesystem.
+    let options = BenchOptions {
+        repetitions: 10_000_000,
+        fork_counts: vec![10_000_000],
+        ..BenchOptions::default()
+    };
+    let oversized_yaml = format!(
+        "segments:\n  - name: lan\n    ipv6: fd64:796c:6f73:1::/64\nnodes:\n  - name: {}\n    image: alpine\n    vcpus: 1\n    memory: 256\n",
+        "n".repeat(32)
+    );
+    let oversized_spec = LabSpec::from_yaml_str(&oversized_yaml).unwrap();
+    let fc_bin = Path::new("firecracker");
+
+    let err = select_default_bench_parent(&ws, &options, &oversized_spec, fc_bin).unwrap_err();
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("no verified benchmark directory found"),
+        "error message must describe exhausted candidates: {msg}"
+    );
+    assert!(
+        msg.contains("--tmp-dir"),
+        "error message must suggest --tmp-dir: {msg}"
+    );
+    assert!(
+        msg.contains(&MAX_UNIX_SOCKET_PATH.to_string()),
+        "error message must state the 107-byte limit: {msg}"
+    );
+
+    fs::remove_dir_all(&ws).unwrap();
 }

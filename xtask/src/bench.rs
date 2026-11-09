@@ -885,8 +885,8 @@ pub fn is_writable_dir(path: &Path) -> anyhow::Result<bool> {
         .map_or(0, |d| d.as_nanos());
     let probe_dir = path.join(format!(".probe-{pid}-{nanos:x}"));
 
-    let created = match DirBuilder::new().mode(0o700).create(&probe_dir) {
-        Ok(()) => true,
+    match DirBuilder::new().mode(0o700).create(&probe_dir) {
+        Ok(()) => {}
         Err(e)
             if e.kind() == std::io::ErrorKind::PermissionDenied
                 || e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
@@ -895,23 +895,39 @@ pub fn is_writable_dir(path: &Path) -> anyhow::Result<bool> {
             return Ok(false);
         }
         Err(_) => return Ok(false),
-    };
-    if created {
-        let probe_file = probe_dir.join("p");
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&probe_file)
-            .with_context(|| format!("cannot create probe file in {}", probe_dir.display()))?;
-        drop(file);
-        fs::remove_file(&probe_file)
-            .with_context(|| format!("cannot remove probe file {}", probe_file.display()))?;
-        fs::remove_dir(&probe_dir)
-            .with_context(|| format!("cannot remove probe directory {}", probe_dir.display()))?;
-        Ok(true)
-    } else {
-        Ok(false)
+    }
+
+    let probe_file = probe_dir.join("p");
+    let open_res = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe_file);
+
+    match open_res {
+        Ok(file) => {
+            drop(file);
+            let rm_file = fs::remove_file(&probe_file)
+                .with_context(|| format!("cannot remove probe file {}", probe_file.display()));
+            let rm_dir = fs::remove_dir(&probe_dir)
+                .with_context(|| format!("cannot remove probe directory {}", probe_dir.display()));
+            rm_file?;
+            rm_dir?;
+            Ok(true)
+        }
+        Err(open_err) => {
+            let rm_dir = fs::remove_dir(&probe_dir).with_context(|| {
+                format!(
+                    "cannot remove probe directory {} during rollback",
+                    probe_dir.display()
+                )
+            });
+            rm_dir?;
+            Err(anyhow::Error::from(open_err).context(format!(
+                "cannot create probe file in {}",
+                probe_dir.display()
+            )))
+        }
     }
 }
 
@@ -975,85 +991,97 @@ pub fn validate_bench_socket_path(
 }
 
 /// Checks whether every socket path created under `candidate` stays within the 107-byte limit,
-/// assuming worst-case run directory component length.
+/// assuming worst-case run directory component length (including collision suffix).
 fn candidate_socket_path_fits(
     candidate: &Path,
     options: &BenchOptions,
     spec: &LabSpec,
     fc_bin: &Path,
 ) -> bool {
-    let test_run_dir = candidate.join(format!("r{:x}", std::process::id()));
+    // setup_private_bench_dir uses r{pid:x} or r{pid:x}-{disambig:x} up to disambig = 255 (0xff).
+    // The longest possible run directory component is r{pid:x}-ff.
+    let test_run_dir = candidate.join(format!("r{:x}-ff", std::process::id()));
     let longest_socket = longest_bench_socket_path(&test_run_dir, options, spec, fc_bin);
     validate_unix_socket_path(&longest_socket).is_ok()
 }
 
 /// Selects a parent directory for the exclusive benchmark run directory on the same filesystem
 /// as `workspace` such that all Unix domain socket paths stay within Linux's 107-byte limit.
+///
+/// # Errors
+/// Returns an error if any probe cleanup fails, or if no verified candidate directory
+/// on the workspace filesystem mount can satisfy the 107-byte socket limit.
 pub fn select_default_bench_parent(
     workspace: &Path,
     options: &BenchOptions,
     spec: &LabSpec,
     fc_bin: &Path,
-) -> PathBuf {
+) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
     let canonical_ws = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let ws_dev = match fs::metadata(&canonical_ws) {
-        Ok(m) => m.dev(),
-        Err(_) => return canonical_ws.join("target/b"),
-    };
+    let ws_dev = fs::metadata(&canonical_ws)
+        .with_context(|| {
+            format!(
+                "cannot read metadata for workspace {}",
+                canonical_ws.display()
+            )
+        })?
+        .dev();
 
-    let check_candidate = |candidate: &Path| -> bool {
+    let check_candidate = |candidate: &Path| -> anyhow::Result<bool> {
         let Some(existing) = shallowest_existing_ancestor(candidate) else {
-            return false;
+            return Ok(false);
         };
         let Ok(meta) = fs::symlink_metadata(existing) else {
-            return false;
+            return Ok(false);
         };
         if meta.file_type().is_symlink() || !meta.is_dir() {
-            return false;
+            return Ok(false);
         }
         if meta.dev() != ws_dev {
-            return false;
+            return Ok(false);
         }
         if is_tmpfs(existing) {
-            return false;
+            return Ok(false);
         }
-        if !is_writable_dir(existing).unwrap_or(false) {
-            return false;
+        if !is_writable_dir(existing)? {
+            return Ok(false);
         }
-        candidate_socket_path_fits(candidate, options, spec, fc_bin)
+        Ok(candidate_socket_path_fits(candidate, options, spec, fc_bin))
     };
 
-    let probe_b = |base: &Path| -> Option<PathBuf> {
+    let probe_b = |base: &Path| -> anyhow::Result<Option<PathBuf>> {
         let dot_b = base.join(".b");
-        if check_candidate(&dot_b) {
-            return Some(dot_b);
+        if check_candidate(&dot_b)? {
+            return Ok(Some(dot_b));
         }
         let plain_b = base.join("b");
-        if check_candidate(&plain_b) {
-            return Some(plain_b);
+        if check_candidate(&plain_b)? {
+            return Ok(Some(plain_b));
         }
-        None
+        Ok(None)
     };
 
     // 1. Cargo's default scratch location under target/b (if it fits within the socket limit)
     let target_b = canonical_ws.join("target/b");
-    if check_candidate(&target_b) {
-        return target_b;
+    if check_candidate(&target_b)? {
+        return Ok(target_b);
     }
 
     // 2. Standard persistent temporary directory (/var/tmp)
     let var_tmp = Path::new("/var/tmp");
-    if check_candidate(var_tmp) {
-        return var_tmp.to_path_buf();
+    if check_candidate(var_tmp)? {
+        return Ok(var_tmp.to_path_buf());
     }
 
     // 3. Operator's home directory if on the same mount
-    if let Some(p) = std::env::var_os("HOME").and_then(|home| probe_b(Path::new(&home))) {
-        return p;
+    if let Some(home) = std::env::var_os("HOME")
+        && let Some(p) = probe_b(Path::new(&home))?
+    {
+        return Ok(p);
     }
 
     // 4. Mount root of the required filesystem
@@ -1065,8 +1093,8 @@ pub fn select_default_bench_parent(
             break;
         }
     }
-    if let Some(p) = probe_b(&mount_root) {
-        return p;
+    if let Some(p) = probe_b(&mount_root)? {
+        return Ok(p);
     }
 
     // 5. Shallowest writable ancestor towards workspace
@@ -1074,19 +1102,20 @@ pub fn select_default_bench_parent(
         let mut current = mount_root.clone();
         for component in rel.components() {
             current.push(component);
-            if let Some(p) = probe_b(&current) {
-                return p;
+            if let Some(p) = probe_b(&current)? {
+                return Ok(p);
             }
         }
     }
 
     // 6. Hidden .b or b directory directly under workspace
-    if let Some(p) = probe_b(&canonical_ws) {
-        return p;
+    if let Some(p) = probe_b(&canonical_ws)? {
+        return Ok(p);
     }
 
-    // Fallback: shortest candidate on workspace mount
-    mount_root.join("b")
+    bail!(
+        "no verified benchmark directory found on workspace filesystem mount where socket paths fit within {MAX_UNIX_SOCKET_PATH} bytes; specify a directory with --tmp-dir"
+    )
 }
 
 /// Result of the measurement phases.
@@ -1625,9 +1654,15 @@ async fn measure_into(
 /// Executes the full benchmark suite.
 pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResults> {
     let prereqs = check_prerequisites()?;
-    let parent_dir = options.tmp_dir.clone().unwrap_or_else(|| {
-        select_default_bench_parent(&prereqs.workspace, &options, &prereqs.spec, &prereqs.fc_bin)
-    });
+    let parent_dir = match options.tmp_dir.clone() {
+        Some(dir) => dir,
+        None => select_default_bench_parent(
+            &prereqs.workspace,
+            &options,
+            &prereqs.spec,
+            &prereqs.fc_bin,
+        )?,
+    };
 
     let results =
         run_in_private_dir(&parent_dir, |run_dir| measure(&options, &prereqs, run_dir)).await?;
