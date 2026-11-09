@@ -34,6 +34,184 @@ async fn assert_vms_running_stably(vms: &[Vm]) {
     .await;
 }
 
+fn dump_memory_and_dirty_limits() {
+    let mut mem_total_kb = 0u64;
+    let mut mem_available_kb = 0u64;
+    let mut mem_dirty_kb = 0u64;
+    let mut mem_writeback_kb = 0u64;
+    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            let mut parts = line.split_whitespace();
+            if let (Some(key), Some(val)) = (parts.next(), parts.next())
+                && let Ok(num) = val.parse::<u64>()
+            {
+                match key {
+                    "MemTotal:" => mem_total_kb = num,
+                    "MemAvailable:" => mem_available_kb = num,
+                    "Dirty:" => mem_dirty_kb = num,
+                    "Writeback:" => mem_writeback_kb = num,
+                    _ => {}
+                }
+            }
+        }
+    }
+    eprintln!(
+        "diagnostics meminfo: total={} MiB, available={} MiB, dirty={} MiB, writeback={} MiB",
+        mem_total_kb / 1024,
+        mem_available_kb / 1024,
+        mem_dirty_kb / 1024,
+        mem_writeback_kb / 1024
+    );
+
+    let mut dirty_ratio = 0u64;
+    let mut dirty_bg_ratio = 0u64;
+    let mut dirty_bytes = 0u64;
+    let mut dirty_bg_bytes = 0u64;
+
+    for (name, path, out) in [
+        (
+            "vm.dirty_ratio",
+            "/proc/sys/vm/dirty_ratio",
+            &mut dirty_ratio,
+        ),
+        (
+            "vm.dirty_background_ratio",
+            "/proc/sys/vm/dirty_background_ratio",
+            &mut dirty_bg_ratio,
+        ),
+        (
+            "vm.dirty_bytes",
+            "/proc/sys/vm/dirty_bytes",
+            &mut dirty_bytes,
+        ),
+        (
+            "vm.dirty_background_bytes",
+            "/proc/sys/vm/dirty_background_bytes",
+            &mut dirty_bg_bytes,
+        ),
+    ] {
+        if let Ok(val) = fs::read_to_string(path) {
+            let trimmed = val.trim();
+            if let Ok(num) = trimmed.parse::<u64>() {
+                *out = num;
+            }
+            eprintln!("diagnostics sysctl: {name} = {trimmed}");
+        }
+    }
+    for (name, path) in [
+        (
+            "vm.dirty_expire_centisecs",
+            "/proc/sys/vm/dirty_expire_centisecs",
+        ),
+        (
+            "vm.dirty_writeback_centisecs",
+            "/proc/sys/vm/dirty_writeback_centisecs",
+        ),
+    ] {
+        if let Ok(val) = fs::read_to_string(path) {
+            eprintln!("diagnostics sysctl: {name} = {}", val.trim());
+        }
+    }
+
+    let effective_dirty_bytes = if dirty_bytes > 0 {
+        dirty_bytes
+    } else {
+        (mem_available_kb * 1024 * dirty_ratio) / 100
+    };
+    let effective_dirty_bg_bytes = if dirty_bg_bytes > 0 {
+        dirty_bg_bytes
+    } else {
+        (mem_available_kb * 1024 * dirty_bg_ratio) / 100
+    };
+    eprintln!(
+        "diagnostics effective limits: dirty={} MiB, dirty_background={} MiB (based on available mem {} MiB)",
+        effective_dirty_bytes / (1024 * 1024),
+        effective_dirty_bg_bytes / (1024 * 1024),
+        mem_available_kb / 1024
+    );
+}
+
+fn dump_vmstat() {
+    if let Ok(vmstat) = fs::read_to_string("/proc/vmstat") {
+        for line in vmstat.lines() {
+            if let Some(key) = line.split_whitespace().next()
+                && matches!(
+                    key,
+                    "nr_dirty" | "nr_writeback" | "nr_dirtied" | "nr_written"
+                )
+            {
+                eprintln!("diagnostics vmstat: {}", line.trim());
+            }
+        }
+    }
+}
+
+fn dump_pressure() {
+    for (press_name, press_path) in [
+        ("pressure/io", "/proc/pressure/io"),
+        ("pressure/memory", "/proc/pressure/memory"),
+    ] {
+        if let Ok(content) = fs::read_to_string(press_path) {
+            for line in content.lines() {
+                eprintln!("diagnostics {press_name}: {}", line.trim());
+            }
+        }
+    }
+}
+
+fn dump_loop_devices() {
+    if let Ok(entries) = fs::read_dir("/sys/block") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("loop") {
+                let dev_path = entry.path();
+                let dio_path = dev_path.join("loop/dio");
+                let backing_path = dev_path.join("loop/backing_file");
+                if dio_path.exists() || backing_path.exists() {
+                    let dio = fs::read_to_string(&dio_path).unwrap_or_default();
+                    let backing = fs::read_to_string(&backing_path).unwrap_or_default();
+                    if !backing.trim().is_empty() {
+                        eprintln!(
+                            "diagnostics loop device {}: backing={}, dio={}",
+                            name_str,
+                            backing.trim(),
+                            dio.trim()
+                        );
+                        let queue_path = dev_path.join("queue");
+                        for qf in ["scheduler", "nr_requests", "max_sectors_kb", "write_cache"] {
+                            if let Ok(qval) = fs::read_to_string(queue_path.join(qf)) {
+                                eprintln!(
+                                    "diagnostics loop {name_str} queue/{qf}: {}",
+                                    qval.trim()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(output) = Command::new("losetup").arg("-a").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if !text.trim().is_empty() {
+            for line in text.lines() {
+                eprintln!("diagnostics losetup: {}", line.trim());
+            }
+        }
+    }
+}
+
+fn dump_runner_diagnostics(phase: &str) {
+    eprintln!("=== [runner diagnostics: {phase}] ===");
+    dump_memory_and_dirty_limits();
+    dump_vmstat();
+    dump_pressure();
+    dump_loop_devices();
+    eprintln!("=== [end runner diagnostics: {phase}] ===");
+}
+
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn five_vms_snapshot_measurement_and_integrity() {
@@ -68,6 +246,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
 
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/five.yaml")).unwrap();
     let lab_id = "five-e2e";
+    dump_runner_diagnostics("before test");
     let mut lab = Lab::up_with(&config, &spec, lab_id)
         .await
         .expect("lab bring-up failed");
@@ -76,12 +255,14 @@ async fn five_vms_snapshot_measurement_and_integrity() {
     assert_vms_running_stably(lab.vms()).await;
 
     // Snapshot the lab with detailed timings
+    dump_runner_diagnostics("before snapshot");
     let started = Instant::now();
     let (manifest, timings) = lab
         .snapshot_with_timings("snap-five")
         .await
         .expect("snapshot failed");
     let total_ms = started.elapsed().as_millis();
+    dump_runner_diagnostics("after snapshot");
 
     // Verify manifest and files
     assert_eq!(manifest.vms.len(), 5);
@@ -152,6 +333,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
 
     // Clean teardown
     lab.teardown().await.expect("teardown failed");
+    dump_runner_diagnostics("after test");
 }
 
 #[tokio::test]

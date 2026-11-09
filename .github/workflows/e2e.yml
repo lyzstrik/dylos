@@ -58,13 +58,6 @@ jobs:
           sudo mount -o compress=zstd:3 "$LOOP_DEV" "$GITHUB_WORKSPACE"
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
 
-          # Prevent balance_dirty_pages_ratelimited from throttling burst writes during snapshotting (LYZ-122).
-          # Five 256 MiB VMs write 1.28 GiB of dirty pages within milliseconds; raising dirty_ratio
-          # allows transient memory dumps to be buffered in RAM until captured and unlinked, preventing
-          # Firecracker's write() syscalls from stalling on disk writeback while VMs are paused.
-          sudo sysctl -w vm.dirty_ratio=50
-          sudo sysctl -w vm.dirty_background_ratio=20
-
           # Verify reflink support on the mounted workspace
           TMP_SRC=$(mktemp "$GITHUB_WORKSPACE/reflink_test_src.XXXXXX")
           TMP_DST=$(mktemp -u "$GITHUB_WORKSPACE/reflink_test_dst.XXXXXX")
@@ -174,7 +167,6 @@ jobs:
           PARTITION: ${{ matrix.selection }}
         run: |
           set -o pipefail
-          sync
           sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" "DYLOS_ENDURANCE_CYCLES=5" just e2e "$PARTITION" 2>&1 | tee e2e.log
           if grep -q "SKIPPED" e2e.log; then
             echo "::error::An e2e test was skipped for missing prerequisites" >&2
