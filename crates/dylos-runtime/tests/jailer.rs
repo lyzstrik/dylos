@@ -728,58 +728,81 @@ fn deep_working_directory_cross_filesystem_fallback_keeps_socket_paths_within_su
 
 #[tokio::test]
 async fn static_binary_fixture_is_accepted_as_static_elf() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary");
-    assert!(fixture.exists(), "fixture missing at {fixture:?}");
-    assert!(!has_elf_interpreter(&fixture).unwrap());
-    assert!(check_static_firecracker(&fixture).await.is_ok());
-    assert!(check_static_firecracker_sync(&fixture).is_ok());
+    let fixture = support::elf::ElfBuilder::static_binary()
+        .write_temp()
+        .unwrap();
+    assert!(
+        fixture.path().exists(),
+        "fixture missing at {:?}",
+        fixture.path()
+    );
+    assert!(!has_elf_interpreter(fixture.path()).unwrap());
+    assert!(check_static_firecracker(fixture.path()).await.is_ok());
+    assert!(check_static_firecracker_sync(fixture.path()).is_ok());
 }
 
 #[tokio::test]
 async fn static_binary_elf32_fixture_is_accepted() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary_elf32");
-    assert!(fixture.exists(), "fixture missing at {fixture:?}");
-    assert!(!has_elf_interpreter(&fixture).unwrap());
-    assert!(check_static_firecracker(&fixture).await.is_ok());
+    let fixture = support::elf::ElfBuilder::static_elf32()
+        .write_temp()
+        .unwrap();
+    assert!(
+        fixture.path().exists(),
+        "fixture missing at {:?}",
+        fixture.path()
+    );
+    assert!(!has_elf_interpreter(fixture.path()).unwrap());
+    assert!(check_static_firecracker(fixture.path()).await.is_ok());
 }
 
 #[tokio::test]
 async fn static_binary_big_endian_fixture_is_accepted() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/elf/static_binary_big_endian");
-    assert!(fixture.exists(), "fixture missing at {fixture:?}");
-    assert!(!has_elf_interpreter(&fixture).unwrap());
-    assert!(check_static_firecracker(&fixture).await.is_ok());
+    let fixture = support::elf::ElfBuilder::static_big_endian()
+        .write_temp()
+        .unwrap();
+    assert!(
+        fixture.path().exists(),
+        "fixture missing at {:?}",
+        fixture.path()
+    );
+    assert!(!has_elf_interpreter(fixture.path()).unwrap());
+    assert!(check_static_firecracker(fixture.path()).await.is_ok());
 }
 
 #[tokio::test]
 async fn static_binary_pie_fixture_is_accepted() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/static_binary_pie");
-    assert!(fixture.exists(), "fixture missing at {fixture:?}");
-    assert!(!has_elf_interpreter(&fixture).unwrap());
-    assert!(check_static_firecracker(&fixture).await.is_ok());
+    let fixture = support::elf::ElfBuilder::static_pie().write_temp().unwrap();
+    assert!(
+        fixture.path().exists(),
+        "fixture missing at {:?}",
+        fixture.path()
+    );
+    assert!(!has_elf_interpreter(fixture.path()).unwrap());
+    assert!(check_static_firecracker(fixture.path()).await.is_ok());
 }
 
 #[tokio::test]
 async fn dynamic_binary_fixture_is_rejected_with_dynamic_firecracker_error() {
-    let fixture =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
-    assert!(fixture.exists(), "fixture missing at {fixture:?}");
-    assert!(has_elf_interpreter(&fixture).unwrap());
-
-    let err = check_static_firecracker(&fixture).await.unwrap_err();
+    let fixture = support::elf::ElfBuilder::dynamic_binary()
+        .write_temp()
+        .unwrap();
     assert!(
-        matches!(&err, Error::DynamicFirecracker { path } if path == &fixture),
+        fixture.path().exists(),
+        "fixture missing at {:?}",
+        fixture.path()
+    );
+    assert!(has_elf_interpreter(fixture.path()).unwrap());
+
+    let err = check_static_firecracker(fixture.path()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::DynamicFirecracker { path } if path == fixture.path()),
         "{err:?}"
     );
     let msg = err.to_string();
     assert!(msg.contains("dynamically linked"), "{msg}");
     assert!(msg.contains("DYLOS_FC_BIN_DIR"), "{msg}");
     assert!(msg.contains("docs/host.md"), "{msg}");
-    assert!(msg.contains(&fixture.display().to_string()), "{msg}");
+    assert!(msg.contains(&fixture.path().display().to_string()), "{msg}");
 }
 
 #[tokio::test]
@@ -818,7 +841,7 @@ async fn truncated_elf_header_is_rejected() {
 #[tokio::test]
 async fn unsupported_elf_class_is_rejected() {
     let temp = tempfile::NamedTempFile::new().unwrap();
-    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    let mut bytes = support::elf::ElfBuilder::static_binary().build();
     bytes[4] = 3;
     std::fs::write(temp.path(), &bytes).unwrap();
     let err = check_static_firecracker(temp.path()).await.unwrap_err();
@@ -831,7 +854,7 @@ async fn unsupported_elf_class_is_rejected() {
 #[tokio::test]
 async fn unsupported_elf_endianness_is_rejected() {
     let temp = tempfile::NamedTempFile::new().unwrap();
-    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    let mut bytes = support::elf::ElfBuilder::static_binary().build();
     bytes[5] = 0;
     std::fs::write(temp.path(), &bytes).unwrap();
     let err = check_static_firecracker(temp.path()).await.unwrap_err();
@@ -844,7 +867,7 @@ async fn unsupported_elf_endianness_is_rejected() {
 #[tokio::test]
 async fn program_header_table_extending_beyond_eof_is_rejected() {
     let temp = tempfile::NamedTempFile::new().unwrap();
-    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    let mut bytes = support::elf::ElfBuilder::static_binary().build();
     bytes[0x38] = 10;
     std::fs::write(temp.path(), &bytes).unwrap();
     let err = check_static_firecracker(temp.path()).await.unwrap_err();
@@ -857,7 +880,7 @@ async fn program_header_table_extending_beyond_eof_is_rejected() {
 #[tokio::test]
 async fn undersized_phentsize_is_rejected() {
     let temp = tempfile::NamedTempFile::new().unwrap();
-    let mut bytes = include_bytes!("fixtures/elf/static_binary").to_vec();
+    let mut bytes = support::elf::ElfBuilder::static_binary().build();
     bytes[0x36] = 16;
     std::fs::write(temp.path(), &bytes).unwrap();
     let err = check_static_firecracker(temp.path()).await.unwrap_err();
@@ -876,25 +899,11 @@ async fn check_static_firecracker_fails_on_missing_file() {
 
 #[tokio::test]
 async fn malformed_program_header_layouts_fail_closed() {
+    let dynamic = support::elf::ElfBuilder::dynamic_binary().build();
+    let elf32 = support::elf::ElfBuilder::static_elf32().build();
     for (fixture, phoff, ehsize, phentsize, phnum, header_size, entry_size) in [
-        (
-            include_bytes!("fixtures/elf/dynamic_binary").as_slice(),
-            32,
-            52,
-            54,
-            56,
-            64u16,
-            56u16,
-        ),
-        (
-            include_bytes!("fixtures/elf/static_binary_elf32").as_slice(),
-            28,
-            40,
-            42,
-            44,
-            52u16,
-            32u16,
-        ),
+        (dynamic.as_slice(), 32, 52, 54, 56, 64u16, 56u16),
+        (elf32.as_slice(), 28, 40, 42, 44, 52u16, 32u16),
     ] {
         for (field, value, reason) in [
             (phoff, 0u64, "program header table"),

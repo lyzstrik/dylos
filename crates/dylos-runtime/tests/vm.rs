@@ -1,7 +1,6 @@
 mod support;
 
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::time::Duration;
 
@@ -172,8 +171,10 @@ async fn launcher_that_cannot_spawn_leaves_nothing() {
 #[tokio::test]
 async fn launch_rejects_dynamic_firecracker_before_preparing_chroot() {
     let mut sandbox = Sandbox::new(Mode::Serve);
-    let dynamic =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    let dynamic_fixture = support::elf::ElfBuilder::dynamic_binary()
+        .write_temp()
+        .unwrap();
+    let dynamic = dynamic_fixture.path().to_path_buf();
     sandbox.config.firecracker = dynamic.clone();
     let err = Vm::launch(&sandbox.config, &spec(&sandbox))
         .await

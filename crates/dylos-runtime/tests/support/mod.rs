@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
+pub mod elf;
+
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::os::unix::fs::MetadataExt;
@@ -176,8 +178,6 @@ pub fn select_test_temp_base(workspace: &Path, tmp_dir: &Path) -> PathBuf {
     canonical_ws.join(".t")
 }
 
-const STATIC_BINARY_FIXTURE: &[u8] = include_bytes!("../fixtures/elf/static_binary");
-
 pub struct Sandbox {
     pub dir: tempfile::TempDir,
     pub config: JailerConfig,
@@ -195,7 +195,7 @@ impl Sandbox {
     fn with_dir(mode: Mode, dir: tempfile::TempDir) -> Self {
         let meta = std::fs::metadata(dir.path()).unwrap();
         let exec = dir.path().join("firecracker");
-        let mut content = STATIC_BINARY_FIXTURE.to_vec();
+        let mut content = elf::ElfBuilder::static_binary().build();
         content.extend_from_slice(format!("{mode:?}").as_bytes());
         std::fs::write(&exec, content).unwrap();
         let mut config = JailerConfig::new(dir.path().join("jails"), meta.uid(), meta.gid());
@@ -311,8 +311,9 @@ pub fn run_fake_jailer_if_requested() {
         std::fs::create_dir_all(cgroup.join(parent).join(&id)).unwrap();
     }
     let raw = std::fs::read(&exec).unwrap();
-    let mode = if raw.starts_with(STATIC_BINARY_FIXTURE) {
-        std::str::from_utf8(&raw[STATIC_BINARY_FIXTURE.len()..])
+    let static_binary = elf::ElfBuilder::static_binary().build();
+    let mode = if raw.starts_with(&static_binary) {
+        std::str::from_utf8(&raw[static_binary.len()..])
             .unwrap()
             .to_string()
     } else {
