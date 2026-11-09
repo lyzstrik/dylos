@@ -275,3 +275,56 @@ async fn diff_sealed_files_use_verified_digest() {
         DiffStatus::Changed
     );
 }
+
+#[tokio::test]
+async fn content_counts_blocks_and_partial_tail() {
+    let tmp = tempdir().unwrap();
+    let a = vec![0; 12288];
+    let mut b = vec![0; 12291];
+    b[1] = 1;
+    b[4096] = 1;
+    let a = create_test_snapshot(&tmp.path().join("a"), single_vm_spec(), &[("vm1", &a)]);
+    let b = create_test_snapshot(&tmp.path().join("b"), single_vm_spec(), &[("vm1", &b)]);
+    let diff = dylos_runtime::diff_snapshots_with_content(&a, &b, true)
+        .await
+        .unwrap();
+    let counts = diff.vms["vm1"].disks[0].content.as_ref().unwrap();
+    assert_eq!(counts.changed_blocks, 3);
+    assert_eq!(counts.changed_bytes, 8195);
+    assert!(
+        diff_snapshots(&a, &b).await.unwrap().vms["vm1"].disks[0]
+            .content
+            .is_none()
+    );
+    fs::write(b.join("vms/vm1/rootfs.ext4"), b"tampered").unwrap();
+    assert!(
+        dylos_runtime::diff_snapshots_with_content(&a, &b, true)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn disk_paths_normalize_and_duplicates_are_rejected() {
+    let tmp = tempdir().unwrap();
+    let a = create_test_snapshot(&tmp.path().join("a"), single_vm_spec(), &[("vm1", b"disk")]);
+    let b = create_test_snapshot(&tmp.path().join("b"), single_vm_spec(), &[("vm1", b"disk")]);
+    let path = b.join("manifest.json");
+    let mut manifest =
+        SnapshotManifest::from_json_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    manifest.vms.get_mut("vm1").unwrap().disks[0].path = "./vms/vm1/rootfs.ext4".into();
+    fs::write(&path, manifest.to_json_string().unwrap()).unwrap();
+    let diff = diff_snapshots(&a, &b).await.unwrap();
+    assert_eq!(diff.vms["vm1"].disks.len(), 1);
+    assert!(diff.vms["vm1"].disks[0].is_identical());
+    let disk = manifest.vms["vm1"].disks[0].clone();
+    manifest.vms.get_mut("vm1").unwrap().disks.push(disk);
+    fs::write(path, manifest.to_json_string().unwrap()).unwrap();
+    assert!(
+        diff_snapshots(&a, &b)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate disk path")
+    );
+}

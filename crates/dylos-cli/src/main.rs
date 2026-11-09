@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use dylos_core::LabSpec;
-use dylos_runtime::{Fleet, Lab, LabConfig, LabError, diff_snapshots};
+use dylos_runtime::{Fleet, Lab, LabConfig, LabError, diff_snapshots_with_content};
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, SFlag, fstat};
 
@@ -111,6 +111,9 @@ enum LabCommands {
 
 #[derive(Args, Debug)]
 struct DiffArgs {
+    /// Count differing 4096-byte disk blocks
+    #[arg(long)]
+    content: bool,
     /// First snapshot directory containing manifest.json
     snapshot_a: PathBuf,
 
@@ -554,13 +557,14 @@ async fn lab_snapshot(args: SnapshotArgs) -> Result<()> {
 }
 
 async fn lab_diff(args: DiffArgs) -> Result<()> {
-    let diff = diff_snapshots(&args.snapshot_a, &args.snapshot_b)
+    let diff = diff_snapshots_with_content(&args.snapshot_a, &args.snapshot_b, args.content)
         .await
-        .with_context(|| {
-            format!(
-                "failed to diff snapshots '{}' and '{}'",
-                args.snapshot_a.display(),
-                args.snapshot_b.display()
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to diff snapshots '{}' and '{}': {}",
+                args.snapshot_a.to_string_lossy().escape_debug(),
+                args.snapshot_b.to_string_lossy().escape_debug(),
+                format!("{error:#}").escape_debug()
             )
         })?;
 
@@ -751,6 +755,12 @@ fn print_human_vms(vms: &std::collections::BTreeMap<String, dylos_core::diff::Vm
                 "    disk \"{escaped_path}\": {}",
                 format_file_status(disk.status, disk.size_a, disk.size_b)
             );
+            if let Some(content) = &disk.content {
+                println!(
+                    "      {} blocks differ, {} changed bytes",
+                    content.changed_blocks, content.changed_bytes
+                );
+            }
         }
     }
 }
