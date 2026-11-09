@@ -280,6 +280,19 @@ async fn run_snapshot_steps(
 ) -> Result<(SnapshotManifest, SnapshotTimings), LabError> {
     let started_all = Instant::now();
 
+    let started_prepare = Instant::now();
+    let preparations = job.vms.iter().map(|vm| {
+        let root = vm.root_dir.clone();
+        let size = vm.memory_mib * 1024 * 1024;
+        tokio::task::spawn_blocking(move || dylos_store::preallocate_snapshot_memory(&root, size))
+    });
+    for result in join_all(preparations).await {
+        result.map_err(|source| LabError::Task {
+            lab: job.lab_id.clone(),
+            source,
+        })??;
+    }
+
     // Drain earlier filesystem work while guests are running; disks are synced again paused.
     let store = job.store.clone();
     tokio::task::spawn_blocking(move || store.sync_filesystem())
@@ -288,6 +301,8 @@ async fn run_snapshot_steps(
             lab: job.lab_id.clone(),
             source,
         })??;
+
+    tracing::info!(lab = %job.lab_id, prepare_ms = started_prepare.elapsed().as_millis(), "snapshot memory outputs reserved before freeze");
 
     let started_freeze_to_thaw = Instant::now();
 
