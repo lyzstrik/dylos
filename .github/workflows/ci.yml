@@ -81,8 +81,8 @@ jobs:
       - name: Run checks
         run: |
           set -o pipefail
-          env "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" just check 2>&1 | tee check.log
-          if grep -q "SKIPPED" check.log; then
+          env "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" just check 2>&1 | tee "$RUNNER_TEMP/check.log"
+          if grep -q "SKIPPED" "$RUNNER_TEMP/check.log"; then
             echo "::error::A test was skipped for missing prerequisites" >&2
             exit 1
           fi
