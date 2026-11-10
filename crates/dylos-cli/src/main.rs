@@ -194,6 +194,9 @@ fn build_base_config() -> LabConfig {
 }
 
 fn build_launch_config() -> Result<LabConfig> {
+    if !nix::unistd::geteuid().is_root() {
+        bail!("requires root orchestrator, run with sudo -E");
+    }
     let mut config = build_base_config();
     let env_bin = std::env::var_os("DYLOS_FC_BIN_DIR").filter(|d| !d.is_empty());
     let resolved =

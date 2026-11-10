@@ -6,7 +6,6 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-test-hooks = []
 test-support = []
 
 [lints]
@@ -27,7 +26,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 nix = { workspace = true, features = ["mount"] }
-dylos-runtime = { path = ".", features = ["test-hooks", "test-support"] }
+dylos-runtime = { path = ".", features = ["test-support"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["signal", "test-util"] }
