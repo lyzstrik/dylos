@@ -456,6 +456,32 @@ impl JailPaths {
     pub fn api_socket(&self) -> PathBuf {
         self.host_path(API_SOCKET)
     }
+
+    /// Derives the jail paths for a lab node, using the runtime's length-prefixed lab identity.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidJailId`] if the derived id is not accepted by the jailer.
+    /// [`Error::SocketPathTooLong`] if the derived API socket path exceeds [`MAX_UNIX_SOCKET_PATH`].
+    pub fn for_lab_node(config: &JailerConfig, lab_id: &str, node: &str) -> Result<Self> {
+        Self::new(config, &crate::lab::jail_identity(lab_id), node)
+    }
+
+    /// Computes the Firecracker API socket path for a lab node under the given jailer configuration.
+    #[must_use]
+    pub fn api_socket_path(config: &JailerConfig, lab_id: &str, node: &str) -> PathBuf {
+        let id = format!("{}-{node}", crate::lab::jail_identity(lab_id));
+        let exec_name = config
+            .firecracker
+            .file_name()
+            .unwrap_or_else(|| "firecracker".as_ref());
+        config
+            .chroot_base_dir
+            .join(exec_name)
+            .join(id)
+            .join("root")
+            .join(API_SOCKET.trim_start_matches('/'))
+    }
 }
 
 /// The full launcher command line, without the program itself.

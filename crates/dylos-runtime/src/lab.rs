@@ -1140,7 +1140,7 @@ fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {
         if !crate::vm::validate_resources(node.vcpus, node.memory) {
             return Err(invalid(id, "invalid VM vCPU or memory configuration"));
         }
-        JailPaths::new(&config.jailer, &jail_identity(id), &node.name)?;
+        JailPaths::for_lab_node(&config.jailer, id, &node.name)?;
         guest_net::boot_args(spec, node)?;
     }
     Ok(())
@@ -1394,7 +1394,7 @@ impl Lab {
             let plan = FabricPlan::new(id, &spec)?;
             // cgroup.kill addresses the owned group, avoiding recycled host PID races.
             for node in &spec.nodes {
-                let paths = JailPaths::new(&config.jailer, &jail_identity(id), &node.name)?;
+                let paths = JailPaths::for_lab_node(&config.jailer, id, &node.name)?;
                 let (cgroup, lab) = (paths.cgroup_dir.clone(), id.to_owned());
                 blocking(id, move || stop_cgroup(&lab, &cgroup)).await?;
                 crate::jailer::remove_jail(&paths).await?;
@@ -1552,7 +1552,8 @@ impl Drop for Lab {
 }
 
 // Length-prefix the lab id: lab `a-b`, node `c` must not alias lab `a`, node `b-c`.
-fn jail_identity(id: &str) -> String {
+#[must_use]
+pub fn jail_identity(id: &str) -> String {
     format!("lab{}-{id}", id.len())
 }
 

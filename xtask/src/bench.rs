@@ -16,16 +16,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::DirBuilderExt;
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
 use dylos_core::LabSpec;
-use dylos_runtime::jailer::JailerConfig;
-use dylos_runtime::{Lab, LabConfig, LabError};
+use dylos_runtime::jailer::{JailPaths, JailerConfig};
+use dylos_runtime::{Lab, LabConfig, LabError, MAX_UNIX_SOCKET_PATH, validate_unix_socket_path};
 use futures_util::future::join_all;
 
 const DEFAULT_REPETITIONS_FULL: usize = 20;
@@ -784,22 +784,33 @@ pub fn setup_private_bench_dir(parent_dir: &Path) -> anyhow::Result<PathBuf> {
         );
     }
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| (d.as_millis() % 1_000_000) as u64);
-    // Kept short: the VM control socket paths below it must fit in sockaddr_un (108 bytes).
-    let run_dir = parent_dir.join(format!("r{}-{}", std::process::id(), timestamp));
-
-    DirBuilder::new()
-        .mode(0o700)
-        .create(&run_dir)
-        .with_context(|| {
-            format!(
-                "cannot create exclusive run directory {}",
-                run_dir.display()
-            )
-        })?;
-    Ok(run_dir)
+    let pid = std::process::id();
+    // Kept short: the VM control socket paths below it must fit in sockaddr_un (107 bytes).
+    let mut run_dir = parent_dir.join(format!("r{pid:x}"));
+    let mut disambig = 0;
+    loop {
+        match DirBuilder::new().mode(0o700).create(&run_dir) {
+            Ok(()) => return Ok(run_dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                disambig += 1;
+                run_dir = parent_dir.join(format!("r{pid:x}-{disambig:x}"));
+                if disambig > 255 {
+                    bail!(
+                        "cannot create exclusive run directory under {}",
+                        parent_dir.display()
+                    );
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "cannot create exclusive run directory {}",
+                        run_dir.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 /// Removes a run directory created by [`setup_private_bench_dir`].
@@ -822,6 +833,309 @@ pub fn cleanup_private_bench_dir(bench_dir: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("failed to remove bench directory {}", bench_dir.display()))?;
     }
     Ok(())
+}
+
+/// Finds the shallowest ancestor of `path` that exists on the filesystem.
+fn shallowest_existing_ancestor(mut path: &Path) -> Option<&Path> {
+    while !path.exists() {
+        path = path.parent()?;
+    }
+    Some(path)
+}
+
+/// Checks whether `path` is on a tmpfs or ramfs filesystem.
+/// Fails closed (returns `true`) if the filesystem type cannot be verified.
+fn is_tmpfs(path: &Path) -> bool {
+    let check_path = shallowest_existing_ancestor(path).unwrap_or(path);
+    let Ok(output) = Command::new("df")
+        .arg("-T")
+        .arg(check_path.as_os_str())
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return true;
+    };
+    let Some(line) = stdout.lines().nth(1) else {
+        return true;
+    };
+    let cols: Vec<&str> = line.split_whitespace().collect();
+    let Some(fs_type) = cols.get(1) else {
+        return true;
+    };
+    *fs_type == "tmpfs" || *fs_type == "ramfs"
+}
+
+/// Checks whether a directory exists, is not a symlink, and permits exclusive safe creation
+/// within a private subdirectory without following symlinks or modifying existing entries.
+pub fn is_writable_dir(path: &Path) -> anyhow::Result<bool> {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return Ok(false);
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Ok(false);
+    }
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let probe_dir = path.join(format!(".probe-{pid}-{nanos:x}"));
+
+    match DirBuilder::new().mode(0o700).create(&probe_dir) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.kind() == std::io::ErrorKind::ReadOnlyFilesystem
+                || e.kind() == std::io::ErrorKind::AlreadyExists =>
+        {
+            return Ok(false);
+        }
+        Err(_) => return Ok(false),
+    }
+
+    let probe_file = probe_dir.join("p");
+    let open_res = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe_file);
+
+    match open_res {
+        Ok(file) => {
+            drop(file);
+            let rm_file = fs::remove_file(&probe_file)
+                .with_context(|| format!("cannot remove probe file {}", probe_file.display()));
+            let rm_dir = fs::remove_dir(&probe_dir)
+                .with_context(|| format!("cannot remove probe directory {}", probe_dir.display()));
+            rm_file?;
+            rm_dir?;
+            Ok(true)
+        }
+        Err(open_err) => {
+            let rm_dir = fs::remove_dir(&probe_dir).with_context(|| {
+                format!(
+                    "cannot remove probe directory {} during rollback",
+                    probe_dir.display()
+                )
+            });
+            rm_dir?;
+            Err(anyhow::Error::from(open_err).context(format!(
+                "cannot create probe file in {}",
+                probe_dir.display()
+            )))
+        }
+    }
+}
+
+/// Computes the longest Unix domain socket path that the benchmark suite will create
+/// under `run_dir` across all measurement phases (cold boot, snapshot, and parallel forks).
+pub fn longest_bench_socket_path(
+    run_dir: &Path,
+    options: &BenchOptions,
+    spec: &LabSpec,
+    fc_bin: &Path,
+) -> PathBuf {
+    let mut jailer = JailerConfig::new(run_dir.join("j"), NOBODY_UID_GID, NOBODY_UID_GID);
+    jailer.firecracker = fc_bin.to_path_buf();
+
+    let longest_node = spec
+        .nodes
+        .iter()
+        .map(|n| n.name.as_str())
+        .max_by_key(|n| n.len())
+        .unwrap_or("node1");
+
+    let cold_boot_id = format!("b-boot-{}", options.repetitions);
+    let source_id = "b-src";
+    let fork_ids: Vec<String> = options
+        .fork_counts
+        .iter()
+        .map(|&count| format!("f-n{count}-r{}-c{count}", options.repetitions))
+        .collect();
+
+    let candidate_ids = std::iter::once(cold_boot_id)
+        .chain(std::iter::once(source_id.to_string()))
+        .chain(fork_ids);
+
+    candidate_ids
+        .map(|lab_id| JailPaths::api_socket_path(&jailer, &lab_id, longest_node))
+        .max_by_key(|p| p.as_os_str().len())
+        .unwrap_or_else(|| JailPaths::api_socket_path(&jailer, source_id, longest_node))
+}
+
+/// Validates that the longest Unix domain socket path created under `run_dir` does not
+/// exceed Linux's `sockaddr_un` limit.
+///
+/// # Errors
+/// Returns an error naming the path, the byte length, the 107-byte limit, and suggesting
+/// `--tmp-dir` if the socket path is too long.
+pub fn validate_bench_socket_path(
+    run_dir: &Path,
+    options: &BenchOptions,
+    spec: &LabSpec,
+    fc_bin: &Path,
+) -> anyhow::Result<PathBuf> {
+    let longest_path = longest_bench_socket_path(run_dir, options, spec, fc_bin);
+    if let Err(len) = validate_unix_socket_path(&longest_path) {
+        bail!(
+            "socket path \"{}\" ({len} bytes) exceeds limit of {} bytes; specify a shorter directory with --tmp-dir",
+            longest_path.display(),
+            MAX_UNIX_SOCKET_PATH
+        );
+    }
+    Ok(longest_path)
+}
+
+/// Checks whether every socket path created under `candidate` stays within the 107-byte limit,
+/// assuming worst-case run directory component length (including collision suffix).
+fn candidate_socket_path_fits(
+    candidate: &Path,
+    options: &BenchOptions,
+    spec: &LabSpec,
+    fc_bin: &Path,
+) -> bool {
+    // setup_private_bench_dir uses r{pid:x} or r{pid:x}-{disambig:x} up to disambig = 255 (0xff).
+    // The longest possible run directory component is r{pid:x}-ff.
+    let test_run_dir = candidate.join(format!("r{:x}-ff", std::process::id()));
+    let longest_socket = longest_bench_socket_path(&test_run_dir, options, spec, fc_bin);
+    validate_unix_socket_path(&longest_socket).is_ok()
+}
+
+/// Selects a parent directory for the exclusive benchmark run directory on the same filesystem
+/// as `workspace` such that all Unix domain socket paths stay within Linux's 107-byte limit.
+///
+/// # Errors
+/// Returns an error if any probe cleanup fails, or if no verified candidate directory
+/// on the workspace filesystem mount can satisfy the 107-byte socket limit.
+pub fn select_default_bench_parent(
+    workspace: &Path,
+    options: &BenchOptions,
+    spec: &LabSpec,
+    fc_bin: &Path,
+) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical_ws = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let ws_dev = fs::metadata(&canonical_ws)
+        .with_context(|| {
+            format!(
+                "cannot read metadata for workspace {}",
+                canonical_ws.display()
+            )
+        })?
+        .dev();
+
+    let check_candidate = |candidate: &Path| -> anyhow::Result<bool> {
+        let Some(existing) = shallowest_existing_ancestor(candidate) else {
+            return Ok(false);
+        };
+        let Ok(meta) = fs::symlink_metadata(existing) else {
+            return Ok(false);
+        };
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Ok(false);
+        }
+        if meta.dev() != ws_dev {
+            return Ok(false);
+        }
+        if is_tmpfs(existing) {
+            return Ok(false);
+        }
+        if !is_writable_dir(existing)? {
+            return Ok(false);
+        }
+        Ok(candidate_socket_path_fits(candidate, options, spec, fc_bin))
+    };
+
+    let probe_b = |base: &Path| -> anyhow::Result<Option<PathBuf>> {
+        let dot_b = base.join(".b");
+        if check_candidate(&dot_b)? {
+            return Ok(Some(dot_b));
+        }
+        let plain_b = base.join("b");
+        if check_candidate(&plain_b)? {
+            return Ok(Some(plain_b));
+        }
+        if check_candidate(base)? {
+            return Ok(Some(base.to_path_buf()));
+        }
+        Ok(None)
+    };
+
+    // 1. Cargo's default scratch location under target/b (if it fits within the socket limit)
+    let target_b = canonical_ws.join("target/b");
+    if check_candidate(&target_b)? {
+        return Ok(target_b);
+    }
+
+    // 2. Standard persistent temporary directory (/var/tmp)
+    let var_tmp = Path::new("/var/tmp");
+    if check_candidate(var_tmp)? {
+        return Ok(var_tmp.to_path_buf());
+    }
+
+    // 3. Operator's home directory if on the same mount
+    if let Some(home) = std::env::var_os("HOME")
+        && let Some(p) = probe_b(Path::new(&home))?
+    {
+        return Ok(p);
+    }
+
+    // 4. Mount root of the required filesystem
+    let mut mount_root = canonical_ws.clone();
+    while let Some(parent) = mount_root.parent() {
+        if fs::metadata(parent).is_ok_and(|m| m.dev() == ws_dev) {
+            mount_root = parent.to_path_buf();
+        } else {
+            break;
+        }
+    }
+    if let Some(p) = probe_b(&mount_root)? {
+        return Ok(p);
+    }
+
+    // 5. Shallowest writable ancestor towards workspace
+    if let Ok(rel) = canonical_ws.strip_prefix(&mount_root) {
+        let mut current = mount_root.clone();
+        for component in rel.components() {
+            current.push(component);
+            if let Some(p) = probe_b(&current)? {
+                return Ok(p);
+            }
+        }
+    }
+
+    // 6. Hidden .b or b directory directly under workspace
+    if let Some(p) = probe_b(&canonical_ws)? {
+        return Ok(p);
+    }
+
+    bail!(
+        "no verified benchmark directory found on workspace filesystem mount where socket paths fit within {MAX_UNIX_SOCKET_PATH} bytes; specify a directory with --tmp-dir"
+    )
+}
+
+/// Resolves the benchmark parent directory: uses `options.tmp_dir` when provided,
+/// or falls back to selecting a verified default directory on the workspace mount.
+///
+/// # Errors
+/// Returns an error if default directory selection fails.
+pub fn resolve_bench_parent(
+    workspace: &Path,
+    options: &BenchOptions,
+    spec: &LabSpec,
+    fc_bin: &Path,
+) -> anyhow::Result<PathBuf> {
+    if let Some(ref dir) = options.tmp_dir {
+        return Ok(dir.clone());
+    }
+    select_default_bench_parent(workspace, options, spec, fc_bin)
 }
 
 /// Result of the measurement phases.
@@ -1286,6 +1600,8 @@ async fn measure_into(
     run_dir: &Path,
     failures: &mut Vec<anyhow::Error>,
 ) -> anyhow::Result<BenchResults> {
+    validate_bench_socket_path(run_dir, options, &prereqs.spec, &prereqs.fc_bin)?;
+
     let fc_bin = prereqs.fc_bin.clone();
     let detect_dir = run_dir.to_owned();
     let host = tokio::task::spawn_blocking(move || HostConfig::detect(&fc_bin, &detect_dir))
@@ -1358,10 +1674,8 @@ async fn measure_into(
 /// Executes the full benchmark suite.
 pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResults> {
     let prereqs = check_prerequisites()?;
-    let parent_dir = options
-        .tmp_dir
-        .clone()
-        .unwrap_or_else(|| prereqs.workspace.join("target/b"));
+    let parent_dir =
+        resolve_bench_parent(&prereqs.workspace, &options, &prereqs.spec, &prereqs.fc_bin)?;
 
     let results =
         run_in_private_dir(&parent_dir, |run_dir| measure(&options, &prereqs, run_dir)).await?;
