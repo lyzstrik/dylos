@@ -17,6 +17,55 @@ use support::{
     StaleSummaryCounters, check_e2e_prerequisites, test_tempdir, verify_e2fsck_readonly_output,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PauseKpiMode {
+    Enforce,
+    Report,
+}
+
+fn parse_pause_kpi_mode(value: Option<&str>) -> Result<PauseKpiMode, String> {
+    match value {
+        None | Some("enforce") => Ok(PauseKpiMode::Enforce),
+        Some("report") => Ok(PauseKpiMode::Report),
+        Some(other) => Err(format!(
+            "unknown DYLOS_E2E_PAUSE_KPI value {other:?}; expected 'enforce', 'report', or unset"
+        )),
+    }
+}
+
+fn pause_kpi_mode() -> PauseKpiMode {
+    match std::env::var("DYLOS_E2E_PAUSE_KPI") {
+        Ok(ref val) => parse_pause_kpi_mode(Some(val)).unwrap_or_else(|err| panic!("{err}")),
+        Err(std::env::VarError::NotPresent) => PauseKpiMode::Enforce,
+        Err(std::env::VarError::NotUnicode(_)) => panic!(
+            "invalid non-unicode value for DYLOS_E2E_PAUSE_KPI; expected 'enforce', 'report', or unset"
+        ),
+    }
+}
+
+fn check_pause_kpi(
+    mode: PauseKpiMode,
+    freeze_to_thaw_ms: u64,
+    api_snapshot_ms: u64,
+    storage_ms: u64,
+) {
+    match mode {
+        PauseKpiMode::Enforce => {
+            assert!(
+                freeze_to_thaw_ms < 1000,
+                "5-VM pause must stay below 1 second, got {freeze_to_thaw_ms}ms (API={api_snapshot_ms}ms, capture={storage_ms}ms)",
+            );
+        }
+        PauseKpiMode::Report => {
+            if freeze_to_thaw_ms >= 1000 {
+                eprintln!(
+                    "::warning::5-VM pause exceeded 1s target: {freeze_to_thaw_ms}ms (API={api_snapshot_ms}ms, capture={storage_ms}ms)",
+                );
+            }
+        }
+    }
+}
+
 async fn assert_vms_running_stably(vms: &[Vm]) {
     join_all(vms.iter().map(|vm| async move {
         let mut state = vm.state();
@@ -37,6 +86,7 @@ async fn assert_vms_running_stably(vms: &[Vm]) {
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
 async fn five_vms_snapshot_measurement_and_integrity() {
+    let pause_kpi = pause_kpi_mode();
     let Some(prereqs) = check_e2e_prerequisites("five_vms_snapshot_measurement_and_integrity")
     else {
         return;
@@ -120,9 +170,8 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         verify_ms,
     );
 
-    assert!(
-        timings.freeze_to_thaw_ms < 1000,
-        "5-VM pause must stay below 1 second, got {}ms (API={}ms, capture={}ms)",
+    check_pause_kpi(
+        pause_kpi,
         timings.freeze_to_thaw_ms,
         timings.api_snapshot_ms,
         timings.storage_ms,
@@ -510,4 +559,46 @@ async fn compare_verification(
             started.elapsed().as_micros()
         );
     }
+}
+
+#[test]
+fn pause_kpi_mode_parsing() {
+    assert_eq!(parse_pause_kpi_mode(None).unwrap(), PauseKpiMode::Enforce);
+    assert_eq!(
+        parse_pause_kpi_mode(Some("enforce")).unwrap(),
+        PauseKpiMode::Enforce
+    );
+    assert_eq!(
+        parse_pause_kpi_mode(Some("report")).unwrap(),
+        PauseKpiMode::Report
+    );
+    for invalid in [
+        "", "REPORT", "Report", "1", "0", "true", "false", "warn", "disabled",
+    ] {
+        assert!(
+            parse_pause_kpi_mode(Some(invalid)).is_err(),
+            "expected {invalid:?} to fail"
+        );
+    }
+}
+
+#[test]
+fn pause_kpi_mode_default_is_enforce() {
+    if std::env::var_os("DYLOS_E2E_PAUSE_KPI").is_none() {
+        assert_eq!(pause_kpi_mode(), PauseKpiMode::Enforce);
+    }
+}
+
+#[test]
+fn pause_kpi_enforce_and_report_behavior() {
+    // Under 1 second: both succeed without panic.
+    check_pause_kpi(PauseKpiMode::Enforce, 500, 400, 50);
+    check_pause_kpi(PauseKpiMode::Report, 500, 400, 50);
+
+    // Over 1 second: report succeeds (warns), enforce panics.
+    check_pause_kpi(PauseKpiMode::Report, 1500, 1200, 200);
+    let result = std::panic::catch_unwind(|| {
+        check_pause_kpi(PauseKpiMode::Enforce, 1500, 1200, 200);
+    });
+    assert!(result.is_err(), "enforce mode must fail when pause >= 1s");
 }
