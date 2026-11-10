@@ -8,6 +8,7 @@ use std::time::Duration;
 use dylos_fc::config::{ActionType, InstanceActionInfo};
 use dylos_runtime::jailer::ChrootFile;
 use dylos_runtime::{Error, ProcessState, Timeouts, Vm, VmSpec};
+use futures_util::FutureExt;
 use support::{Captured, Mode, Sandbox, wait_until};
 
 #[test]
@@ -267,41 +268,58 @@ async fn concurrent_launches_of_same_vm_have_one_winner() {
     sandbox.assert_no_jail_left();
 }
 
-#[tokio::test]
-async fn cancelled_launch_leaves_no_jail_and_retry_works() {
-    let mut sandbox = Sandbox::new(Mode::Serve);
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
-    sandbox.config.preparation_barrier = Some(std::sync::Arc::clone(&barrier));
+// With one blocking thread, holding it queues every later `spawn_blocking` (the firecracker
+// check, chroot preparation, jail removal) until the returned sender is dropped.
+#[allow(clippy::unwrap_used)]
+fn one_blocking_thread() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+}
+
+#[allow(clippy::unwrap_used)]
+async fn hold_blocking_thread() -> std::sync::mpsc::Sender<()> {
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    tokio::time::timeout(Duration::from_secs(5), held_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    release_tx
+}
+
+#[test]
+fn cancelled_launch_leaves_no_jail_and_retry_works() {
+    one_blocking_thread().block_on(cancelled_launch());
+}
+
+#[allow(clippy::unwrap_used)]
+async fn cancelled_launch() {
+    let sandbox = Sandbox::new(Mode::Serve);
     let test_spec = spec(&sandbox);
     let jail = sandbox.jail_dir("lab1-web");
+    let jails = jail.parent().unwrap().to_owned();
 
-    let barrier_wait = tokio::task::spawn_blocking({
-        let b = std::sync::Arc::clone(&barrier);
-        move || b.wait()
-    });
+    let mut launch = Box::pin(Vm::launch(&sandbox.config, &test_spec));
+    assert!((&mut launch).now_or_never().is_none());
+    // The firecracker check ran before the thread was held: the next poll queues preparation.
+    let release = hold_blocking_thread().await;
+    assert!((&mut launch).now_or_never().is_none());
+    drop(launch);
+    assert!(!jails.exists(), "preparation started before cancellation");
 
-    let cancelled = tokio::select! {
-        biased;
-        // Wait until `prepare_chroot` claims the jail and hits the barrier.
-        () = async { barrier_wait.await.unwrap(); } => true,
-        _ = Vm::launch(&sandbox.config, &test_spec) => false,
-    };
-    assert!(cancelled, "launch completed before cancellation");
-    assert!(jail.exists());
+    // The detached preparation claims the jail, then its unread result removes it.
+    drop(release);
+    tokio::task::spawn_blocking(|| ()).await.unwrap();
+    assert!(jails.is_dir(), "the cancelled preparation did not run");
+    assert!(!jail.exists());
 
-    // Release the task so it can observe the cancellation (drop the unread result).
-    tokio::task::spawn_blocking(move || barrier.wait())
-        .await
-        .unwrap();
-
-    wait_until(
-        "the cancelled launch is rolled back",
-        Duration::from_secs(5),
-        || !jail.exists(),
-    )
-    .await;
-
-    sandbox.config.preparation_barrier = None;
     let mut vm = Vm::launch(&sandbox.config, &spec(&sandbox)).await.unwrap();
     vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
@@ -466,32 +484,46 @@ async fn inherited_stderr_does_not_block_shutdown_or_reaping() {
     sandbox.release_output_holder().await;
 }
 
-#[tokio::test]
-async fn cancelled_shutdown_retries_and_waits_for_cleanup() {
+#[test]
+fn cancelled_shutdown_retries_and_waits_for_cleanup() {
+    one_blocking_thread().block_on(cancelled_shutdown());
+}
+
+#[allow(clippy::unwrap_used)]
+async fn cancelled_shutdown() {
     let (logs, _guard) = Captured::install();
-    let mut sandbox = Sandbox::new(Mode::Serve);
-    let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
-    sandbox.config.cleanup_barrier = Some(barrier.clone());
+    let sandbox = Sandbox::new(Mode::Serve);
     let mut test_spec = spec(&sandbox);
     test_spec.timeouts.kill = Duration::from_millis(500);
     let mut vm = Vm::launch(&sandbox.config, &test_spec).await.unwrap();
+    // The supervisor's jail removal stays queued until `release` is dropped.
+    let release = hold_blocking_thread().await;
     let cancelled = tokio::select! {
         biased;
-        () = barrier.0.notified() => true,
+        () = wait_until("the supervisor releases the jail", Duration::from_secs(5), || logs.contains("Firecracker exited")) => true,
         _ = vm.shutdown() => false,
     };
     assert!(cancelled);
     assert!(vm.paths().jail_dir.exists());
+    let joined = || {
+        logs.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains("post-exit tasks joined"))
+            .count()
+    };
+    let before = joined();
     let cancelled = tokio::select! {
         biased;
-        () = wait_until("forwarding handles are consumed", Duration::from_secs(5), || logs.contains("post-exit tasks joined")) => true,
+        () = wait_until("forwarding handles are consumed", Duration::from_secs(5), || joined() > before) => true,
         _ = vm.shutdown() => false,
     };
     assert!(cancelled);
     let error = vm.shutdown().await.unwrap_err();
     assert!(matches!(error, Error::CleanupTimeout { .. }));
     assert!(vm.paths().jail_dir.exists());
-    barrier.1.notify_one();
+    drop(release);
     vm.shutdown().await.unwrap();
     sandbox.assert_no_jail_left();
     vm.shutdown().await.unwrap();
