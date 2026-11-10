@@ -4,14 +4,19 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use dylos_runtime::LabError;
+use dylos_core::LabSpec;
+use dylos_runtime::jailer::{JailPaths, JailerConfig};
+use dylos_runtime::{LabError, MAX_UNIX_SOCKET_PATH};
 use xtask::bench::{
-    BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
-    SnapshotStages, cleanup_private_bench_dir, lab_failure, parse_bench_args, percentile,
-    render_markdown_report, run_in_private_dir, settle_pss, setup_private_bench_dir,
+    BenchOptions, BenchResults, HostConfig, MetricSamples, PhaseOutcome, PssReading, SettleParams,
+    SnapshotStages, cleanup_private_bench_dir, is_writable_dir, lab_failure,
+    longest_bench_socket_path, parse_bench_args, percentile, render_markdown_report,
+    resolve_bench_parent, run_in_private_dir, select_default_bench_parent, settle_pss,
+    setup_private_bench_dir, validate_bench_socket_path,
 };
 
 fn samples(values: &[f64]) -> MetricSamples {
@@ -698,4 +703,467 @@ fn control_socket_path_fits_sun_len() {
         sock.display()
     );
     fs::remove_dir_all(&parent).unwrap();
+}
+
+fn five_vm_spec() -> LabSpec {
+    LabSpec::from_yaml_str(include_str!("../../labs/five.yaml")).unwrap()
+}
+
+#[test]
+fn default_bench_parent_picks_short_dir_on_same_mount() {
+    use std::os::unix::fs::MetadataExt;
+
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let parent = select_default_bench_parent(&ws, &options, &spec, fc_bin).unwrap();
+    let child = setup_private_bench_dir(&parent).unwrap();
+    assert!(child.starts_with(&parent));
+    assert_eq!(
+        fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(&parent).unwrap().dev(),
+        fs::metadata(&ws).unwrap().dev(),
+        "chosen parent must reside on the same filesystem mount as workspace"
+    );
+
+    let longest = validate_bench_socket_path(&child, &options, &spec, fc_bin).unwrap();
+    assert!(
+        longest.as_os_str().len() <= MAX_UNIX_SOCKET_PATH,
+        "longest socket path length {} exceeds limit {}",
+        longest.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH
+    );
+
+    cleanup_private_bench_dir(&child).unwrap();
+    assert!(!child.exists());
+    assert!(parent.exists());
+}
+
+#[test]
+fn default_parent_selection_handles_deep_workspace_and_cross_fs_fallback() {
+    use std::os::unix::fs::MetadataExt;
+
+    let scratch_base = scratch("deep-ws");
+    let deep_ws = scratch_base
+        .join("d".repeat(35))
+        .join("e".repeat(35))
+        .join("p".repeat(35))
+        .join("workspace");
+    fs::create_dir_all(&deep_ws).unwrap();
+    let ws_canonical = deep_ws.canonicalize().unwrap();
+
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    // With a deep workspace, target/b would make socket paths far too long
+    let target_b_run = ws_canonical.join("target/b/r1234567-999999");
+    assert!(
+        validate_bench_socket_path(&target_b_run, &options, &spec, fc_bin).is_err(),
+        "target/b on deep checkout must exceed socket path limit"
+    );
+
+    let parent = select_default_bench_parent(&deep_ws, &options, &spec, fc_bin).unwrap();
+
+    let child = setup_private_bench_dir(&parent).unwrap();
+    let deep_dev = fs::metadata(&deep_ws).unwrap().dev();
+    let parent_dev = fs::metadata(&parent).unwrap().dev();
+    assert_eq!(
+        deep_dev, parent_dev,
+        "selected parent must reside on the same filesystem mount as deep workspace"
+    );
+    assert!(
+        !parent.starts_with(&deep_ws),
+        "selected parent {parent:?} must not embed deep workspace path"
+    );
+    let longest = validate_bench_socket_path(&child, &options, &spec, fc_bin).unwrap();
+    assert!(
+        longest.as_os_str().len() <= MAX_UNIX_SOCKET_PATH,
+        "socket path {} must stay under limit {}",
+        longest.display(),
+        MAX_UNIX_SOCKET_PATH
+    );
+
+    cleanup_private_bench_dir(&child).unwrap();
+    fs::remove_dir_all(&scratch_base).unwrap();
+}
+
+#[test]
+fn early_failure_on_oversized_socket_path_names_path_limit_and_suggests_tmp_dir() {
+    let long_run_dir = PathBuf::from("/").join("p".repeat(70));
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let err = validate_bench_socket_path(&long_run_dir, &options, &spec, fc_bin).unwrap_err();
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains(&long_run_dir.display().to_string()),
+        "error message must name the path: {msg}"
+    );
+    assert!(
+        msg.contains("exceeds limit of 107 bytes"),
+        "error message must state the 107-byte limit: {msg}"
+    );
+    assert!(
+        msg.contains("--tmp-dir"),
+        "error message must suggest --tmp-dir: {msg}"
+    );
+}
+
+#[test]
+fn longest_bench_socket_path_computes_largest_fork_count_and_longest_vm_name() {
+    let run_dir = Path::new("/run/test");
+    let options = BenchOptions {
+        repetitions: 7,
+        fork_counts: vec![1, 10, 25],
+        ..BenchOptions::default()
+    };
+    let spec = LabSpec::from_yaml_str(include_str!("fixtures/long_node_bench_lab.yaml")).unwrap();
+    let fc_bin = Path::new("/opt/bin/firecracker-custom");
+
+    let longest = longest_bench_socket_path(run_dir, &options, &spec, fc_bin);
+    let s = longest.to_str().unwrap();
+
+    assert!(
+        s.contains("firecracker-custom"),
+        "must use fc_bin exec name: {s}"
+    );
+    assert!(
+        s.contains("lab12-f-n25-r7-c25"),
+        "must include length-prefixed largest clone identifier: {s}"
+    );
+    assert!(
+        s.contains("very-long-node-identifier"),
+        "must choose longest VM node name: {s}"
+    );
+    assert!(
+        s.ends_with("root/run/firecracker.socket"),
+        "must end with root/run/firecracker.socket: {s}"
+    );
+}
+
+#[test]
+fn tmp_dir_override_keeps_working_and_is_validated() {
+    let custom = std::env::temp_dir().join(format!("dylos-custom-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&custom);
+    fs::create_dir_all(&custom).unwrap();
+
+    let options = BenchOptions {
+        tmp_dir: Some(custom.clone()),
+        ..BenchOptions::default()
+    };
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // Production resolver must choose options.tmp_dir when provided
+    let parent = resolve_bench_parent(ws, &options, &spec, fc_bin).unwrap();
+    assert_eq!(parent, custom);
+
+    let child = setup_private_bench_dir(&parent).unwrap();
+    assert!(child.starts_with(&custom));
+    assert!(validate_bench_socket_path(&child, &options, &spec, fc_bin).is_ok());
+
+    cleanup_private_bench_dir(&child).unwrap();
+    fs::remove_dir_all(&custom).unwrap();
+}
+
+#[test]
+fn socket_preflight_matches_runtime_jail_paths_naming() {
+    let run_dir = Path::new("/tmp/test-run");
+    let options = BenchOptions {
+        repetitions: 20,
+        fork_counts: vec![1, 10, 20],
+        ..BenchOptions::default()
+    };
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    let preflight = longest_bench_socket_path(run_dir, &options, &spec, fc_bin);
+
+    let mut jailer = JailerConfig::new(run_dir.join("j"), 0, 0);
+    jailer.firecracker = fc_bin.to_path_buf();
+    let runtime_paths = JailPaths::for_lab_node(&jailer, "f-n20-r20-c20", "node5").unwrap();
+
+    assert_eq!(preflight, runtime_paths.api_socket());
+    assert!(
+        preflight
+            .to_str()
+            .unwrap()
+            .contains("lab13-f-n20-r20-c20-node5"),
+        "preflight must contain the runtime's length-prefixed lab identity: {}",
+        preflight.display()
+    );
+}
+
+#[test]
+fn writability_probe_refuses_preexisting_file_and_preserves_content() {
+    let dir = scratch("probe-regular");
+    let target = dir.join("important.txt");
+    fs::write(&target, b"precious data").unwrap();
+
+    assert!(is_writable_dir(&dir).unwrap());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    assert_eq!(fs::read(&target).unwrap(), b"precious data");
+
+    let link = dir.join("link_to_target");
+    symlink(&target, &link).unwrap();
+    assert!(!is_writable_dir(&link).unwrap());
+    assert_eq!(fs::read(&target).unwrap(), b"precious data");
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn writability_probe_in_read_only_dir_fails_safely_without_leftover() {
+    let dir = scratch("probe-ro");
+    let sentinel = dir.join("keep.txt");
+    fs::write(&sentinel, b"safe").unwrap();
+
+    let mut perms = fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o500);
+    fs::set_permissions(&dir, perms.clone()).unwrap();
+
+    let result = is_writable_dir(&dir).unwrap();
+    assert!(!result, "read-only directory must not be writable");
+
+    perms.set_mode(0o700);
+    fs::set_permissions(&dir, perms).unwrap();
+    assert_eq!(fs::read(&sentinel).unwrap(), b"safe");
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn oversized_socket_path_fails_before_measurements_at_orchestration_boundary() {
+    let parent = scratch("orchestration-oversized");
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+
+    // Construct a deeply nested parent path such that setup_private_bench_dir produces
+    // a run_dir whose socket paths exceed 107 bytes.
+    let deep_parent = parent.join("p".repeat(60));
+    fs::create_dir_all(&deep_parent).unwrap();
+
+    let mut measured = false;
+    let res = run_in_private_dir(&deep_parent, |run_dir| {
+        let options = options.clone();
+        let spec = spec.clone();
+        async move {
+            let teardown = Vec::new();
+            let result = (|| -> anyhow::Result<()> {
+                validate_bench_socket_path(&run_dir, &options, &spec, fc_bin)?;
+                measured = true;
+                Ok(())
+            })();
+            PhaseOutcome {
+                result,
+                teardown_failures: teardown,
+            }
+        }
+    })
+    .await;
+
+    assert!(
+        res.is_err(),
+        "orchestration boundary must fail on oversized socket paths"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("exceeds limit of 107 bytes"),
+        "error must cite 107-byte limit: {err_msg}"
+    );
+    assert!(
+        !measured,
+        "measurements must never execute when socket path validation fails"
+    );
+    assert_eq!(
+        run_dirs(&deep_parent),
+        Vec::<PathBuf>::new(),
+        "run directory must be cleaned up after validation failure"
+    );
+
+    fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn probe_failure_rolls_back_partial_directory_and_propagates_error() {
+    let dir = scratch("probe-rollback");
+    let sentinel = dir.join("important.txt");
+    fs::write(&sentinel, b"preserve me").unwrap();
+
+    let acl_status = Command::new("setfacl")
+        .arg("-d")
+        .arg("-m")
+        .arg("u::r-x,g::r-x,o::---")
+        .arg(&dir)
+        .status();
+    assert!(
+        acl_status
+            .as_ref()
+            .is_ok_and(std::process::ExitStatus::success),
+        "setfacl must succeed to configure default ACL on test directory: {acl_status:?}"
+    );
+
+    // Under this default ACL, probe directory creation succeeds (0700 masked to 0500),
+    // but creating the probe file inside it fails.
+    // is_writable_dir must roll back the probe directory and propagate the error.
+    let res = is_writable_dir(&dir);
+    assert!(
+        res.is_err(),
+        "must propagate error when probe file creation fails"
+    );
+    let err_msg = res.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("cannot create probe file"),
+        "error message must describe probe file creation failure: {err_msg}"
+    );
+    // Ensure no leftover probe directory remains and sentinel is untouched
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        1,
+        "partial probe directory must be removed during rollback"
+    );
+    assert_eq!(fs::read(&sentinel).unwrap(), b"preserve me");
+
+    // Verify that select_default_bench_parent propagates the error rather than suppressing it
+    let options = BenchOptions::default();
+    let spec = five_vm_spec();
+    let fc_bin = Path::new("firecracker");
+    let sel_res = select_default_bench_parent(&dir, &options, &spec, fc_bin);
+    assert!(
+        sel_res.is_err(),
+        "selector must propagate probe failure through the production boundary"
+    );
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        1,
+        "selection failure must leave no residual probe directory"
+    );
+
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn candidate_socket_path_budget_includes_collision_suffix() {
+    let spec = five_vm_spec();
+    let options = BenchOptions::default();
+    let fc_bin = Path::new("firecracker");
+
+    let pid = std::process::id();
+    let base = std::env::temp_dir().join(format!("cb-{pid}"));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+
+    let pid_comp = format!("r{pid:x}");
+    let ff_comp = format!("r{pid:x}-ff");
+
+    // Measure suffix length below run_dir
+    let dummy = base.join("test");
+    let dummy_run = dummy.join(&pid_comp);
+    let sample_socket = longest_bench_socket_path(&dummy_run, &options, &spec, fc_bin);
+    let suffix_len = sample_socket.as_os_str().len() - dummy_run.as_os_str().len();
+
+    // Construct a candidate directory where candidate.join(r{pid:x}) would produce
+    // a socket path of exactly 107 bytes, but candidate.join(r{pid:x}-ff) produces 110 bytes (> 107).
+    let target_cand_len = 107 - suffix_len - pid_comp.len() - 1;
+    let base_len = base.as_os_str().len();
+    assert!(
+        target_cand_len > base_len + 1,
+        "base path must be short enough to test boundary: target_cand_len={target_cand_len}, base_len={base_len}"
+    );
+    let pad = target_cand_len - base_len - 1;
+    let boundary_cand = base.join("b".repeat(pad));
+    fs::create_dir_all(&boundary_cand).unwrap();
+
+    let initial_socket =
+        longest_bench_socket_path(&boundary_cand.join(&pid_comp), &options, &spec, fc_bin);
+    let collision_socket =
+        longest_bench_socket_path(&boundary_cand.join(&ff_comp), &options, &spec, fc_bin);
+
+    assert_eq!(
+        initial_socket.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH,
+        "initial socket without collision suffix must be at the limit"
+    );
+    assert!(
+        collision_socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH,
+        "socket path with collision suffix must exceed 107 bytes"
+    );
+
+    // Verify production selector rejects boundary_cand because its collision budget exceeds 107 bytes
+    let sel = select_default_bench_parent(&boundary_cand, &options, &spec, fc_bin);
+    assert!(
+        sel.as_ref().map_or(true, |chosen| chosen != &boundary_cand
+            && !chosen.starts_with(&boundary_cand)),
+        "production selector must reject boundary candidate whose collision socket exceeds 107 bytes: chosen={sel:?}"
+    );
+
+    // Pre-create the initial run directory to force setup_private_bench_dir to disambiguate
+    let existing_run = boundary_cand.join(&pid_comp);
+    fs::create_dir_all(&existing_run).unwrap();
+
+    let disambig_run = setup_private_bench_dir(&boundary_cand).unwrap();
+    assert_eq!(
+        disambig_run,
+        boundary_cand.join(format!("r{pid:x}-1")),
+        "pre-existing run dir must cause disambiguation to -1"
+    );
+    let disambig_socket = longest_bench_socket_path(&disambig_run, &options, &spec, fc_bin);
+    assert!(
+        disambig_socket.as_os_str().len() > MAX_UNIX_SOCKET_PATH,
+        "disambiguated socket path {} must exceed limit {}",
+        disambig_socket.as_os_str().len(),
+        MAX_UNIX_SOCKET_PATH
+    );
+
+    cleanup_private_bench_dir(&disambig_run).unwrap();
+    cleanup_private_bench_dir(&existing_run).unwrap();
+    fs::remove_dir_all(&base).unwrap();
+}
+
+#[test]
+fn exhausted_candidates_fail_selection_with_clear_tmp_dir_error() {
+    let ws = scratch("exhausted-ws");
+    // Repetitions and clone count produce long clone IDs (f-n10000000-r10000000-c10000000)
+    // such that socket paths cannot fit in any candidate directory on the filesystem.
+    let options = BenchOptions {
+        repetitions: 10_000_000,
+        fork_counts: vec![10_000_000],
+        ..BenchOptions::default()
+    };
+    let oversized_yaml = include_str!("fixtures/oversized_node_bench_lab.yaml");
+    let oversized_spec = LabSpec::from_yaml_str(oversized_yaml).unwrap();
+    let fc_bin = Path::new("firecracker");
+
+    let err = select_default_bench_parent(&ws, &options, &oversized_spec, fc_bin).unwrap_err();
+    let msg = err.to_string();
+
+    assert!(
+        msg.contains("no verified benchmark directory found"),
+        "error message must describe exhausted candidates: {msg}"
+    );
+    assert!(
+        msg.contains("--tmp-dir"),
+        "error message must suggest --tmp-dir: {msg}"
+    );
+    assert!(
+        msg.contains(&MAX_UNIX_SOCKET_PATH.to_string()),
+        "error message must state the 107-byte limit: {msg}"
+    );
+
+    fs::remove_dir_all(&ws).unwrap();
 }

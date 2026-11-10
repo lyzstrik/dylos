@@ -164,9 +164,10 @@ jobs:
       - name: Run end-to-end tests
         env:
           PARTITION: ${{ matrix.selection }}
+          DYLOS_E2E_PAUSE_KPI: report
         run: |
           set -o pipefail
-          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" "DYLOS_ENDURANCE_CYCLES=5" just e2e "$PARTITION" 2>&1 | tee e2e.log
+          sudo -E env "PATH=$PATH" "HOME=$HOME" "DYLOS_FC_BIN_DIR=$DYLOS_FC_BIN_DIR" "NEXTEST_SUCCESS_OUTPUT=immediate" "NEXTEST_FAILURE_OUTPUT=immediate" "DYLOS_ENDURANCE_CYCLES=5" "DYLOS_E2E_PAUSE_KPI=report" just e2e "$PARTITION" 2>&1 | tee e2e.log
           if grep -q "SKIPPED" e2e.log; then
             echo "::error::An e2e test was skipped for missing prerequisites" >&2
             exit 1
