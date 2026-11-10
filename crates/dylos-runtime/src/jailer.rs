@@ -326,14 +326,6 @@ pub struct JailerConfig {
     /// Arguments inserted before the jailer flags. Empty for the real jailer; lets tests run a
     /// fake launcher that needs its own leading arguments.
     pub launcher_args: Vec<OsString>,
-    #[cfg(feature = "test-hooks")]
-    /// Two-phase preparation barrier for integration tests.
-    pub preparation_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
-    #[cfg(feature = "test-hooks")]
-    /// Pauses after path validation and again after opening the source.
-    pub source_validation_barrier: Option<std::sync::Arc<std::sync::Barrier>>,
-    #[cfg(feature = "test-hooks")]
-    pub cleanup_barrier: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
 
 impl JailerConfig {
@@ -351,12 +343,6 @@ impl JailerConfig {
             memory_max: None,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             launcher_args: Vec::new(),
-            #[cfg(feature = "test-hooks")]
-            preparation_barrier: None,
-            #[cfg(feature = "test-hooks")]
-            source_validation_barrier: None,
-            #[cfg(feature = "test-hooks")]
-            cleanup_barrier: None,
         }
     }
 }
@@ -556,8 +542,6 @@ pub struct Jail {
     paths: JailPaths,
     owned: bool,
     directory: File,
-    #[cfg(feature = "test-hooks")]
-    cleanup_barrier: Option<std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>>,
 }
 
 impl Jail {
@@ -576,11 +560,6 @@ impl Jail {
     pub async fn release(&mut self) -> Result<()> {
         if !self.owned {
             return Ok(());
-        }
-        #[cfg(feature = "test-hooks")]
-        if let Some(barrier) = self.cleanup_barrier.take() {
-            barrier.0.notify_one();
-            barrier.1.notified().await;
         }
         remove_jail(&self.paths).await?;
         self.owned = false;
@@ -628,33 +607,9 @@ pub async fn prepare_chroot(
     }
     let (paths, files, uid, gid) = (paths.clone(), files.to_vec(), config.uid, config.gid);
     let id = paths.id.clone();
-    #[cfg(feature = "test-hooks")]
-    let cleanup_barrier = config.cleanup_barrier.clone();
-    #[cfg(feature = "test-hooks")]
-    let barrier = config.preparation_barrier.clone();
-    #[cfg(feature = "test-hooks")]
-    let source_barrier = config.source_validation_barrier.clone();
     tokio::task::spawn_blocking(move || {
         let jail = claim(paths)?;
-        #[cfg(feature = "test-hooks")]
-        let jail = {
-            let mut jail = jail;
-            jail.cleanup_barrier = cleanup_barrier;
-            jail
-        };
-        #[cfg(feature = "test-hooks")]
-        if let Some(b) = barrier {
-            b.wait();
-            b.wait();
-        }
-        populate(
-            &jail,
-            &files,
-            uid,
-            gid,
-            #[cfg(feature = "test-hooks")]
-            source_barrier.as_deref(),
-        )?;
+        populate(&jail, &files, uid, gid)?;
         Ok(jail)
     })
     .await
@@ -696,8 +651,6 @@ fn claim(paths: JailPaths) -> Result<Jail> {
                 paths,
                 directory,
                 owned: true,
-                #[cfg(feature = "test-hooks")]
-                cleanup_barrier: None,
             };
             jail.directory = openat(
                 &jail.directory,
@@ -743,13 +696,7 @@ fn open_directory(path: &Path, create: bool) -> std::io::Result<File> {
     Ok(dir)
 }
 
-fn populate(
-    jail: &Jail,
-    files: &[ChrootFile],
-    uid: u32,
-    gid: u32,
-    #[cfg(feature = "test-hooks")] source_barrier: Option<&std::sync::Barrier>,
-) -> Result<()> {
+fn populate(jail: &Jail, files: &[ChrootFile], uid: u32, gid: u32) -> Result<()> {
     let paths = &jail.paths;
     let io = |op, path: &Path| io_error(paths, op, path);
     let own = |file: &File, path: &Path| {
@@ -767,13 +714,7 @@ fn populate(
     let run_path = paths.host_path("/run");
     let run = make_dir(&root, "run", &run_path)?;
     for file in files {
-        let placed = place_file(
-            paths,
-            &root,
-            file,
-            #[cfg(feature = "test-hooks")]
-            source_barrier,
-        )?;
+        let placed = place_file(paths, &root, file)?;
         let placed_path = paths.host_path(&file.jailed_path());
         if file.read_only {
             // Never chmod or chown here: a hard link shares the inode with every other clone.
@@ -800,12 +741,13 @@ fn populate(
     Ok(())
 }
 
-fn place_file(
-    paths: &JailPaths,
-    root: &File,
-    file: &ChrootFile,
-    #[cfg(feature = "test-hooks")] source_barrier: Option<&std::sync::Barrier>,
-) -> Result<File> {
+fn place_file(paths: &JailPaths, root: &File, file: &ChrootFile) -> Result<File> {
+    let metadata = validate_source(paths, file)?;
+    let source = open_source(paths, file, &metadata)?;
+    link_source(paths, root, file, source)
+}
+
+fn validate_source(paths: &JailPaths, file: &ChrootFile) -> Result<std::fs::Metadata> {
     let io = |op, path: &Path| io_error(paths, op, path);
     let metadata =
         std::fs::symlink_metadata(&file.source).map_err(io("validate source", &file.source))?;
@@ -814,11 +756,23 @@ fn place_file(
             ErrorKind::InvalidInput.into(),
         ));
     }
-    #[cfg(feature = "test-hooks")]
-    if let Some(barrier) = source_barrier {
-        barrier.wait();
-        barrier.wait();
-    }
+    Ok(metadata)
+}
+
+/// A chroot file source opened without following symlinks, pinned to the validated inode.
+struct OpenSource<'a> {
+    dir: File,
+    name: &'a std::ffi::OsStr,
+    file: File,
+    pinned: std::fs::Metadata,
+}
+
+fn open_source<'a>(
+    paths: &JailPaths,
+    file: &'a ChrootFile,
+    metadata: &std::fs::Metadata,
+) -> Result<OpenSource<'a>> {
+    let io = |op, path: &Path| io_error(paths, op, path);
     let parent = file
         .source
         .parent()
@@ -830,7 +784,7 @@ fn place_file(
         .ok_or_else(|| io("open source", &file.source)(ErrorKind::InvalidInput.into()))?;
     let source_dir = open_directory(parent, false).map_err(io("open source parent", parent))?;
     // NONBLOCK prevents a regular file replaced by a FIFO from hanging preparation.
-    let mut source = openat(
+    let source = openat(
         &source_dir,
         name,
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
@@ -847,11 +801,27 @@ fn place_file(
     if file.read_only {
         trusted_read_only(&pinned).map_err(io("validate read-only source", &file.source))?;
     }
-    #[cfg(feature = "test-hooks")]
-    if let Some(barrier) = source_barrier {
-        barrier.wait();
-        barrier.wait();
-    }
+    Ok(OpenSource {
+        dir: source_dir,
+        name,
+        file: source,
+        pinned,
+    })
+}
+
+fn link_source(
+    paths: &JailPaths,
+    root: &File,
+    file: &ChrootFile,
+    source: OpenSource<'_>,
+) -> Result<File> {
+    let io = |op, path: &Path| io_error(paths, op, path);
+    let OpenSource {
+        dir: source_dir,
+        name,
+        file: mut source,
+        pinned,
+    } = source;
     let dest = paths.host_path(&file.jailed_path());
     let placed = match linkat(
         &source_dir,
@@ -923,4 +893,119 @@ pub async fn remove_jail(paths: &JailPaths) -> Result<()> {
     ignore_missing(res).map_err(io_error(paths, "remove cgroup", &paths.cgroup_dir))?;
     let res = tokio::fs::remove_dir_all(&paths.jail_dir).await;
     ignore_missing(res).map_err(io_error(paths, "remove dir", &paths.jail_dir))
+}
+
+// Preparation runs in one blocking task, so no public path can change the filesystem between
+// its steps; these tests run the steps directly and race them by hand.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    struct Race {
+        dir: tempfile::TempDir,
+        config: JailerConfig,
+        paths: JailPaths,
+        parent: PathBuf,
+        source: PathBuf,
+        outside: PathBuf,
+        target: PathBuf,
+    }
+
+    impl Race {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let meta = std::fs::metadata(dir.path()).unwrap();
+            let config = JailerConfig::new(dir.path().join("jails"), meta.uid(), meta.gid());
+            let paths = JailPaths::new(&config, "lab", "web").unwrap();
+            let (parent, outside) = (dir.path().join("sources"), dir.path().join("outside"));
+            std::fs::create_dir(&parent).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            let (source, target) = (parent.join("kernel"), outside.join("kernel"));
+            std::fs::write(&source, b"kernel").unwrap();
+            std::fs::write(&target, b"outside contents").unwrap();
+            Self {
+                dir,
+                config,
+                paths,
+                parent,
+                source,
+                outside,
+                target,
+            }
+        }
+
+        fn replace_source(&self) {
+            std::fs::remove_file(&self.source).unwrap();
+            symlink(&self.target, &self.source).unwrap();
+        }
+
+        fn replace_ancestor(&self) {
+            std::fs::rename(&self.parent, self.dir.path().join("original-sources")).unwrap();
+            symlink(&self.outside, &self.parent).unwrap();
+        }
+
+        fn assert_target_untouched(&self, before: &std::fs::Metadata) {
+            let after = std::fs::symlink_metadata(&self.target).unwrap();
+            assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+            assert_eq!(std::fs::read(&self.target).unwrap(), b"outside contents");
+        }
+    }
+
+    fn assert_op(result: Result<impl std::fmt::Debug>, ops: &[&str]) {
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::Io { op, .. } if ops.contains(op)),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn source_replacement_after_validation_is_rejected() {
+        for ancestor in [false, true] {
+            let race = Race::new();
+            let before = std::fs::symlink_metadata(&race.target).unwrap();
+            let file = ChrootFile::new(&race.source, "kernel");
+            let metadata = validate_source(&race.paths, &file).unwrap();
+            if ancestor {
+                race.replace_ancestor();
+            } else {
+                race.replace_source();
+            }
+            let opened = open_source(&race.paths, &file, &metadata).map(|_| ());
+            assert_op(opened, &["open source", "open source parent"]);
+            race.assert_target_untouched(&before);
+        }
+    }
+
+    #[test]
+    fn source_replacement_after_open_is_not_followed_by_placement() {
+        let race = Race::new();
+        let before = std::fs::symlink_metadata(&race.target).unwrap();
+        let root_path = race.dir.path().join("root");
+        std::fs::create_dir(&root_path).unwrap();
+        let root = File::open(&root_path).unwrap();
+        let file = ChrootFile::new(&race.source, "kernel");
+        let metadata = validate_source(&race.paths, &file).unwrap();
+        let opened = open_source(&race.paths, &file, &metadata).unwrap();
+        race.replace_source();
+        let placed = link_source(&race.paths, &root, &file, opened);
+        assert_op(placed, &["open placed file"]);
+        race.assert_target_untouched(&before);
+    }
+
+    #[test]
+    fn injected_jail_directory_symlink_is_rejected_without_touching_target() {
+        let race = Race::new();
+        let before = std::fs::symlink_metadata(&race.outside).unwrap();
+        let jail = claim(race.paths.clone()).unwrap();
+        symlink(&race.outside, &race.paths.root).unwrap();
+        let populated = populate(&jail, &[], race.config.uid, race.config.gid);
+        assert_op(populated, &["create dir"]);
+        drop(jail);
+        assert!(!race.paths.jail_dir.exists());
+        let after = std::fs::symlink_metadata(&race.outside).unwrap();
+        assert_eq!((before.uid(), before.gid()), (after.uid(), after.gid()));
+        assert!(!race.outside.join("run").exists());
+    }
 }
