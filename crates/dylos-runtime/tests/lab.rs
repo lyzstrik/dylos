@@ -253,6 +253,21 @@ async fn invalid_inputs_are_rejected_before_creating_host_resources() {
 }
 
 #[tokio::test]
+async fn host_root_jailer_is_rejected_before_creating_host_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::LabReady);
+    for (uid, gid) in [(0, 65534), (65534, 0)] {
+        (config.jailer.uid, config.jailer.gid) = (uid, gid);
+        let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+        assert!(
+            matches!(&err, LabError::Invalid { message, .. } if message == "requires non-root jailer uid/gid"),
+            "{err}"
+        );
+    }
+    assert!(!config.store.base.exists());
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
 async fn invalid_vm_resources_are_rejected_before_creating_host_resources() {
     let (sandbox, config, mut spec) = setup(Mode::LabReady);
     for (vcpus, memory) in [(0, 128), (33, 128), (3, 128), (1, 0)] {

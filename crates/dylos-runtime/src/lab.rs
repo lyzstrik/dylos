@@ -1116,15 +1116,10 @@ fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {
     {
         return Err(invalid(id, "invalid lab id"));
     }
-    if !cfg!(feature = "test-hooks")
-        && (nix::unistd::geteuid().as_raw() != 0
-            || config.jailer.uid == 0
-            || config.jailer.gid == 0)
+    if maps_to_parent_root("/proc/self/uid_map", config.jailer.uid)
+        || maps_to_parent_root("/proc/self/gid_map", config.jailer.gid)
     {
-        return Err(invalid(
-            id,
-            "requires root orchestrator and non-root jailer uid/gid",
-        ));
+        return Err(invalid(id, "requires non-root jailer uid/gid"));
     }
     spec.validate()?;
     let control_socket = Lab::control_socket_path(&config.store.base, id);
@@ -1140,7 +1135,7 @@ fn validate(config: &LabConfig, spec: &LabSpec, id: &str) -> Result<()> {
         if !crate::vm::validate_resources(node.vcpus, node.memory) {
             return Err(invalid(id, "invalid VM vCPU or memory configuration"));
         }
-        JailPaths::new(&config.jailer, &jail_identity(id), &node.name)?;
+        JailPaths::for_lab_node(&config.jailer, id, &node.name)?;
         guest_net::boot_args(spec, node)?;
     }
     Ok(())
@@ -1394,7 +1389,7 @@ impl Lab {
             let plan = FabricPlan::new(id, &spec)?;
             // cgroup.kill addresses the owned group, avoiding recycled host PID races.
             for node in &spec.nodes {
-                let paths = JailPaths::new(&config.jailer, &jail_identity(id), &node.name)?;
+                let paths = JailPaths::for_lab_node(&config.jailer, id, &node.name)?;
                 let (cgroup, lab) = (paths.cgroup_dir.clone(), id.to_owned());
                 blocking(id, move || stop_cgroup(&lab, &cgroup)).await?;
                 crate::jailer::remove_jail(&paths).await?;
@@ -1404,6 +1399,26 @@ impl Lab {
         let (store, id_copy) = (config.store.clone(), id.to_owned());
         blocking(id, move || Ok(store.remove(&id_copy)?)).await
     }
+}
+
+// Root of a user namespace whose root maps to an unprivileged id is not host root, so the jailer
+// id is checked against the parent namespace. An unreadable map counts as root.
+fn maps_to_parent_root(map: &str, id: u32) -> bool {
+    std::fs::read_to_string(map).map_or(true, |map| id_maps_to_root(&map, id))
+}
+
+// Each line is `<inside> <outside> <length>`; only the first id of a range starting at outside 0
+// maps to root. A malformed line counts as root.
+fn id_maps_to_root(map: &str, id: u32) -> bool {
+    map.lines().any(|line| {
+        let mut fields = line.split_whitespace().map(str::parse::<u32>);
+        match (fields.next(), fields.next(), fields.next()) {
+            (Some(Ok(inside)), Some(Ok(outside)), Some(Ok(len))) => {
+                inside == id && outside == 0 && len > 0
+            }
+            _ => true,
+        }
+    })
 }
 
 fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
@@ -1424,10 +1439,9 @@ fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
     let events = || {
         let mut text = String::new();
         match open("cgroup.events", OFlag::O_RDONLY) {
-            Err(LabError::Io { source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound
-                    && cfg!(feature = "test-hooks") =>
-            {
+            // Only a cgroup v2 directory has it; anything else has no process to kill, and a
+            // populated v1 group still makes the later rmdir fail.
+            Err(LabError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(false);
             }
             result => {
@@ -1552,7 +1566,8 @@ impl Drop for Lab {
 }
 
 // Length-prefix the lab id: lab `a-b`, node `c` must not alias lab `a`, node `b-c`.
-fn jail_identity(id: &str) -> String {
+#[must_use]
+pub fn jail_identity(id: &str) -> String {
     format!("lab{}-{id}", id.len())
 }
 
@@ -1590,4 +1605,21 @@ async fn create_network(config: &LabConfig, plan: FabricPlan, frozen: bool) -> R
     };
     tracing::info!(duration_ms = started.elapsed().as_millis(), "fabric ready");
     Ok(network)
+}
+
+// Unprivileged tests only see the initial map and a single-line `unshare -r` map.
+#[cfg(test)]
+mod tests {
+    use super::id_maps_to_root;
+
+    #[test]
+    fn only_ids_mapped_to_parent_root_are_root() {
+        let initial = "         0          0 4294967295\n";
+        assert!(id_maps_to_root(initial, 0));
+        assert!(!id_maps_to_root(initial, 65534));
+        assert!(!id_maps_to_root("0 1000 1\n", 0));
+        assert!(!id_maps_to_root("0 100000 65536\n", 0));
+        assert!(id_maps_to_root("0 100000 1\n1 0 1\n", 1));
+        assert!(id_maps_to_root("garbage\n", 65534));
+    }
 }

@@ -1632,7 +1632,10 @@ impl SnapshotOpener {
     /// Returns an error for absolute or parent paths, symlinks, missing files,
     /// or non-regular leaves.
     pub fn open(&self, path: &Path) -> io::Result<File> {
-        self.open_impl(path, None, &mut |_| {})
+        match self.open_beneath(path) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => self.open_walk(path),
+            result => result,
+        }
     }
 
     /// Loads and validates the snapshot manifest, checking that manifest VMs
@@ -1685,81 +1688,57 @@ impl SnapshotOpener {
         Ok(manifest)
     }
 
-    /// Forces a resolver and pauses immediately before each resolution step.
-    ///
-    /// # Errors
-    /// Returns the same errors as `open`, including ENOSYS for forced openat2.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn open_with_test_hook(
-        &self,
-        path: &Path,
-        fallback: bool,
-        mut before_step: impl FnMut(usize),
-    ) -> io::Result<File> {
-        self.open_impl(path, Some(fallback), &mut before_step)
-    }
-
-    fn open_impl(
-        &self,
-        path: &Path,
-        fallback: Option<bool>,
-        before_step: &mut dyn FnMut(usize),
-    ) -> io::Result<File> {
+    // Resolves atomically with openat2; ENOSYS on kernels without it.
+    fn open_beneath(&self, path: &Path) -> io::Result<File> {
+        // RESOLVE_BENEATH alone would accept `..` that stays inside the base.
         if path
             .components()
             .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
 
-        if fallback != Some(true) {
-            before_step(0);
-            let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let how = open_how {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        };
 
-            let how = open_how {
-                flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
-                mode: 0,
-                resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
-            };
-
-            // SAFETY: The base descriptor, NUL-terminated path, and initialized C-layout
-            // how remain live for this syscall; the supplied size matches how.
-            let fd = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    self.base.as_raw_fd(),
-                    path_c.as_ptr(),
-                    &how,
-                    std::mem::size_of::<open_how>(),
-                )
-            };
-
-            if fd >= 0 {
-                let Ok(fd_i32) = i32::try_from(fd) else {
-                    // SAFETY: fd comes from a successful openat2 syscall and is
-                    // exclusively owned here. Pass it unchanged to close before
-                    // returning; no File has taken ownership of it.
-                    if unsafe { libc::syscall(libc::SYS_close, fd) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    return Err(io::ErrorKind::Other.into());
-                };
-                // SAFETY: A successful openat2 returns a valid, newly opened descriptor
-                // that we exclusively own. The conversion preserves its value, and
-                // File takes ownership exactly once.
-                let file = unsafe { std::fs::File::from_raw_fd(fd_i32) };
-                return regular_snapshot_file(file);
-            }
-
-            let err = io::Error::last_os_error();
-            if fallback == Some(false) || err.raw_os_error() != Some(libc::ENOSYS) {
-                return Err(err);
-            }
+        // SAFETY: The base descriptor, NUL-terminated path, and initialized C-layout
+        // how remain live for this syscall; the supplied size matches how.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.base.as_raw_fd(),
+                path_c.as_ptr(),
+                &how,
+                std::mem::size_of::<open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
+        let Ok(fd_i32) = i32::try_from(fd) else {
+            // SAFETY: fd comes from a successful openat2 syscall and is
+            // exclusively owned here. Pass it unchanged to close before
+            // returning; no File has taken ownership of it.
+            if unsafe { libc::syscall(libc::SYS_close, fd) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Err(io::ErrorKind::Other.into());
+        };
+        // SAFETY: A successful openat2 returns a valid, newly opened descriptor
+        // that we exclusively own. The conversion preserves its value, and
+        // File takes ownership exactly once.
+        let file = unsafe { std::fs::File::from_raw_fd(fd_i32) };
+        regular_snapshot_file(file)
+    }
+
+    // Component-by-component fallback from the pinned base, refusing symlinks at every step.
+    fn open_walk(&self, path: &Path) -> io::Result<File> {
         let mut parent = self.base.try_clone()?;
-        let mut step = 0;
         let mut components = path.components().peekable();
         while let Some(component) = components.next() {
             let name = match component {
@@ -1773,8 +1752,6 @@ impl SnapshotOpener {
             } else {
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY
             };
-            before_step(step);
-            step += 1;
             parent = open(&parent, name, flags)?;
         }
         regular_snapshot_file(parent)
@@ -2070,5 +2047,90 @@ mod tests {
 
         let alone = with_cleanup(io::Error::from_raw_os_error(libc::EXDEV), Ok(()));
         assert!(!alone.to_string().contains("additionally"));
+    }
+
+    // The public `open` only reaches the walk on kernels without openat2, so each resolver is
+    // exercised directly.
+    use std::fs;
+
+    type Resolver = fn(&SnapshotOpener, &Path) -> io::Result<File>;
+    const RESOLVERS: [Resolver; 2] = [SnapshotOpener::open_beneath, SnapshotOpener::open_walk];
+
+    fn contents(mut file: File) -> String {
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    #[test]
+    fn both_resolvers_reject_existing_escape_targets_and_pin_base() {
+        use std::os::unix::fs::symlink;
+        for resolve in RESOLVERS {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().join("snapshot");
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(base.join("nested")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(base.join("file"), "inside").unwrap();
+            fs::write(outside.join("file"), "outside").unwrap();
+            symlink(&outside, base.join("link")).unwrap();
+            symlink(outside.join("file"), base.join("leaf")).unwrap();
+            let opener = SnapshotOpener::new(&base).unwrap();
+            let open = |path: &Path| resolve(&opener, path);
+            assert_eq!(contents(open(Path::new("file")).unwrap()), "inside");
+            for path in ["../outside/file", "nested/../file", "link/file", "leaf"] {
+                assert!(open(Path::new(path)).is_err(), "{path}");
+            }
+            assert!(open(&outside.join("file")).is_err());
+            fs::rename(&base, tmp.path().join("pinned")).unwrap();
+            symlink(&outside, &base).unwrap();
+            assert_eq!(contents(open(Path::new("file")).unwrap()), "inside");
+            assert!(SnapshotOpener::new(&base).is_err());
+            let ancestor = tmp.path().join("ancestor");
+            symlink(tmp.path(), &ancestor).unwrap();
+            assert!(SnapshotOpener::new(&ancestor.join("pinned")).is_err());
+        }
+    }
+
+    // A component swapped for a symlink before the resolver reaches it, whether it is the
+    // first component or one below an already pinned directory.
+    #[test]
+    fn component_replacement_never_returns_outside_content() {
+        use std::os::unix::fs::symlink;
+        for (resolve, replaced) in [
+            (RESOLVERS[0], "nested"),
+            (RESOLVERS[1], "nested"),
+            (RESOLVERS[1], "nested/inner"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().join("snapshot");
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(base.join("nested/inner")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(base.join("nested/inner/file"), "inside").unwrap();
+            fs::write(outside.join("file"), "outside").unwrap();
+            fs::create_dir(outside.join("inner")).unwrap();
+            fs::write(outside.join("inner/file"), "outside").unwrap();
+            let opener = SnapshotOpener::new(&base).unwrap();
+            let component = base.join(replaced);
+            fs::rename(&component, tmp.path().join("removed")).unwrap();
+            symlink(&outside, &component).unwrap();
+            assert!(resolve(&opener, Path::new("nested/inner/file")).is_err());
+        }
+    }
+
+    #[test]
+    fn both_resolvers_reject_non_regular_leaves_without_blocking() {
+        for resolve in RESOLVERS {
+            let tmp = tempfile::tempdir().unwrap();
+            nix::unistd::mkfifo(&tmp.path().join("fifo"), Mode::S_IRUSR).unwrap();
+            let opener = SnapshotOpener::new(tmp.path()).unwrap();
+            for path in ["fifo", "."] {
+                assert!(resolve(&opener, Path::new(path)).is_err());
+            }
+            // Read-only access to an existing device requires no host configuration changes.
+            let devices = SnapshotOpener::new(Path::new("/dev")).unwrap();
+            assert!(resolve(&devices, Path::new("null")).is_err());
+        }
     }
 }
