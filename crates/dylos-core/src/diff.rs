@@ -33,16 +33,6 @@ pub struct DiffSet<T, C> {
     pub changed: Vec<C>,
 }
 
-impl<T, C> Default for DiffSet<T, C> {
-    fn default() -> Self {
-        Self {
-            added: Vec::new(),
-            removed: Vec::new(),
-            changed: Vec::new(),
-        }
-    }
-}
-
 impl<T, C> DiffSet<T, C> {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -93,7 +83,7 @@ pub struct NodeInterfaceChange {
 }
 
 /// Topology changes between two `LabSpec` definitions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TopologyDiff {
     pub segments: SegmentDiff,
     pub nodes: NodeDiff,
@@ -296,6 +286,15 @@ pub struct DiskDiff {
     pub status: DiffStatus,
     pub size_a: Option<u64>,
     pub size_b: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<DiskContentDiff>,
+}
+
+/// Fixed 4096-byte block comparison; changed bytes include the entire differing block.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiskContentDiff {
+    pub changed_blocks: u64,
+    pub changed_bytes: u64,
 }
 
 impl DiskDiff {
@@ -312,13 +311,6 @@ pub struct VmDiff {
     pub state: FileDiff,
     pub memory: FileDiff,
     pub disks: Vec<DiskDiff>,
-}
-
-impl VmDiff {
-    #[must_use]
-    pub fn is_identical(&self) -> bool {
-        self.status == DiffStatus::Identical
-    }
 }
 
 /// Complete diff between two lab snapshots.

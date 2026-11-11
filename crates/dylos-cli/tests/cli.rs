@@ -141,6 +141,25 @@ fn argument_parsing() {
             false,
             vec!["failed to read lab spec"],
         ),
+        (
+            vec![
+                "lab",
+                "up",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../labs/abc.yaml"),
+            ],
+            false,
+            vec!["requires root orchestrator"],
+        ),
+        (
+            vec!["lab", "restore", "missing"],
+            false,
+            vec!["requires root orchestrator"],
+        ),
+        (
+            vec!["lab", "fork", "missing", "-n", "1"],
+            false,
+            vec!["requires root orchestrator"],
+        ),
     ] {
         let output = run(store.path(), &args);
         for text in expected {

@@ -5,7 +5,6 @@ mod support;
 use std::fs;
 use std::future::Future;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{
     Arc,
@@ -250,6 +249,21 @@ async fn invalid_inputs_are_rejected_before_creating_host_resources() {
     }
     spec.nodes[0].name = "../escape".into();
     assert!(Lab::up_with(&config, &spec, "lab").await.is_err());
+    assert!(!config.store.base.exists());
+    assert_removed(&sandbox, &config);
+}
+
+#[tokio::test]
+async fn host_root_jailer_is_rejected_before_creating_host_resources() {
+    let (sandbox, mut config, spec) = setup(Mode::LabReady);
+    for (uid, gid) in [(0, 65534), (65534, 0)] {
+        (config.jailer.uid, config.jailer.gid) = (uid, gid);
+        let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
+        assert!(
+            matches!(&err, LabError::Invalid { message, .. } if message == "requires non-root jailer uid/gid"),
+            "{err}"
+        );
+    }
     assert!(!config.store.base.exists());
     assert_removed(&sandbox, &config);
 }
@@ -1410,8 +1424,10 @@ async fn up_rejects_api_socket_exceeding_sun_len_before_creating_resources() {
 #[tokio::test]
 async fn up_rejects_dynamic_firecracker_before_creating_resources() {
     let (sandbox, mut config, spec) = setup(Mode::Serve);
-    let dynamic =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    let dynamic_fixture = support::elf::ElfBuilder::dynamic_binary()
+        .write_temp()
+        .unwrap();
+    let dynamic = dynamic_fixture.path().to_path_buf();
     config.jailer.firecracker = dynamic.clone();
     let err = Lab::up_with(&config, &spec, "lab").await.err().unwrap();
     match &err {
@@ -1439,8 +1455,10 @@ async fn up_rejects_dynamic_firecracker_before_creating_resources() {
 #[tokio::test]
 async fn restore_rejects_dynamic_firecracker_before_creating_resources() {
     let (sandbox, mut config, _spec) = setup(Mode::Serve);
-    let dynamic =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    let dynamic_fixture = support::elf::ElfBuilder::dynamic_binary()
+        .write_temp()
+        .unwrap();
+    let dynamic = dynamic_fixture.path().to_path_buf();
     config.jailer.firecracker = dynamic.clone();
     let snapshot_dir = sandbox.dir.path().join("fake-snapshot");
     let err = Lab::restore_with(&config, &snapshot_dir, "restored")
@@ -1467,8 +1485,10 @@ async fn restore_rejects_dynamic_firecracker_before_creating_resources() {
 #[tokio::test]
 async fn fork_rejects_dynamic_firecracker_before_creating_resources() {
     let (sandbox, mut config, _spec) = setup(Mode::Serve);
-    let dynamic =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/dynamic_binary");
+    let dynamic_fixture = support::elf::ElfBuilder::dynamic_binary()
+        .write_temp()
+        .unwrap();
+    let dynamic = dynamic_fixture.path().to_path_buf();
     config.jailer.firecracker = dynamic.clone();
     let snapshot_dir = sandbox.dir.path().join("fake-snapshot");
     let clone_ids = vec!["fork-c1".to_string(), "fork-c2".to_string()];

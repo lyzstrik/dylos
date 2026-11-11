@@ -215,6 +215,17 @@ pub struct VmFileSource {
     max_bytes: u64,
 }
 
+/// Isolated sparse VM bytes owned until they are persisted after thaw.
+pub struct BufferedVmFile {
+    source_device: u64,
+    destination: File,
+    path: PathBuf,
+    node: String,
+    file_name: String,
+    size: u64,
+    chunks: Vec<(u64, Vec<u8>)>,
+}
+
 impl VmFileSource {
     /// # Errors
     /// Rejects symlinks in any component, non-regular files and files over `max_bytes`.
@@ -371,14 +382,7 @@ impl Snapshot {
             .map_err(|e| contextual(source_path, e))?;
         let fsync_ms = u64::try_from(t_fsync.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        };
+        let vm_dir = self.vm_directory(node)?;
 
         let dest_path = self.root.join("vms").join(node).join(disk_name);
         let dest_file = open(
@@ -472,7 +476,7 @@ impl Snapshot {
         self.save_vm_source_impl(source, node, file_name, true)
     }
 
-    /// Captures an isolated state or memory file without hashing it.
+    /// Captures an isolated state or memory file without hashing or syncing it.
     /// # Errors
     /// Enforces the same source and size checks as `save_vm_source`.
     pub fn capture_vm_source(
@@ -482,6 +486,111 @@ impl Snapshot {
         file_name: &str,
     ) -> Result<(FileMeta, u64), Error> {
         self.save_vm_source_impl(source, node, file_name, false)
+    }
+
+    /// Captures bounded, private sparse bytes without writing to the filesystem.
+    /// Persist the result after thaw, then finalize it with `hash_file`.
+    /// # Errors
+    /// Rejects invalid names, cross-device sources, read errors and excessive growth.
+    pub fn buffer_vm_source(
+        &self,
+        source: VmFileSource,
+        node: &str,
+        file_name: &str,
+    ) -> Result<BufferedVmFile, Error> {
+        valid_id(node)?;
+        valid_file_name(file_name)?;
+        let vm_dir = self.vm_directory(node)?;
+        let path = PathBuf::from(format!("vms/{node}/{file_name}"));
+        let dest_path = self.root.join(&path);
+        let destination = open(
+            &vm_dir,
+            file_name.as_ref(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        )
+        .map_err(|e| contextual(&dest_path, e))?;
+        let fail = |e| {
+            contextual(
+                &dest_path,
+                with_cleanup(e, cleanup_dest(&vm_dir, file_name, &dest_path)),
+            )
+        };
+        if source.meta.dev() != destination.metadata().map_err(fail)?.dev() {
+            return Err(fail(io::Error::from_raw_os_error(libc::EXDEV)));
+        }
+        tracing::info!(node, file_name, created = ?source.meta.created(), modified = ?source.meta.modified(), "snapshot source timestamps");
+        let mut chunks = Vec::new();
+        let size = read_sparse_bounded(&source.file, source.max_bytes, |offset, bytes| {
+            chunks.push((offset, bytes.to_vec()));
+            Ok(())
+        })
+        .map_err(fail)?;
+        safe_unlink_source(&source.dir, &source.name, &source.meta).map_err(fail)?;
+        let source_device = source.meta.dev();
+        drop(source);
+        Ok(BufferedVmFile {
+            source_device,
+            destination,
+            path,
+            node: node.into(),
+            file_name: file_name.into(),
+            size,
+            chunks,
+        })
+    }
+
+    /// Writes private buffered bytes into staging; sync, seal and hash before publication.
+    /// # Errors
+    /// Returns contextual directory, write and cross-device errors; removes partial output.
+    pub fn persist_buffered_vm_file(&self, captured: BufferedVmFile) -> Result<FileMeta, Error> {
+        let BufferedVmFile {
+            source_device,
+            destination: mut file,
+            path,
+            node,
+            file_name,
+            size,
+            chunks,
+        } = captured;
+        let vm_dir = self.vm_directory(&node)?;
+        let dest_path = self.root.join(&path);
+        let write = || -> io::Result<()> {
+            if source_device != file.metadata()?.dev() {
+                return Err(io::Error::from_raw_os_error(libc::EXDEV));
+            }
+            for (offset, bytes) in chunks {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&bytes)?;
+            }
+            file.set_len(size)?;
+            if file_name == "vm.mem" {
+                file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+            }
+            Ok(())
+        };
+        write().map_err(|e| {
+            contextual(
+                &dest_path,
+                with_cleanup(e, cleanup_dest(&vm_dir, &file_name, &dest_path)),
+            )
+        })?;
+        Ok(FileMeta {
+            fsverity: None,
+            path,
+            sha256: String::new(),
+            size,
+        })
+    }
+
+    fn vm_directory(&self, node: &str) -> Result<File, Error> {
+        let vms = open(&self.directory, "vms".as_ref(), dirs())
+            .map_err(|e| contextual(&self.root.join("vms"), e))?;
+        match open(&vms, node.as_ref(), dirs()) {
+            Ok(dir) => Ok(dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
+                .map_err(|e| contextual(&self.root.join("vms").join(node), e)),
+            Err(e) => Err(contextual(&self.root.join("vms").join(node), e)),
+        }
     }
 
     fn save_vm_source_impl(
@@ -503,14 +612,7 @@ impl Snapshot {
         } = source;
         let source_path = source_path.as_path();
 
-        let vms = open(&self.directory, "vms".as_ref(), dirs())
-            .map_err(|e| contextual(&self.root.join("vms"), e))?;
-        let vm_dir = match open(&vms, node.as_ref(), dirs()) {
-            Ok(dir) => dir,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => make_directory(&vms, node)
-                .map_err(|e| contextual(&self.root.join("vms").join(node), e))?,
-            Err(e) => return Err(contextual(&self.root.join("vms").join(node), e)),
-        };
+        let vm_dir = self.vm_directory(node)?;
 
         let dest_path = self.root.join("vms").join(node).join(file_name);
         let mut dest_file = open(
@@ -532,15 +634,26 @@ impl Snapshot {
             ));
         }
 
-        match reflink(&source_file, &dest_file) {
+        // FICLONE flushes dirty source pages before remapping extents. Deferred
+        // capture uses buffered copy to defer explicit writeback until after thaw.
+        let capture = if hash {
+            reflink(&source_file, &dest_file)
+        } else {
+            copy_bounded(&source_file, &mut dest_file, max_bytes)
+        };
+        match capture {
             Ok(()) => {}
+            Err(err) if !hash => return Err(contextual(&dest_path, fail(err))),
             Err(err)
-                if matches!(
-                    err.raw_os_error(),
-                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
-                ) =>
+                if hash
+                    && matches!(
+                        err.raw_os_error(),
+                        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+                    ) =>
             {
-                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes) {
+                if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes)
+                    .and_then(|()| dest_file.sync_all())
+                {
                     return Err(contextual(&dest_path, fail(copy_err)));
                 }
             }
@@ -593,12 +706,13 @@ impl Snapshot {
         ))
     }
 
-    /// Seals captured content with fs-verity where supported, then hashes it.
+    /// Syncs captured content, seals it with fs-verity where supported, then hashes it.
     /// The captured size is an upper bound; unsupported storage retains full hashing.
     /// # Errors
     /// Rejects missing files and changes in captured size.
     pub fn hash_file(&self, meta: &mut FileMeta) -> Result<(), Error> {
         let opener = SnapshotOpener {
+            root: self.root.clone(),
             base: self
                 .directory
                 .try_clone()
@@ -606,6 +720,9 @@ impl Snapshot {
         };
         let file = opener
             .open(&meta.path)
+            .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
+        // Deferred captures are written back here, after thaw and before sealing.
+        file.sync_all()
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         // Enabling verity requires write permission even on an O_RDONLY descriptor.
         // Captured memory is already read-only; restore its mode on every outcome.
@@ -718,6 +835,14 @@ impl Drop for Snapshot {
     }
 }
 impl Store {
+    /// Drains pending writes before a latency-sensitive capture.
+    /// # Errors
+    /// Reports filesystem writeback errors, including those from earlier operations.
+    pub fn sync_filesystem(&self) -> Result<(), Error> {
+        let base = directory(&self.base, true).map_err(|e| contextual(&self.base, e))?;
+        nix::unistd::syncfs(&base).map_err(|e| contextual(&self.base, e.into()))
+    }
+
     /// Checks image/store and jail/store reflinks before any lab resources are created.
     /// Missing directories are probed at their nearest existing ancestor. Unnamed temporary
     /// files are removed by the kernel when their descriptors close, including on failure.
@@ -1117,11 +1242,61 @@ fn compute_file_sha256_and_size(file: &File, max_bytes: u64) -> io::Result<(Stri
     Ok((sha256, total_size))
 }
 
+/// Reserves the temporary memory output before freeze, owned like the VM jail.
+/// The snapshot operation must unlink `snap.mem` on success or recovery.
+/// # Errors
+/// Rejects existing outputs and reports allocation/ownership errors after removing partial output.
+pub fn preallocate_snapshot_memory(root: &Path, size: u64) -> Result<(), Error> {
+    let path = root.join("snap.mem");
+    let length =
+        i64::try_from(size).map_err(|_| contextual(&path, io::ErrorKind::InvalidInput.into()))?;
+    let dir = directory(root, false).map_err(|e| contextual(root, e))?;
+    let file = open(
+        &dir,
+        "snap.mem".as_ref(),
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+    )
+    .map_err(|e| contextual(&path, e))?;
+    let allocate = || -> io::Result<()> {
+        let owner = dir.metadata()?;
+        let meta = file.metadata()?;
+        if meta.uid() != owner.uid() || meta.gid() != owner.gid() {
+            nix::unistd::fchown(
+                &file,
+                Some(nix::unistd::Uid::from_raw(owner.uid())),
+                Some(nix::unistd::Gid::from_raw(owner.gid())),
+            )?;
+        }
+        // Firecracker truncates an existing output to zero when its size differs
+        // from guest RAM. KEEP_SIZE would therefore discard the reservation.
+        nix::fcntl::fallocate(&file, nix::fcntl::FallocateFlags::empty(), 0, length)?;
+        Ok(())
+    };
+    allocate().map_err(|e| {
+        contextual(
+            &path,
+            with_cleanup(e, cleanup_dest(&dir, "snap.mem", &path)),
+        )
+    })
+}
+
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {
+    let size = read_sparse_bounded(source, max_bytes, |offset, bytes| {
+        dest.seek(SeekFrom::Start(offset))?;
+        dest.write_all(bytes)
+    })?;
+    dest.set_len(size)
+}
+
+fn read_sparse_bounded(
+    source: &File,
+    max_bytes: u64,
+    mut write: impl FnMut(u64, &[u8]) -> io::Result<()>,
+) -> io::Result<u64> {
     let mut reader = source.try_clone()?;
     reader.seek(SeekFrom::Start(0))?;
-    dest.seek(SeekFrom::Start(0))?;
     let mut buffer = vec![0u8; 1024 * 1024];
+    let zeros = vec![0u8; buffer.len()];
     let mut copied = 0u64;
     loop {
         let n = match reader.read(&mut buffer) {
@@ -1141,10 +1316,22 @@ fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()
                 ),
             ));
         }
-        dest.write_all(&buffer[..n])?;
+        // Guest pages are often mostly zero even inside a populated 1 MiB chunk.
+        // Preserve page-sized holes so scattered data does not dirty the entire chunk.
+        let mut run_start = None;
+        for (index, page) in buffer[..n].chunks(4096).enumerate() {
+            let offset = index * 4096;
+            if page != &zeros[..page.len()] {
+                run_start.get_or_insert(offset);
+            } else if let Some(start) = run_start.take() {
+                write(copied - n as u64 + start as u64, &buffer[start..offset])?;
+            }
+        }
+        if let Some(start) = run_start {
+            write(copied - n as u64 + start as u64, &buffer[start..n])?;
+        }
     }
-    dest.sync_all()?;
-    Ok(())
+    Ok(copied)
 }
 
 fn safe_unlink_source(
@@ -1423,6 +1610,7 @@ impl SharedBacking {
 /// descriptors rather than reopening joined paths after verification.
 pub struct SnapshotOpener {
     base: File,
+    root: PathBuf,
 }
 
 impl SnapshotOpener {
@@ -1432,7 +1620,10 @@ impl SnapshotOpener {
     /// Returns an error if the path cannot be opened safely.
     pub fn new(path: &Path) -> io::Result<Self> {
         let base = directory(path, false)?;
-        Ok(Self { base })
+        Ok(Self {
+            base,
+            root: path.to_path_buf(),
+        })
     }
 
     /// Opens a file relative to the snapshot directory.
@@ -1441,11 +1632,15 @@ impl SnapshotOpener {
     /// Returns an error for absolute or parent paths, symlinks, missing files,
     /// or non-regular leaves.
     pub fn open(&self, path: &Path) -> io::Result<File> {
-        self.open_impl(path, None, &mut |_| {})
+        match self.open_beneath(path) {
+            Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => self.open_walk(path),
+            result => result,
+        }
     }
 
     /// Loads and validates the snapshot manifest, checking that manifest VMs
     /// match the lab specification's declared nodes.
+    /// This does not verify file contents; callers must verify before trusting file metadata.
     ///
     /// # Errors
     /// Returns an error if opening or reading `manifest.json` fails, if the manifest
@@ -1454,18 +1649,27 @@ impl SnapshotOpener {
     pub fn load_manifest(&self) -> Result<SnapshotManifest, Error> {
         let mut json = String::new();
         self.open(Path::new("manifest.json"))
-            .map_err(|e| contextual(Path::new("manifest.json"), e))?
+            .map_err(|e| contextual(&self.root.join("manifest.json"), e))?
             .take(1024 * 1024 + 1)
             .read_to_string(&mut json)
-            .map_err(|e| contextual(Path::new("manifest.json"), e))?;
+            .map_err(|e| contextual(&self.root.join("manifest.json"), e))?;
         if json.len() > 1024 * 1024 {
             return Err(contextual(
-                Path::new("manifest.json"),
+                &self.root.join("manifest.json"),
                 io::Error::new(io::ErrorKind::InvalidData, "manifest exceeds 1 MiB"),
             ));
         }
-        let manifest = SnapshotManifest::from_json_str(&json)?;
-        manifest.lab_spec.validate()?;
+        let manifest = SnapshotManifest::from_json_str(&json)
+            .and_then(|manifest| {
+                manifest.lab_spec.validate()?;
+                Ok(manifest)
+            })
+            .map_err(|error| {
+                contextual(
+                    &self.root.join("manifest.json"),
+                    io::Error::new(io::ErrorKind::InvalidData, error),
+                )
+            })?;
         if manifest.vms.len() != manifest.lab_spec.nodes.len()
             || manifest
                 .lab_spec
@@ -1474,7 +1678,7 @@ impl SnapshotOpener {
                 .any(|n| !manifest.vms.contains_key(&n.name))
         {
             return Err(contextual(
-                Path::new("manifest.json"),
+                &self.root.join("manifest.json"),
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     "manifest VMs do not match lab spec nodes",
@@ -1484,81 +1688,57 @@ impl SnapshotOpener {
         Ok(manifest)
     }
 
-    /// Forces a resolver and pauses immediately before each resolution step.
-    ///
-    /// # Errors
-    /// Returns the same errors as `open`, including ENOSYS for forced openat2.
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn open_with_test_hook(
-        &self,
-        path: &Path,
-        fallback: bool,
-        mut before_step: impl FnMut(usize),
-    ) -> io::Result<File> {
-        self.open_impl(path, Some(fallback), &mut before_step)
-    }
-
-    fn open_impl(
-        &self,
-        path: &Path,
-        fallback: Option<bool>,
-        before_step: &mut dyn FnMut(usize),
-    ) -> io::Result<File> {
+    // Resolves atomically with openat2; ENOSYS on kernels without it.
+    fn open_beneath(&self, path: &Path) -> io::Result<File> {
+        // RESOLVE_BENEATH alone would accept `..` that stays inside the base.
         if path
             .components()
             .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
         {
             return Err(io::ErrorKind::InvalidInput.into());
         }
+        let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
 
-        if fallback != Some(true) {
-            before_step(0);
-            let path_c = std::ffi::CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let how = open_how {
+            flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
+        };
 
-            let how = open_how {
-                flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
-                mode: 0,
-                resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS,
-            };
-
-            // SAFETY: The base descriptor, NUL-terminated path, and initialized C-layout
-            // how remain live for this syscall; the supplied size matches how.
-            let fd = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    self.base.as_raw_fd(),
-                    path_c.as_ptr(),
-                    &how,
-                    std::mem::size_of::<open_how>(),
-                )
-            };
-
-            if fd >= 0 {
-                let Ok(fd_i32) = i32::try_from(fd) else {
-                    // SAFETY: fd comes from a successful openat2 syscall and is
-                    // exclusively owned here. Pass it unchanged to close before
-                    // returning; no File has taken ownership of it.
-                    if unsafe { libc::syscall(libc::SYS_close, fd) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    return Err(io::ErrorKind::Other.into());
-                };
-                // SAFETY: A successful openat2 returns a valid, newly opened descriptor
-                // that we exclusively own. The conversion preserves its value, and
-                // File takes ownership exactly once.
-                let file = unsafe { std::fs::File::from_raw_fd(fd_i32) };
-                return regular_snapshot_file(file);
-            }
-
-            let err = io::Error::last_os_error();
-            if fallback == Some(false) || err.raw_os_error() != Some(libc::ENOSYS) {
-                return Err(err);
-            }
+        // SAFETY: The base descriptor, NUL-terminated path, and initialized C-layout
+        // how remain live for this syscall; the supplied size matches how.
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                self.base.as_raw_fd(),
+                path_c.as_ptr(),
+                &how,
+                std::mem::size_of::<open_how>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
+        let Ok(fd_i32) = i32::try_from(fd) else {
+            // SAFETY: fd comes from a successful openat2 syscall and is
+            // exclusively owned here. Pass it unchanged to close before
+            // returning; no File has taken ownership of it.
+            if unsafe { libc::syscall(libc::SYS_close, fd) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            return Err(io::ErrorKind::Other.into());
+        };
+        // SAFETY: A successful openat2 returns a valid, newly opened descriptor
+        // that we exclusively own. The conversion preserves its value, and
+        // File takes ownership exactly once.
+        let file = unsafe { std::fs::File::from_raw_fd(fd_i32) };
+        regular_snapshot_file(file)
+    }
+
+    // Component-by-component fallback from the pinned base, refusing symlinks at every step.
+    fn open_walk(&self, path: &Path) -> io::Result<File> {
         let mut parent = self.base.try_clone()?;
-        let mut step = 0;
         let mut components = path.components().peekable();
         while let Some(component) = components.next() {
             let name = match component {
@@ -1572,8 +1752,6 @@ impl SnapshotOpener {
             } else {
                 OFlag::O_RDONLY | OFlag::O_DIRECTORY
             };
-            before_step(step);
-            step += 1;
             parent = open(&parent, name, flags)?;
         }
         regular_snapshot_file(parent)
@@ -1586,6 +1764,7 @@ impl SnapshotOpener {
     pub fn try_clone(&self) -> io::Result<Self> {
         Ok(Self {
             base: self.base.try_clone()?,
+            root: self.root.clone(),
         })
     }
 
@@ -1868,5 +2047,90 @@ mod tests {
 
         let alone = with_cleanup(io::Error::from_raw_os_error(libc::EXDEV), Ok(()));
         assert!(!alone.to_string().contains("additionally"));
+    }
+
+    // The public `open` only reaches the walk on kernels without openat2, so each resolver is
+    // exercised directly.
+    use std::fs;
+
+    type Resolver = fn(&SnapshotOpener, &Path) -> io::Result<File>;
+    const RESOLVERS: [Resolver; 2] = [SnapshotOpener::open_beneath, SnapshotOpener::open_walk];
+
+    fn contents(mut file: File) -> String {
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        text
+    }
+
+    #[test]
+    fn both_resolvers_reject_existing_escape_targets_and_pin_base() {
+        use std::os::unix::fs::symlink;
+        for resolve in RESOLVERS {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().join("snapshot");
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(base.join("nested")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(base.join("file"), "inside").unwrap();
+            fs::write(outside.join("file"), "outside").unwrap();
+            symlink(&outside, base.join("link")).unwrap();
+            symlink(outside.join("file"), base.join("leaf")).unwrap();
+            let opener = SnapshotOpener::new(&base).unwrap();
+            let open = |path: &Path| resolve(&opener, path);
+            assert_eq!(contents(open(Path::new("file")).unwrap()), "inside");
+            for path in ["../outside/file", "nested/../file", "link/file", "leaf"] {
+                assert!(open(Path::new(path)).is_err(), "{path}");
+            }
+            assert!(open(&outside.join("file")).is_err());
+            fs::rename(&base, tmp.path().join("pinned")).unwrap();
+            symlink(&outside, &base).unwrap();
+            assert_eq!(contents(open(Path::new("file")).unwrap()), "inside");
+            assert!(SnapshotOpener::new(&base).is_err());
+            let ancestor = tmp.path().join("ancestor");
+            symlink(tmp.path(), &ancestor).unwrap();
+            assert!(SnapshotOpener::new(&ancestor.join("pinned")).is_err());
+        }
+    }
+
+    // A component swapped for a symlink before the resolver reaches it, whether it is the
+    // first component or one below an already pinned directory.
+    #[test]
+    fn component_replacement_never_returns_outside_content() {
+        use std::os::unix::fs::symlink;
+        for (resolve, replaced) in [
+            (RESOLVERS[0], "nested"),
+            (RESOLVERS[1], "nested"),
+            (RESOLVERS[1], "nested/inner"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = tmp.path().join("snapshot");
+            let outside = tmp.path().join("outside");
+            fs::create_dir_all(base.join("nested/inner")).unwrap();
+            fs::create_dir(&outside).unwrap();
+            fs::write(base.join("nested/inner/file"), "inside").unwrap();
+            fs::write(outside.join("file"), "outside").unwrap();
+            fs::create_dir(outside.join("inner")).unwrap();
+            fs::write(outside.join("inner/file"), "outside").unwrap();
+            let opener = SnapshotOpener::new(&base).unwrap();
+            let component = base.join(replaced);
+            fs::rename(&component, tmp.path().join("removed")).unwrap();
+            symlink(&outside, &component).unwrap();
+            assert!(resolve(&opener, Path::new("nested/inner/file")).is_err());
+        }
+    }
+
+    #[test]
+    fn both_resolvers_reject_non_regular_leaves_without_blocking() {
+        for resolve in RESOLVERS {
+            let tmp = tempfile::tempdir().unwrap();
+            nix::unistd::mkfifo(&tmp.path().join("fifo"), Mode::S_IRUSR).unwrap();
+            let opener = SnapshotOpener::new(tmp.path()).unwrap();
+            for path in ["fifo", "."] {
+                assert!(resolve(&opener, Path::new(path)).is_err());
+            }
+            // Read-only access to an existing device requires no host configuration changes.
+            let devices = SnapshotOpener::new(Path::new("/dev")).unwrap();
+            assert!(resolve(&devices, Path::new("null")).is_err());
+        }
     }
 }
