@@ -721,10 +721,10 @@ impl Lab {
         self.snapshots.wait().await;
     }
 
-    /// Gives integration tests access to the live fabric, until teardown removes it.
-    #[cfg(feature = "test-support")]
-    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
-        self.network.as_mut()
+    /// Inspect topology/netns or isolate faults through the existing fabric handle.
+    #[must_use]
+    pub fn network(&self) -> Option<&LabNetwork> {
+        self.network.as_ref()
     }
 
     /// Returns a reference to the VM with the given node name, if present.
