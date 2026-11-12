@@ -10,7 +10,9 @@ dylos lab fork /path/to/snapshot -n 4 --prefix experiment \
 ```
 
 The repeatable flag is `ID=delay_ms:jitter_ms:loss_percent`; omitted clones
-remain unshaped. A 100% loss profile partitions the entire clone fabric.
+remain unshaped. A 100% loss profile cuts the whole clone off the fabric, including traffic
+between machines inside that clone; it cannot partition selected machines.
+Per-link chaos is a follow-up.
 Profiles affect every TAP egress (toward the guest), including Ethernet control
 traffic, IPv6 NDP and IPv4 ARP. Delay is per TAP traversal, not per end-to-end
 round trip. Jitter uses netem's default distribution; results are not seeded.

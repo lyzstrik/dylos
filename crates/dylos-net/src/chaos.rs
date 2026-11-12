@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::{path::Path, time::Instant};
+
+use tracing::{info, info_span};
 
 use crate::{Error, LabNetwork, netns};
 
@@ -63,42 +65,54 @@ impl LabNetwork {
             .ok_or_else(|| Error::NetworkRemoved { lab: lab.clone() })?;
         let plan = self.plan().clone();
         let path = self.netns_path().to_owned();
+        let span = info_span!("fabric_step", lab = %lab, step = "chaos");
         netns::on_fresh_thread(&lab, move || {
-            let _state = state;
-            if !netns::enter_file(plan.lab_id(), &ns, &path)? {
-                return Err(Error::NetworkRemoved {
-                    lab: plan.lab_id().into(),
-                });
-            }
-            for tap in plan.taps() {
-                let mut command = std::process::Command::new("tc");
-                command.args(["qdisc", "add", "dev", &tap.name, "root", "netem"]);
-                if profile.delay_ms > 0 {
-                    command.args(["delay", &format!("{}ms", profile.delay_ms)]);
-                    if profile.jitter_ms > 0 {
-                        command.arg(format!("{}ms", profile.jitter_ms));
-                    }
-                }
-                command.args(["loss", &format!("{}%", profile.loss_percent)]);
-                let output = command.output().map_err(netns::io_err(
-                    plan.lab_id(),
-                    "execute tc netem",
-                    Path::new(&tap.name),
-                ))?;
-                if !output.status.success() {
-                    return Err(Error::FabricTransition {
+            let started = Instant::now();
+            let result = span.in_scope(|| {
+                let _state = state;
+                if !netns::enter_file(plan.lab_id(), &ns, &path)? {
+                    return Err(Error::NetworkRemoved {
                         lab: plan.lab_id().into(),
-                        step: "chaos",
-                        failures: vec![format!(
-                            "{}: tc: {}",
-                            tap.name,
-                            String::from_utf8_lossy(&output.stderr)
-                        )],
-                        rollback_failures: vec![],
                     });
                 }
-            }
-            Ok(())
+                for tap in plan.taps() {
+                    let mut command = std::process::Command::new("tc");
+                    command.args(["qdisc", "add", "dev", &tap.name, "root", "netem"]);
+                    if profile.delay_ms > 0 {
+                        command.args(["delay", &format!("{}ms", profile.delay_ms)]);
+                        if profile.jitter_ms > 0 {
+                            command.arg(format!("{}ms", profile.jitter_ms));
+                        }
+                    }
+                    command.args(["loss", &format!("{}%", profile.loss_percent)]);
+                    let output = command.output().map_err(netns::io_err(
+                        plan.lab_id(),
+                        "execute tc netem",
+                        Path::new(&tap.name),
+                    ))?;
+                    if !output.status.success() {
+                        return Err(Error::FabricTransition {
+                            lab: plan.lab_id().into(),
+                            step: "chaos",
+                            failures: vec![format!(
+                                "{}: tc: {}",
+                                tap.name,
+                                String::from_utf8_lossy(&output.stderr).trim()
+                            )],
+                            rollback_failures: vec![],
+                        });
+                    }
+                }
+                Ok(())
+            });
+            span.in_scope(|| {
+                info!(
+                    duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    success = result.is_ok(),
+                    "fabric step completed"
+                );
+            });
+            result
         })
         .await
     }

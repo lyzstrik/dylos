@@ -127,7 +127,7 @@ struct DiffArgs {
 
 #[derive(Args, Debug)]
 struct ForkArgs {
-    /// Per-clone netem: `ID=delay_ms:jitter_ms:loss_percent` (100 loss partitions)
+    /// Per-clone netem: `ID=delay_ms:jitter_ms:loss_percent` (100 loss cuts off the whole clone fabric)
     #[arg(long)]
     chaos: Vec<String>,
     /// Snapshot directory containing manifest.json

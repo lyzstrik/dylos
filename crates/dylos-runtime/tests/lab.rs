@@ -581,6 +581,29 @@ fn generate_clone_ids_validates_count_and_naming() {
 }
 
 #[tokio::test]
+async fn fork_with_rejects_chaos_for_unknown_clone_before_restore() {
+    let mut config = LabConfig::default();
+    config
+        .chaos
+        .insert("typo-c1".into(), dylos_net::ChaosProfile::default());
+    let Err(err) = Lab::fork_with(
+        &config,
+        std::path::Path::new("missing"),
+        &["clone-c1".into()],
+    )
+    .await
+    else {
+        panic!("unknown chaos clone accepted");
+    };
+    assert!(err.to_string().contains("typo-c1"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("chaos profile names unknown clone"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
 async fn fork_with_rejects_empty_and_oversized_clone_lists() {
     let config = LabConfig::default();
     let snapshot = std::path::Path::new("missing");
