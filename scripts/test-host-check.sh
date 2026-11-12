@@ -35,6 +35,9 @@ BIN
 chmod +x "$TEST_ROOT/bin/"*
 export PATH="$TEST_ROOT/bin:$PATH"
 export DYLOS_FC_BIN_DIR="$TEST_ROOT/bin"
+export DYLOS_SYS_MODULE_DIR="$TEST_ROOT/sys/module"
+export DYLOS_KERNEL_MODULE_DIR="$TEST_ROOT/modules/running"
+mkdir -p "$DYLOS_SYS_MODULE_DIR/sch_netem" "$DYLOS_KERNEL_MODULE_DIR"
 unset DYLOS_LAB_DIR DYLOS_IMAGE_DIR DYLOS_IMAGE DYLOS_JAIL_DIR
 CHECK_SCRIPT="$TEST_ROOT/repo/scripts/host-check.sh"
 
@@ -63,6 +66,28 @@ assert_result() {
 }
 
 assert_result pass 'default probe succeeds' 'All host prerequisites are met' bash "$CHECK_SCRIPT"
+assert_result pass 'loaded netem succeeds without a module tree' 'sch_netem : loaded' \
+    env DYLOS_KERNEL_MODULE_DIR="$TEST_ROOT/missing" bash "$CHECK_SCRIPT"
+rmdir "$DYLOS_SYS_MODULE_DIR/sch_netem"
+assert_result fail 'missing running kernel modules reports reboot hint' 'A reboot after a kernel upgrade may be needed' \
+    env DYLOS_KERNEL_MODULE_DIR="$TEST_ROOT/missing" bash "$CHECK_SCRIPT"
+assert_result fail 'empty module tree rejects netem' 'netem qdisc unavailable for running kernel' bash "$CHECK_SCRIPT"
+mkdir -p "$TEST_ROOT/modules/other/kernel/net/sched"
+touch "$TEST_ROOT/modules/other/kernel/net/sched/sch_netem.ko"
+assert_result fail 'another kernel module does not satisfy running kernel' 'netem qdisc unavailable' bash "$CHECK_SCRIPT"
+printf '%s\n' 'kernel/net/sched/not_sch_netem.ko' > "$DYLOS_KERNEL_MODULE_DIR/modules.builtin"
+assert_result fail 'unrelated builtin does not satisfy netem' 'netem qdisc unavailable' bash "$CHECK_SCRIPT"
+printf '%s\n' 'kernel/net/sched/sch_netem.ko' >> "$DYLOS_KERNEL_MODULE_DIR/modules.builtin"
+assert_result pass 'builtin netem succeeds' 'sch_netem : built in' bash "$CHECK_SCRIPT"
+rm "$DYLOS_KERNEL_MODULE_DIR/modules.builtin"
+mkdir -p "$DYLOS_KERNEL_MODULE_DIR/kernel/net/sched"
+for suffix in ko ko.xz ko.zst ko.gz; do
+    module="$DYLOS_KERNEL_MODULE_DIR/kernel/net/sched/sch_netem.$suffix"
+    touch "$module"
+    assert_result pass "loadable netem .$suffix succeeds" 'sch_netem : available' bash "$CHECK_SCRIPT"
+    rm "$module"
+done
+mkdir -p "$DYLOS_SYS_MODULE_DIR/sch_netem"
 for variable in DYLOS_LAB_DIR DYLOS_JAIL_DIR DYLOS_IMAGE_DIR DYLOS_IMAGE; do
     assert_result fail "$variable incompatible pair reported" 'Reflink probe failed for the following pair(s)' \
         env "$variable=$TEST_ROOT/incompatible/location" bash "$CHECK_SCRIPT"
