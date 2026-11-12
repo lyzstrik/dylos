@@ -1620,13 +1620,13 @@ fn assert_snapshot_type(lab: &Lab, expected: &str) {
 }
 
 #[tokio::test]
-async fn only_first_boot_capture_is_diff_including_after_failure() {
-    if !sandboxed("only_first_boot_capture_is_diff_including_after_failure") {
+async fn capture_without_verified_baseline_is_full_including_after_failure() {
+    if !sandboxed("capture_without_verified_baseline_is_full_including_after_failure") {
         return;
     }
     let sandbox = Sandbox::in_target(Mode::LabSnapshot);
     let Some((config, mut lab)) = up_lab(
-        "only_first_boot_capture_is_diff_including_after_failure",
+        "capture_without_verified_baseline_is_full_including_after_failure",
         &sandbox,
         "first-diff",
     )
@@ -1652,7 +1652,7 @@ async fn only_first_boot_capture_is_diff_including_after_failure() {
     }
     let error = lab.snapshot("failed").await.unwrap_err();
     assert!(matches!(error, LabError::Api { .. }), "{error:?}");
-    assert_snapshot_type(&lab, "Diff");
+    assert_snapshot_type(&lab, "Full");
     for vm in lab.vms() {
         fs::remove_file(vm.paths().root.join("fail-snapshot")).unwrap();
     }

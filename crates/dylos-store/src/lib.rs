@@ -1280,6 +1280,54 @@ pub fn preallocate_snapshot_memory(root: &Path, size: u64) -> Result<(), Error> 
     })
 }
 
+/// Seeds an exclusive writable snapshot output from the exact verified published image.
+/// # Errors
+/// Rejects untrusted, changed or wrong-size baselines and cleans partial outputs.
+pub fn seed_snapshot_memory(
+    root: &Path,
+    size: u64,
+    snapshot: &Path,
+    meta: &FileMeta,
+) -> Result<(), Error> {
+    let path = root.join("snap.mem");
+    let seed = || -> io::Result<()> {
+        if meta.size != size {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let opener = SnapshotOpener::new(snapshot)?;
+        let backing = SharedBacking::pin(&opener, meta)?;
+        if let Some(digest) = &meta.fsverity {
+            if verity::measure(&backing.file)? != *digest {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+        } else {
+            meta.verify("baseline", backing.reader()?)
+                .map_err(io::Error::other)?;
+        }
+        let dir = directory(root, false)?;
+        let output = open(
+            &dir,
+            "snap.mem".as_ref(),
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
+        )?;
+        let clone = || -> io::Result<()> {
+            reflink(&backing.file, &output)?;
+            if SharedBacking::validate(&backing.file, size)? != backing.stamp {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            let owner = dir.metadata()?;
+            nix::unistd::fchown(
+                &output,
+                Some(nix::unistd::Uid::from_raw(owner.uid())),
+                Some(nix::unistd::Gid::from_raw(owner.gid())),
+            )?;
+            Ok(())
+        };
+        clone().map_err(|e| with_cleanup(e, cleanup_dest(&dir, "snap.mem", &path)))
+    };
+    seed().map_err(|e| contextual(&path, e))
+}
+
 fn copy_bounded(source: &File, dest: &mut File, max_bytes: u64) -> io::Result<()> {
     let size = read_sparse_bounded(source, max_bytes, |offset, bytes| {
         dest.seek(SeekFrom::Start(offset))?;

@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -612,11 +613,52 @@ async fn memory_checksum(lab: &Lab, command: &str) -> String {
     output.stdout.trim().to_owned()
 }
 
+async fn verify_successive_memory_overlays(
+    config: &LabConfig,
+    original: &mut Lab,
+    first: &Path,
+    first_manifest: &dylos_core::manifest::SnapshotManifest,
+    checksum: &str,
+) {
+    // Preserve clean ranges while repeatedly dirtying disjoint pages, including zeros.
+    for (index, byte) in [0x5a, 0, 0x3c].into_iter().enumerate() {
+        memory_checksum(original, &format!(
+            "python3 -c \"p='/mnt/memory-proof/region'; f=open(p,'r+b'); f.seek({}); f.write(bytes([{}])*4096); f.close()\"",
+            if index == 1 { 0 } else { index * 4096 }, byte,
+        )).await;
+        let expected = memory_checksum(original, checksum).await;
+        let name = format!("repeat{index}");
+        let (manifest, timing) = original.snapshot_with_timings(&name).await.unwrap();
+        eprintln!(
+            "Repeated snapshot {index}: API_snapshot={}ms freeze_to_thaw={}ms",
+            timing.api_snapshot_ms, timing.freeze_to_thaw_ms
+        );
+        let path = config.store.snapshot_dir("memory-src", &name);
+        SnapshotOpener::new(first)
+            .unwrap()
+            .verify(first_manifest)
+            .unwrap();
+        assert_ne!(
+            fs::metadata(first.join(&first_manifest.vms["writer"].memory_file.path))
+                .unwrap()
+                .ino(),
+            fs::metadata(path.join(&manifest.vms["writer"].memory_file.path))
+                .unwrap()
+                .ino()
+        );
+        let mut copy = Lab::restore_with(config, &path, &format!("proof{index}"))
+            .await
+            .unwrap();
+        assert_eq!(memory_checksum(&copy, checksum).await, expected);
+        copy.teardown().await.unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
-async fn first_diff_preserves_guest_and_boot_memory_across_restore_and_fork() {
+async fn successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork() {
     let Some(prereqs) = check_e2e_prerequisites(
-        "first_diff_preserves_guest_and_boot_memory_across_restore_and_fork",
+        "successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork",
     ) else {
         return;
     };
@@ -641,9 +683,14 @@ async fn first_diff_preserves_guest_and_boot_memory_across_restore_and_fork() {
         include_str!("fixtures/memory-proof.sh").trim_end(),
     )
     .await;
+    memory_checksum(
+        &original,
+        include_str!("fixtures/memory-churn.sh").trim_end(),
+    )
+    .await;
     let checksum = "sha256sum /mnt/memory-proof/region /sys/kernel/notes";
     let before = memory_checksum(&original, checksum).await;
-    original.snapshot("first").await.unwrap();
+    let first_manifest = original.snapshot("first").await.unwrap();
     let first = config.store.snapshot_dir("memory-src", "first");
     let mut clones = Lab::fork_with(&config, &first, &["memory-c1".into(), "memory-c2".into()])
         .await
@@ -651,19 +698,48 @@ async fn first_diff_preserves_guest_and_boot_memory_across_restore_and_fork() {
     for clone in &clones {
         assert_eq!(memory_checksum(clone, checksum).await, before);
     }
-    // Original pages unchanged since the first snapshot must still be captured in full.
+    verify_successive_memory_overlays(&config, &mut original, &first, &first_manifest, checksum)
+        .await;
+    let before = memory_checksum(&original, checksum).await;
+    // Clean pages from every preceding epoch must survive the next overlay.
     original.snapshot("second").await.unwrap();
     let second = config.store.snapshot_dir("memory-src", "second");
     let mut restored = Lab::restore_with(&config, &second, "memory-r1")
         .await
         .unwrap();
     assert_eq!(memory_checksum(&restored, checksum).await, before);
+    // Deleting the exact baseline must force Full, even while its restore is live.
+    config
+        .store
+        .remove_snapshot("memory-src", "second")
+        .unwrap();
+    original.snapshot("missing-base").await.unwrap();
+    let mut fallback = Lab::restore_with(
+        &config,
+        &config.store.snapshot_dir("memory-src", "missing-base"),
+        "memory-fallback",
+    )
+    .await
+    .unwrap();
+    assert_eq!(memory_checksum(&fallback, checksum).await, before);
+    fallback.teardown().await.unwrap();
     restored.snapshot("restored").await.unwrap();
     let third = config.store.snapshot_dir("memory-r1", "restored");
     let mut restored_again = Lab::restore_with(&config, &third, "memory-r2")
         .await
         .unwrap();
     assert_eq!(memory_checksum(&restored_again, checksum).await, before);
+    // A restored VM first publishes Full, then can overlay its own baseline.
+    restored.snapshot("restored-diff").await.unwrap();
+    let mut own = Lab::restore_with(
+        &config,
+        &config.store.snapshot_dir("memory-r1", "restored-diff"),
+        "memory-own",
+    )
+    .await
+    .unwrap();
+    assert_eq!(memory_checksum(&own, checksum).await, before);
+    own.teardown().await.unwrap();
     for clone in &mut clones {
         clone.teardown().await.unwrap();
     }

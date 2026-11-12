@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use dylos_core::manifest::SnapshotManifest;
@@ -547,10 +548,7 @@ impl Lab {
             .await,
         )?;
         for vm in &self.vms {
-            *vm.snapshot_type
-                .lock()
-                .map_err(|_| invalid(&self.id, "snapshot type unavailable"))? =
-                dylos_fc::snapshot::SnapshotType::Diff;
+            vm.dirty_tracking.store(true, Ordering::SeqCst);
         }
         tracing::info!(
             duration_ms = started.elapsed().as_millis(),
@@ -619,11 +617,13 @@ impl Lab {
     async fn load_restored(&self) -> Result<()> {
         complete(
             join_all(self.vms.iter().map(|vm| async {
-                let params = dylos_fc::snapshot::SnapshotLoadParams::with_file_backend(
+                let mut params = dylos_fc::snapshot::SnapshotLoadParams::with_file_backend(
                     "/vm.state",
                     "/vm.mem",
                 )
                 .with_resume_vm(false);
+                params.track_dirty_pages = Some(true);
+                vm.dirty_tracking.store(true, Ordering::SeqCst);
                 vm.client()
                     .load_snapshot(&params)
                     .await

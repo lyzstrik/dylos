@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::panic)]
 
 use std::fs;
 use std::io::Write;
@@ -69,4 +69,69 @@ fn preexisting_symlink_is_never_followed_or_removed() {
             .is_symlink()
     );
     assert_eq!(fs::read(target).unwrap(), b"keep");
+}
+
+#[test]
+fn verified_baseline_seeds_private_output_and_rejects_invalid_inputs() {
+    use dylos_store::{Store, seed_snapshot_memory};
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let root = temp.path().join("jail");
+    fs::create_dir(&root).unwrap();
+    let store = Store {
+        base: temp.path().join("labs"),
+        image: temp.path().join("unused"),
+    };
+    let snapshot = store.create_snapshot("lab", "base").unwrap();
+    let source = temp.path().join("memory");
+    fs::write(&source, vec![0xa5; 8192]).unwrap();
+    let meta = snapshot
+        .save_vm_file(&source, "vm", "vm.mem", 8192)
+        .unwrap();
+    let baseline = snapshot.root().join(&meta.path);
+    fs::set_permissions(&baseline, fs::Permissions::from_mode(0o400)).unwrap();
+    let mut invalid = meta.clone();
+    invalid.sha256 = "0".repeat(64);
+    for (path, metadata, size) in [
+        (snapshot.root(), &invalid, 8192),
+        (snapshot.root(), &meta, 4096),
+        (root.as_path(), &meta, 8192),
+    ] {
+        assert!(seed_snapshot_memory(&root, size, path, metadata).is_err());
+        assert!(!root.join("snap.mem").exists());
+    }
+    match seed_snapshot_memory(&root, 8192, snapshot.root(), &meta) {
+        Ok(()) => {}
+        Err(dylos_store::Error::Io { source, .. })
+            if source.raw_os_error() == Some(nix::libc::EOPNOTSUPP) =>
+        {
+            eprintln!("SKIPPED baseline reflink isolation: filesystem does not support reflink");
+            assert!(!root.join("snap.mem").exists());
+            return;
+        }
+        Err(error) => panic!("{error}"),
+    }
+    let output = root.join("snap.mem");
+    let restore = root.join("vm.mem");
+    fs::hard_link(&baseline, &restore).unwrap();
+    assert_ne!(
+        fs::metadata(&output).unwrap().ino(),
+        fs::metadata(&baseline).unwrap().ino()
+    );
+    assert_ne!(
+        fs::metadata(&output).unwrap().ino(),
+        fs::metadata(&restore).unwrap().ino()
+    );
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&output)
+        .unwrap()
+        .write_all(&[0; 4096])
+        .unwrap();
+    assert_eq!(fs::read(&baseline).unwrap(), vec![0xa5; 8192]);
+    let contents = fs::read(&output).unwrap();
+    assert_eq!(&contents[..4096], &[0; 4096]);
+    assert_eq!(&contents[4096..], &[0xa5; 4096]);
+    assert!(seed_snapshot_memory(&root, 8192, snapshot.root(), &meta).is_err());
+    assert_eq!(fs::read(output).unwrap(), contents);
 }
