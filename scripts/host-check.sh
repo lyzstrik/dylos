@@ -10,6 +10,24 @@ fail() {
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DOC_HOST="${REPO_ROOT}/docs/host.md"
 
+# Check the running kernel without loading modules or changing qdiscs.
+echo "==> Checking netem qdisc support..."
+KERNEL_RELEASE="$(uname -r)"
+SYS_MODULE_DIR="${DYLOS_SYS_MODULE_DIR:-/sys/module}"
+KERNEL_MODULE_DIR="${DYLOS_KERNEL_MODULE_DIR:-/lib/modules/$KERNEL_RELEASE}"
+if [ -d "$SYS_MODULE_DIR/sch_netem" ]; then
+    echo "  - sch_netem : loaded"
+elif [ -r "$KERNEL_MODULE_DIR/modules.builtin" ] &&
+    grep -Eq '(^|/)sch_netem\.ko$' "$KERNEL_MODULE_DIR/modules.builtin"; then
+    echo "  - sch_netem : built in"
+elif [ -d "$KERNEL_MODULE_DIR" ] &&
+    NETEM_MODULE="$(find "$KERNEL_MODULE_DIR/" -type f -name 'sch_netem.ko*' -print -quit)" &&
+    [ -n "$NETEM_MODULE" ]; then
+    echo "  - sch_netem : available ($NETEM_MODULE)"
+else
+    fail "netem qdisc unavailable for running kernel $KERNEL_RELEASE: sch_netem is neither loaded, built in, nor available in $KERNEL_MODULE_DIR. A reboot after a kernel upgrade may be needed (see docs/host.md)."
+fi
+
 # 1. Check /dev/kvm
 echo "==> Checking KVM..."
 [ -e /dev/kvm ] || fail "/dev/kvm does not exist."

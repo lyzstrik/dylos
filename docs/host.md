@@ -103,6 +103,15 @@ git config --local tag.gpgsign true
 ## Verification
 `scripts/host-check.sh` must pass before any work session.
 
+The running host kernel must provide the `netem` qdisc (`CONFIG_NET_SCH_NETEM`),
+either built in, already loaded as `sch_netem`, or available as `sch_netem.ko*`
+under `/lib/modules/$(uname -r)`. Host-check inspects `/sys/module`,
+`modules.builtin`, and the running kernel's module files without root, loading
+modules, or creating qdiscs. If a kernel upgrade removed the running kernel's
+modules, reboot into the installed kernel and rerun `just host-check`.
+`DYLOS_SYS_MODULE_DIR` and `DYLOS_KERNEL_MODULE_DIR` override the inspected
+directories (the latter defaults to `/lib/modules/$(uname -r)`).
+
 ## End-to-end tests
 End-to-end tests (`just e2e`) require root and `/dev/kvm`. They run automatically in CI on disposable GitHub-hosted runners (`.github/workflows/e2e.yml`). On a developer host, they are run by a human (never run `sudo` inside tests).
 
