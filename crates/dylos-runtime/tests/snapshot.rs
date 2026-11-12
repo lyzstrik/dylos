@@ -179,6 +179,7 @@ async fn up_lab(test: &str, sandbox: &Sandbox, lab_id: &str) -> Option<(LabConfi
         },
         boot_timeout: Duration::from_secs(5),
         extra_boot_args: None,
+        chaos: std::collections::BTreeMap::new(),
     };
     match Lab::up_with(&config, &test_spec(), lab_id).await {
         Ok(lab) => Some((config, lab)),

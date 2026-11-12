@@ -15,6 +15,7 @@
 //! It depends on `dylos-core` for lab definitions, but must never depend on
 //! higher-level orchestration crates (like `dylos-runtime` or `dylos-cli`).
 
+mod chaos;
 mod error;
 mod fabric;
 mod freeze;
@@ -22,6 +23,7 @@ mod netns;
 mod plan;
 mod tap;
 
+pub use chaos::ChaosProfile;
 pub use error::Error;
 pub use fabric::{FabricThawHandle, LabNetwork, teardown};
 pub use netns::DEFAULT_NETNS_DIR;

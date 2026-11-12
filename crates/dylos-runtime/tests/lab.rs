@@ -70,6 +70,7 @@ fn setup(mode: Mode) -> (Sandbox, LabConfig, LabSpec) {
         },
         boot_timeout: Duration::from_millis(200),
         extra_boot_args: None,
+        chaos: std::collections::BTreeMap::new(),
     };
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
     (sandbox, config, spec)
@@ -577,6 +578,29 @@ fn generate_clone_ids_validates_count_and_naming() {
     assert!(Lab::generate_clone_ids("twenty-seven-chars-long-prefix-", 100).is_err());
     let ids = Lab::generate_clone_ids("abc", 3).unwrap();
     assert_eq!(ids, vec!["abc-c1", "abc-c2", "abc-c3"]);
+}
+
+#[tokio::test]
+async fn fork_with_rejects_chaos_for_unknown_clone_before_restore() {
+    let mut config = LabConfig::default();
+    config
+        .chaos
+        .insert("typo-c1".into(), dylos_net::ChaosProfile::default());
+    let Err(err) = Lab::fork_with(
+        &config,
+        std::path::Path::new("missing"),
+        &["clone-c1".into()],
+    )
+    .await
+    else {
+        panic!("unknown chaos clone accepted");
+    };
+    assert!(err.to_string().contains("typo-c1"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("chaos profile names unknown clone"),
+        "{err}"
+    );
 }
 
 #[tokio::test]

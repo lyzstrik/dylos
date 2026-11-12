@@ -127,6 +127,9 @@ struct DiffArgs {
 
 #[derive(Args, Debug)]
 struct ForkArgs {
+    /// Per-clone netem: `ID=delay_ms:jitter_ms:loss_percent` (100 loss cuts off the whole clone fabric)
+    #[arg(long)]
+    chaos: Vec<String>,
     /// Snapshot directory containing manifest.json
     snapshot: PathBuf,
 
@@ -396,7 +399,19 @@ async fn lab_fork(args: ForkArgs) -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("failed to register SIGTERM handler")?;
 
-    let config = build_launch_config()?;
+    let mut config = build_launch_config()?;
+    for entry in args.chaos {
+        let (id, value) = entry
+            .split_once('=')
+            .context("chaos requires ID=delay_ms:jitter_ms:loss_percent")?;
+        if !clone_ids.iter().any(|clone| clone == id) {
+            bail!("chaos profile names unknown clone {id}");
+        }
+        let profile = dylos_runtime::ChaosProfile::parse(value).map_err(anyhow::Error::msg)?;
+        if config.chaos.insert(id.to_owned(), profile).is_some() {
+            bail!("duplicate chaos profile for {id}");
+        }
+    }
     let fork_future = Lab::fork_with(&config, &args.snapshot, &clone_ids);
     tokio::pin!(fork_future);
 

@@ -24,6 +24,7 @@ pub mod snapshot;
 pub mod vm;
 
 pub use diff::{diff_snapshots, diff_snapshots_with_content};
+pub use dylos_net::ChaosProfile;
 pub use error::{Error, Result};
 pub use fleet::{Fleet, FleetError, LabFailure};
 pub use jailer::{

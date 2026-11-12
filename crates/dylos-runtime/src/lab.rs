@@ -98,6 +98,8 @@ pub struct LabConfig {
     pub timeouts: Timeouts,
     pub boot_timeout: Duration,
     pub extra_boot_args: Option<String>,
+    /// Profiles keyed by restored clone identifier; never applied during fresh boot.
+    pub chaos: std::collections::BTreeMap<String, dylos_net::ChaosProfile>,
 }
 
 impl Default for LabConfig {
@@ -112,6 +114,7 @@ impl Default for LabConfig {
             timeouts: Timeouts::default(),
             boot_timeout: Duration::from_secs(30),
             extra_boot_args: None,
+            chaos: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -334,7 +337,7 @@ impl Lab {
     ///
     /// # Errors
     /// Rejects empty or oversized (over [`Self::MAX_CLONES`]) clone lists, invalid or duplicate
-    /// clone IDs, and propagates any restore error.
+    /// clone IDs, chaos profiles naming unknown clones, and propagates any restore error.
     pub async fn fork_with(
         config: &LabConfig,
         snapshot: &Path,
@@ -355,6 +358,11 @@ impl Lab {
                 .map_err(|reason| invalid(id, &format!("invalid clone id: {reason}")))?;
             if !seen.insert(id) {
                 return Err(invalid(id, "duplicate clone identifier"));
+            }
+        }
+        for id in config.chaos.keys() {
+            if !seen.contains(id) {
+                return Err(invalid(id, "chaos profile names unknown clone"));
             }
         }
         validate_firecracker(config).await?;
@@ -574,6 +582,15 @@ impl Lab {
     async fn resume_restored(&mut self, config: &LabConfig, netns_started: Instant) -> Result<()> {
         let listeners = crate::agent::listeners(&self.id, &self.vms, &config.jailer)?;
         self.load_restored().await?;
+        if let Some(profile) = config.chaos.get(&self.id) {
+            let network = self.network.as_mut().ok_or_else(|| {
+                invalid(
+                    &self.id,
+                    "configured chaos profile requires a clone network",
+                )
+            })?;
+            network.apply_chaos(*profile).await?;
+        }
         crate::resume_all(&self.id, &self.vms).await?;
         crate::agent::resync_all(&self.vms, &listeners)
             .await

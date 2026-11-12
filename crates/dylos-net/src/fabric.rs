@@ -18,8 +18,8 @@ pub struct LabNetwork {
     plan: FabricPlan,
     netns_path: PathBuf,
     /// The netns this handle created, held open until torn down. `None` once torn down.
-    ns: Option<Arc<File>>,
-    fabric_state: Arc<Mutex<crate::freeze::State>>,
+    pub(crate) ns: Option<Arc<File>>,
+    pub(crate) fabric_state: Arc<Mutex<crate::freeze::State>>,
 }
 
 impl LabNetwork {
