@@ -629,6 +629,7 @@ async fn verify_successive_memory_overlays(
         let expected = memory_checksum(original, checksum).await;
         let name = format!("repeat{index}");
         let (manifest, timing) = original.snapshot_with_timings(&name).await.unwrap();
+        assert_eq!(timing.capture_counts, (original.vms().len(), 0));
         eprintln!(
             "Repeated snapshot {index}: API_snapshot={}ms freeze_to_thaw={}ms",
             timing.api_snapshot_ms, timing.freeze_to_thaw_ms
@@ -719,7 +720,11 @@ async fn successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork
         .store
         .remove_snapshot("memory-src", "second")
         .unwrap();
-    original.snapshot("missing-base").await.unwrap();
+    let (_, timing) = original
+        .snapshot_with_timings("missing-base")
+        .await
+        .unwrap();
+    assert_eq!(timing.capture_counts, (0, original.vms().len()));
     let mut fallback = Lab::restore_with(
         &config,
         &config.store.snapshot_dir("memory-src", "missing-base"),

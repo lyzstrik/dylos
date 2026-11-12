@@ -1656,7 +1656,8 @@ async fn first_boot_diff_is_consumed_even_on_capture_failure() {
     for vm in lab.vms() {
         fs::remove_file(vm.paths().root.join("fail-snapshot")).unwrap();
     }
-    lab.snapshot("retry").await.unwrap();
+    let (_, timing) = lab.snapshot_with_timings("retry").await.unwrap();
+    assert_eq!(timing.capture_counts, (0, lab.vms().len()));
     assert_snapshot_type(&lab, "Full");
     lab.snapshot("again").await.unwrap();
     assert_snapshot_type(&lab, "Full");

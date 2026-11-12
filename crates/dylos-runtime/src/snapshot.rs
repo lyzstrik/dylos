@@ -21,6 +21,8 @@ use crate::{LabError, Vm};
 /// Timings recorded across all snapshot stages.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SnapshotTimings {
+    /// Number of VM captures requested as (Diff, Full), including baseline fallback.
+    pub capture_counts: (usize, usize),
     pub freeze_ms: u64,
     pub pause_ms: u64,
     /// First-to-last successful pause acknowledgement interval, in microseconds.
@@ -329,6 +331,12 @@ async fn run_snapshot_steps(
             source,
         })??);
     }
+
+    let diff_count = snapshot_types
+        .iter()
+        .filter(|kind| **kind == dylos_fc::snapshot::SnapshotType::Diff)
+        .count();
+    let capture_counts = (diff_count, snapshot_types.len() - diff_count);
 
     // Drain earlier filesystem work while guests are running; disks are synced again paused.
     let store = job.store.clone();
@@ -685,6 +693,7 @@ async fn run_snapshot_steps(
 
     let total_ms = u64::try_from(started_all.elapsed().as_millis()).unwrap_or(u64::MAX);
     let timings = SnapshotTimings {
+        capture_counts,
         freeze_ms,
         pause_ms,
         pause_skew_us,
