@@ -33,7 +33,7 @@ async fn vm_boots_and_reaches_readiness() {
         node: "vm0".into(),
         netns: None,
         files: vec![
-            ChrootFile::new(&kernel, "vmlinux.bin"),
+            ChrootFile::immutable(&kernel, "vmlinux.bin"),
             ChrootFile::new(&rootfs, "rootfs.ext4"),
         ],
         timeouts: Timeouts::default(),

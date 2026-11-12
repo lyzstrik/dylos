@@ -480,7 +480,7 @@ impl Lab {
                         });
                     }
                 } else {
-                    files.push(ChrootFile::new(&config.kernel, "vmlinux.bin"));
+                    files.push(ChrootFile::immutable(&config.kernel, "vmlinux.bin"));
                 }
                 Ok(VmSpec {
                     lab_id: jail_identity(&self.id),

@@ -54,7 +54,7 @@ fn spec(node: &str, kernel: &Path, netns: &OwnedNetns) -> VmSpec {
         lab_id: "e2e".into(),
         node: node.into(),
         netns: Some(netns.path.clone()),
-        files: vec![ChrootFile::new(kernel, "vmlinux.bin")],
+        files: vec![ChrootFile::immutable(kernel, "vmlinux.bin")],
         timeouts: Timeouts::default(),
     }
 }
@@ -140,4 +140,86 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
         || !proc_dir.exists() && !paths.jail_dir.exists() && !paths.cgroup_dir.exists(),
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
+async fn jailer_uid_cannot_modify_private_kernels_or_shared_memory() {
+    use dylos_runtime::jailer::{JailPaths, prepare_chroot};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::process::CommandExt;
+    let Some(_prereqs) =
+        check_e2e_prerequisites("jailer_uid_cannot_modify_private_kernels_or_shared_memory")
+    else {
+        return;
+    };
+    let dir = test_tempdir();
+    let config = JailerConfig::new(dir.path().join("jails"), NOBODY, NOBODY);
+    let kernel = dir.path().join("kernel");
+    let memory = dir.path().join("vm.mem");
+    std::fs::write(&kernel, b"kernel").unwrap();
+    std::fs::write(&memory, b"published memory").unwrap();
+    std::fs::set_permissions(&memory, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let before = std::fs::metadata(&kernel).unwrap();
+    let published = std::fs::metadata(&memory).unwrap();
+    assert_eq!(
+        (before.uid(), before.gid(), published.uid(), published.gid()),
+        (0, 0, 0, 0)
+    );
+    let files = [
+        ChrootFile::immutable(&kernel, "vmlinux.bin"),
+        ChrootFile::read_only(&memory, "vm.mem"),
+    ];
+    let a = JailPaths::new(&config, "isolation", "a").unwrap();
+    let b = JailPaths::new(&config, "isolation", "b").unwrap();
+    let mut first = prepare_chroot(&config, &a, &files).await.unwrap();
+    let mut second = prepare_chroot(&config, &b, &files).await.unwrap();
+    for paths in [&a, &b] {
+        let placed = std::fs::metadata(paths.root.join("vmlinux.bin")).unwrap();
+        assert_eq!(
+            (placed.uid(), placed.gid(), placed.mode() & 0o777),
+            (0, 0, 0o444)
+        );
+        assert_ne!(placed.ino(), before.ino());
+        let linked = std::fs::metadata(paths.root.join("vm.mem")).unwrap();
+        assert_eq!(
+            (linked.dev(), linked.ino(), linked.uid(), linked.mode()),
+            (published.dev(), published.ino(), 0, published.mode())
+        );
+        // chdir happens before dropping privileges; relative paths exercise inode permissions.
+        for name in ["vmlinux.bin", "vm.mem"] {
+            let status = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "! chmod u+w \"$1\" && ! (printf corrupt > \"$1\")",
+                    "sh",
+                    name,
+                ])
+                .current_dir(&paths.root)
+                .uid(NOBODY)
+                .gid(NOBODY)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+    }
+    assert_ne!(
+        std::fs::metadata(a.root.join("vmlinux.bin")).unwrap().ino(),
+        std::fs::metadata(b.root.join("vmlinux.bin")).unwrap().ino()
+    );
+    assert_eq!(std::fs::read(&kernel).unwrap(), b"kernel");
+    assert_eq!(
+        std::fs::read(b.root.join("vmlinux.bin")).unwrap(),
+        b"kernel"
+    );
+    assert_eq!(std::fs::read(&memory).unwrap(), b"published memory");
+    let after = std::fs::metadata(&kernel).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    first.release().await.unwrap();
+    second.release().await.unwrap();
+    assert!(!a.jail_dir.exists());
+    assert!(!b.jail_dir.exists());
 }

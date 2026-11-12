@@ -416,7 +416,7 @@ async fn guest_with_failed_network_marker_reports_not_ready() {
         node: "vm0".into(),
         netns: None,
         files: vec![
-            ChrootFile::new(&kernel, "vmlinux.bin"),
+            ChrootFile::immutable(&kernel, "vmlinux.bin"),
             ChrootFile::new(&image, "rootfs.ext4"),
         ],
         timeouts: Timeouts::default(),

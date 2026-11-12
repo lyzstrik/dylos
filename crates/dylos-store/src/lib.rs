@@ -1480,7 +1480,13 @@ fn probe_file(path: &Path) -> io::Result<File> {
     open(&parent, ".".as_ref(), OFlag::O_TMPFILE | OFlag::O_RDWR)
 }
 
-fn reflink(source: &File, destination: &File) -> io::Result<()> {
+/// Clones an opened file into an exclusively created writable destination using FICLONE.
+/// No byte-copy fallback is performed; both descriptors must share a reflink-capable mount.
+/// Async callers must run this in a blocking task.
+///
+/// # Errors
+/// Returns the filesystem error if reflinking is unavailable or fails.
+pub fn reflink(source: &File, destination: &File) -> io::Result<()> {
     // SAFETY: FICLONE takes a valid source descriptor as its integer argument, not a pointer;
     // both Files remain live for the ioctl and the destination is opened writable.
     let result = unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };

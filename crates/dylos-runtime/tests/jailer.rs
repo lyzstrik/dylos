@@ -821,3 +821,72 @@ async fn malformed_program_header_layouts_fail_closed() {
         }
     }
 }
+
+#[tokio::test]
+async fn immutable_kernel_has_private_inode_and_preserves_source() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = support::test_tempdir();
+    let config = local_config(dir.path());
+    let source = dir.path().join("kernel");
+    std::fs::write(&source, b"kernel").unwrap();
+    let before = std::fs::metadata(&source).unwrap();
+    let files = [ChrootFile::immutable(&source, "vmlinux.bin")];
+    let a = JailPaths::new(&config, "lab", "a").unwrap();
+    let b = JailPaths::new(&config, "lab", "b").unwrap();
+    let mut first = prepare_chroot(&config, &a, &files).await.unwrap();
+    let mut second = prepare_chroot(&config, &b, &files).await.unwrap();
+    let private = a.root.join("vmlinux.bin");
+    let meta = std::fs::metadata(&private).unwrap();
+    assert_ne!(meta.ino(), before.ino());
+    assert_ne!(
+        meta.ino(),
+        std::fs::metadata(b.root.join("vmlinux.bin")).unwrap().ino()
+    );
+    assert_eq!(meta.mode() & 0o777, 0o444);
+    assert_eq!(meta.uid(), before.uid());
+    // Even a privileged writer changing its private inode cannot alter a sibling or source.
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::write(&private, b"changed").unwrap();
+    assert_eq!(
+        std::fs::read(b.root.join("vmlinux.bin")).unwrap(),
+        b"kernel"
+    );
+    assert_eq!(std::fs::read(&source).unwrap(), b"kernel");
+    let after = std::fs::metadata(&source).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    first.release().await.unwrap();
+    second.release().await.unwrap();
+    assert!(!a.jail_dir.exists());
+    assert!(!b.jail_dir.exists());
+}
+
+#[tokio::test]
+async fn immutable_kernel_reflink_failure_rolls_back_without_copy() {
+    let dir = tempfile::tempdir_in("/dev/shm").unwrap();
+    let config = local_config(dir.path());
+    let source = dir.path().join("kernel");
+    std::fs::write(&source, b"kernel").unwrap();
+    let paths = JailPaths::new(&config, "lab", "web").unwrap();
+    let error = prepare_chroot(
+        &config,
+        &paths,
+        &[ChrootFile::immutable(&source, "vmlinux.bin")],
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::Io {
+                op: "reflink required",
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(!paths.jail_dir.exists());
+    assert_eq!(std::fs::read(&source).unwrap(), b"kernel");
+}
