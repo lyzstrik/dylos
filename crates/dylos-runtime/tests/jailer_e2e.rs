@@ -147,7 +147,6 @@ async fn real_jailer_runs_firecracker_unprivileged_in_its_cgroup_and_netns() {
 async fn jailer_uid_cannot_modify_private_kernels_or_shared_memory() {
     use dylos_runtime::jailer::{JailPaths, prepare_chroot};
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::os::unix::process::CommandExt;
     let Some(_prereqs) =
         check_e2e_prerequisites("jailer_uid_cannot_modify_private_kernels_or_shared_memory")
     else {
@@ -186,18 +185,21 @@ async fn jailer_uid_cannot_modify_private_kernels_or_shared_memory() {
             (linked.dev(), linked.ino(), linked.uid(), linked.mode()),
             (published.dev(), published.ino(), 0, published.mode())
         );
-        // chdir happens before dropping privileges; relative paths exercise inode permissions.
+        // Enter as root before setpriv drops credentials, so private ancestors cannot
+        // mask the inode permissions exercised by the unprivileged shell.
         for name in ["vmlinux.bin", "vm.mem"] {
-            let status = std::process::Command::new("/bin/sh")
+            let status = std::process::Command::new("setpriv")
                 .args([
+                    "--reuid=65534",
+                    "--regid=65534",
+                    "--clear-groups",
+                    "/bin/sh",
                     "-c",
                     "! chmod u+w \"$1\" && ! (printf corrupt > \"$1\")",
                     "sh",
                     name,
                 ])
                 .current_dir(&paths.root)
-                .uid(NOBODY)
-                .gid(NOBODY)
                 .status()
                 .unwrap();
             assert!(status.success());
