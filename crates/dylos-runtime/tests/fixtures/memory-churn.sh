@@ -1,3 +1,5 @@
+(
+set -eu
 python3 - <<'PY' >/dev/null 2>&1 &
 from pathlib import Path
 
@@ -23,3 +25,4 @@ while time.monotonic() < deadline:
 else:
     raise RuntimeError('memory writer did not advance')
 PY
+)
