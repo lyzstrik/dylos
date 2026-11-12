@@ -462,6 +462,8 @@ pub struct BenchResults {
     pub snapshot_total_ms: MetricSamples,
     /// Per-stage breakdown of the snapshot sequence.
     pub snapshot_stages: SnapshotStages,
+    /// Per-repetition VM capture counts (Diff, Full), reported by the runtime.
+    pub snapshot_captures: Vec<(usize, usize)>,
     /// End-to-end `Lab::fork_with` duration for the whole batch of clones.
     pub fork_wall_time_ms: BTreeMap<usize, MetricSamples>,
     /// Batch duration divided by the clone count.
@@ -1317,8 +1319,17 @@ struct ForkMetrics {
     pss_unsettled: BTreeMap<usize, usize>,
 }
 
+/// Snapshot to remove before a repetition, retaining the immediately previous baseline.
+pub fn obsolete_snapshot_id(repetition: usize) -> Option<String> {
+    repetition
+        .checked_sub(2)
+        .filter(|rep| *rep > 0)
+        .map(|rep| format!("snap-{rep}"))
+}
+
 #[derive(Default)]
 struct SnapshotMetrics {
+    captures: Vec<(usize, usize)>,
     freeze: MetricSamples,
     pause: MetricSamples,
     skew: MetricSamples,
@@ -1383,9 +1394,9 @@ impl Bench<'_> {
         let mut metrics = SnapshotMetrics::default();
         let mut last_snapshot_dir: Option<PathBuf> = None;
         for rep in 1..=self.options.repetitions {
-            // Only the last snapshot is forked from; drop the previous one outside the
-            // measured interval so a full run does not exhaust the filesystem.
-            if let Some(prev_dir) = last_snapshot_dir.take() {
+            // Keep the preceding memory image available as the Diff baseline.
+            if let Some(obsolete) = obsolete_snapshot_id(rep) {
+                let prev_dir = self.lab_config.store.snapshot_dir("b-src", &obsolete);
                 let prev = prev_dir.clone();
                 tokio::task::spawn_blocking(move || fs::remove_dir_all(&prev))
                     .await
@@ -1412,6 +1423,7 @@ impl Bench<'_> {
             let manifest = timings.manifest_ms as f64;
             let total = timings.total_ms as f64;
 
+            metrics.captures.push(timings.capture_counts);
             metrics.freeze.add(freeze);
             metrics.pause.add(pause);
             metrics.skew.add(skew);
@@ -1425,11 +1437,16 @@ impl Bench<'_> {
             metrics.total.add(total);
 
             println!(
-                "  Repetition {rep:>2}/{}: pause window (freeze-to-thaw) = {freeze_to_thaw:>5.1} ms, total until published = {total:>6.1} ms, pause skew = {skew:>5.3} ms",
-                self.options.repetitions
+                "  Repetition {rep:>2}/{}: Diff = {}, Full = {}, pause window (freeze-to-thaw) = {freeze_to_thaw:>5.1} ms, total until published = {total:>6.1} ms, pause skew = {skew:>5.3} ms",
+                self.options.repetitions, timings.capture_counts.0, timings.capture_counts.1
             );
             last_snapshot_dir = Some(self.lab_config.store.snapshot_dir("b-src", &snap_id));
         }
+        let (diff, full) = metrics
+            .captures
+            .iter()
+            .fold((0, 0), |(d, f), &(next_d, next_f)| (d + next_d, f + next_f));
+        println!("Capture summary (VM captures): Diff = {diff}, Full = {full}.");
         println!(
             "Snapshot summary: pause window median = {:.1} ms (p95: {:.1} ms), total published median = {:.1} ms (p95: {:.1} ms), pause skew median = {:.3} ms (p95: {:.3} ms)\n",
             metrics.freeze_to_thaw.median(),
@@ -1653,6 +1670,7 @@ async fn measure_into(
         pause_skew_ms: snapshot.skew,
         snapshot_freeze_to_thaw_ms: snapshot.freeze_to_thaw,
         snapshot_total_ms: snapshot.total,
+        snapshot_captures: snapshot.captures,
         snapshot_stages: SnapshotStages {
             freeze_ms: snapshot.freeze,
             pause_ms: snapshot.pause,
@@ -1871,6 +1889,22 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
         );
     }
 
+    let _ = writeln!(
+        out,
+        "\n### Snapshot Capture Types\n\n| Repetition | Diff VMs | Full VMs |\n| :--- | ---: | ---: |"
+    );
+    let mut diff = 0;
+    let mut full = 0;
+    for (rep, &(d, f)) in results.snapshot_captures.iter().enumerate() {
+        let _ = writeln!(out, "| {} | {d} | {f} |", rep + 1);
+        diff += d;
+        full += f;
+    }
+    let _ = writeln!(
+        out,
+        "\nCapture summary (VM captures): Diff = {diff}, Full = {full}."
+    );
+
     let stage_freeze = stat(Some(&results.snapshot_stages.freeze_ms), 1.0, 1, "ms");
     let stage_pause = stat(Some(&results.snapshot_stages.pause_ms), 1.0, 1, "ms");
     let stage_api = stat(Some(&results.snapshot_stages.api_snapshot_ms), 1.0, 1, "ms");
@@ -1929,6 +1963,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 
 - **Percentile Calculation:** Values are computed using sorted linear interpolation at rank $p \\times (N - 1)$.
 - **Repetitions & Samples:** Cold boot and snapshot are evaluated across independent repetitions. Fork and PSS evaluate $N \\times \\text{{repetitions}}$ clone observations grouped by clone count (clones of one batch are correlated). In quick mode (2 repetitions), p95 is an interpolation close to the maximum and is indicative only.
+- **Snapshot Baseline:** Keep the previous snapshot as the Diff baseline; delete the snapshot from two repetitions back before measurement, retaining at most two snapshots and forking from the last.
 - **Interval Definitions:**
   - *Fabric Freeze Duration:* duration of the fabric-freeze call on the network fabric. It does not measure guest-observed network downtime.
   - *Pause Confirmation Skew:* duration from the first successful VM pause API response to the last.

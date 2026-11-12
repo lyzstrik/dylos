@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::panic, clippy::float_cmp)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -54,6 +54,7 @@ fn passing() -> BenchResults {
         pause_skew_ms: samples(&[0.5]),
         snapshot_freeze_to_thaw_ms: samples(&[800.0]),
         snapshot_total_ms: samples(&[5800.0]),
+        snapshot_captures: vec![(0, 5), (5, 0)],
         snapshot_stages: SnapshotStages {
             freeze_ms: samples(&[2.0]),
             pause_ms: samples(&[80.0]),
@@ -1207,4 +1208,38 @@ fn report_names_e2e_evidence_without_claiming_observed_results() {
         assert!(report.contains("this benchmark does not observe their results"));
         assert!(report.contains("100 cycles by default, 5 in CI"));
     }
+}
+
+#[test]
+fn snapshot_retention_keeps_previous_baseline_and_last_fork_source() {
+    let mut retained = BTreeSet::new();
+    for rep in 1..=20 {
+        if let Some(old) = xtask::bench::obsolete_snapshot_id(rep) {
+            assert!(retained.remove(&old));
+        }
+        if rep > 1 {
+            assert!(retained.contains(&format!("snap-{}", rep - 1)));
+        }
+        retained.insert(format!("snap-{rep}"));
+        assert!(retained.len() <= 2);
+        assert!(retained.contains(&format!("snap-{rep}")));
+    }
+    assert_eq!(
+        retained,
+        BTreeSet::from(["snap-19".into(), "snap-20".into()])
+    );
+}
+
+#[test]
+fn snapshot_report_counts_actual_capture_types_including_mixed_fallback() {
+    let r = BenchResults {
+        snapshot_captures: vec![(0, 5), (5, 0), (3, 2)],
+        ..passing()
+    };
+    let report = render_markdown_report(&r);
+    assert!(report.contains("| 1 | 0 | 5 |"));
+    assert!(report.contains("| 2 | 5 | 0 |"));
+    assert!(report.contains("| 3 | 3 | 2 |"));
+    assert!(report.contains("Capture summary (VM captures): Diff = 8, Full = 7."));
+    assert!(report.contains("delete the snapshot from two repetitions back before measurement"));
 }
