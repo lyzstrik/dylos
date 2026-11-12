@@ -38,7 +38,7 @@ Lab snapshot sequence (each step completes for all VMs before the next starts; s
 
 1. Freeze the fabric: after completion T, no frame sent after T is received by a lab VM before thaw; pre-T queued frames may still be received. For the spike this is one operation per host-side TAP; later, one write to an eBPF map.
 2. Pause all VMs (`PATCH /vm` with `Paused`).
-3. Snapshot each VM (`PUT /snapshot/create`, full snapshot) into an isolated staging directory: capture state and memory, fsync source disks and clone them by reflink. Complete capture for every VM before resuming any VM.
+3. Snapshot each VM (`PUT /snapshot/create`, full snapshot except the first capture since boot) into an isolated staging directory: capture state and memory, fsync source disks and clone them by reflink. Complete capture for every VM before resuming any VM.
 4. Resume all VMs (`PATCH /vm` with `Resumed`).
 5. Thaw the fabric.
 6. Fsync, seal and hash all captured files and write the lab manifest in staging. Publish only after all hashes and the manifest are complete, by atomically renaming staging to the final snapshot directory. The snapshot command returns only after publication.
@@ -46,6 +46,8 @@ Lab snapshot sequence (each step completes for all VMs before the next starts; s
 **Revision (2026-11-05):** Hashing follows thaw to shorten the pause. Firecracker finishes writing and closes state and memory output before acknowledging capture; the store additionally reflinks (or copies) them into distinct destination inodes and unlinks the jail outputs. Captured disks are reflink copies, isolated from writes through the running VMs' disk handles. Resumed VMs therefore cannot modify the captured files during hashing. Hashing does not alter the logical cut.
 
 **Revision (2026-11-07):** Request `sync_snapshot_files=false` from Firecracker v1.17.0 so state and memory writes complete without an fsync during the pause. Capture still isolates those outputs before resume, using bounded buffered copies because reflinking dirty files forces writeback. After thaw, each captured file is fsynced, then sealed with fs-verity where supported and hashed, before the manifest is written and published. A host crash before publication may lose staging, which is never a restorable snapshot; the snapshot command still returns only after durable publication. Firecracker still syncs activated block devices during capture, independently of this option.
+
+**Revision (2026-11-12):** Enable dirty-page tracking at boot and use a diff only for the first capture since boot. Untouched anonymous guest pages are zero, so this first diff is a standalone memory image; Firecracker combines its userspace dirty bitmap with KVM dirties. Consume eligibility before requesting capture, including failed requests. Later captures and restored VMs use full snapshots. The private buffered copy and all six step boundaries above remain unchanged.
 
 Staging directories are unpublished: restore and fork reject them even if a manifest is already present. Any failure before publication removes staging and recovers paused VMs and the frozen fabric in that order. A failed hash never publishes a snapshot; no partial snapshot may be restored or forked.
 

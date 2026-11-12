@@ -1609,3 +1609,57 @@ async fn memory_reservation_failure_precedes_pause_and_cleans_all_outputs() {
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
+
+fn assert_snapshot_type(lab: &Lab, expected: &str) {
+    for vm in lab.vms() {
+        let request = fs::read_to_string(vm.paths().root.join("snapshot-request")).unwrap();
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let params: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(params["snapshot_type"], expected);
+    }
+}
+
+#[tokio::test]
+async fn only_first_boot_capture_is_diff_including_after_failure() {
+    if !sandboxed("only_first_boot_capture_is_diff_including_after_failure") {
+        return;
+    }
+    let sandbox = Sandbox::in_target(Mode::LabSnapshot);
+    let Some((config, mut lab)) = up_lab(
+        "only_first_boot_capture_is_diff_including_after_failure",
+        &sandbox,
+        "first-diff",
+    )
+    .await
+    else {
+        return;
+    };
+    for vm in lab.vms() {
+        let requests = fs::read_to_string(
+            vm.paths()
+                .api_socket()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("requests"),
+        )
+        .unwrap();
+        assert!(requests.contains("\"track_dirty_pages\":true"));
+    }
+    for vm in lab.vms() {
+        fs::write(vm.paths().root.join("fail-snapshot"), b"").unwrap();
+    }
+    let error = lab.snapshot("failed").await.unwrap_err();
+    assert!(matches!(error, LabError::Api { .. }), "{error:?}");
+    assert_snapshot_type(&lab, "Diff");
+    for vm in lab.vms() {
+        fs::remove_file(vm.paths().root.join("fail-snapshot")).unwrap();
+    }
+    lab.snapshot("retry").await.unwrap();
+    assert_snapshot_type(&lab, "Full");
+    lab.snapshot("again").await.unwrap();
+    assert_snapshot_type(&lab, "Full");
+    lab.teardown().await.unwrap();
+    assert_lab_removed(&sandbox, &config, "first-diff");
+}

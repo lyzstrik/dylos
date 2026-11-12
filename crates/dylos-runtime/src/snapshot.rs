@@ -96,6 +96,7 @@ struct SnapshotVm {
     root_dir: PathBuf,
     disk_path: Option<PathBuf>,
     memory_mib: u64,
+    snapshot_type: Arc<Mutex<dylos_fc::snapshot::SnapshotType>>,
 }
 
 struct SnapshotExecutionState {
@@ -391,6 +392,7 @@ async fn run_snapshot_steps(
         let state_max_bytes = 16 * 1024 * 1024;
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
 
+        let next_snapshot_type = Arc::clone(&vm.snapshot_type);
         let vm_node = node.clone();
         let capture = move |api_ms| {
             let started = Instant::now();
@@ -426,9 +428,20 @@ async fn run_snapshot_steps(
             ))
         };
         let handle = tokio::spawn(async move {
+            // An ambiguous API failure may have cleared dirty tracking. Consume
+            // eligibility before dispatch; only fresh boot permits a standalone diff.
+            let snapshot_type = {
+                let mut next = next_snapshot_type.lock().map_err(|_| LabError::Invalid {
+                    lab: lab.clone(),
+                    message: format!("snapshot type unavailable for VM {vm_node}"),
+                })?;
+                std::mem::replace(&mut *next, dylos_fc::snapshot::SnapshotType::Full)
+            };
+            tracing::info!(lab = %lab, vm = %vm_node, ?snapshot_type, "selected VM snapshot type");
             let started_api = Instant::now();
-            let params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
+            let mut params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
                 .with_sync_snapshot_files(false);
+            params.snapshot_type = Some(snapshot_type);
             api.create_snapshot(&params)
                 .await
                 .map_err(|source| LabError::Api {
@@ -758,6 +771,7 @@ pub async fn snapshot_vms(
             node,
             disk_path,
             memory_mib,
+            snapshot_type: Arc::clone(&vm.snapshot_type),
         });
     }
     let job = SnapshotJob {

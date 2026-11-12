@@ -546,6 +546,12 @@ impl Lab {
             }))
             .await,
         )?;
+        for vm in &self.vms {
+            *vm.snapshot_type
+                .lock()
+                .map_err(|_| invalid(&self.id, "snapshot type unavailable"))? =
+                dylos_fc::snapshot::SnapshotType::Diff;
+        }
         tracing::info!(
             duration_ms = started.elapsed().as_millis(),
             "all VM instances started"
@@ -1505,8 +1511,9 @@ async fn configure_vm(
     async {
         let api = vm.client();
         let configure = async {
-            api.put_machine_config(&MachineConfiguration::new(vcpus, node.memory as usize))
-                .await?;
+            let mut machine = MachineConfiguration::new(vcpus, node.memory as usize);
+            machine.track_dirty_pages = Some(true);
+            api.put_machine_config(&machine).await?;
             let mut boot = BootSource::new("/vmlinux.bin");
             let extra_boot_args = match extra_boot {
                 Some(args) => format!(" {args}"),
