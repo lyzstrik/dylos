@@ -87,6 +87,9 @@ enum Readiness {
     Failed(Instant),
 }
 
+pub(crate) type SnapshotBaseline =
+    Arc<std::sync::Mutex<Option<(PathBuf, dylos_core::manifest::FileMeta)>>>;
+
 /// A running Firecracker process inside its jail.
 ///
 /// The supervisor task owns the child and the [`Jail`]: whatever the reason the process exits,
@@ -100,7 +103,9 @@ pub struct Vm {
     paths: JailPaths,
     node: String,
     client: FcClient,
-    pub(crate) snapshot_type: Arc<std::sync::Mutex<dylos_fc::snapshot::SnapshotType>>,
+    pub(crate) snapshot_baseline: SnapshotBaseline,
+    pub(crate) first_boot_diff: Arc<AtomicBool>,
+    pub(crate) dirty_tracking: Arc<AtomicBool>,
     timeouts: Timeouts,
     signals: mpsc::UnboundedSender<Signal>,
     state: watch::Receiver<ProcessState>,
@@ -291,11 +296,9 @@ impl Vm {
         tasks.push(tokio::spawn(metrics.in_current_span()));
         Self {
             client: FcClient::new(paths.api_socket()),
-            // Restored or externally configured VMs require a self-contained full image.
-            // Lab boot alone enables the one-shot diff after dirty tracking is configured.
-            snapshot_type: Arc::new(std::sync::Mutex::new(
-                dylos_fc::snapshot::SnapshotType::Full,
-            )),
+            snapshot_baseline: Arc::default(),
+            first_boot_diff: Arc::new(AtomicBool::new(false)),
+            dirty_tracking: Arc::new(AtomicBool::new(false)),
             paths,
             node,
             lab,

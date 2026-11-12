@@ -1620,13 +1620,13 @@ fn assert_snapshot_type(lab: &Lab, expected: &str) {
 }
 
 #[tokio::test]
-async fn only_first_boot_capture_is_diff_including_after_failure() {
-    if !sandboxed("only_first_boot_capture_is_diff_including_after_failure") {
+async fn first_boot_diff_is_consumed_even_on_capture_failure() {
+    if !sandboxed("first_boot_diff_is_consumed_even_on_capture_failure") {
         return;
     }
     let sandbox = Sandbox::in_target(Mode::LabSnapshot);
     let Some((config, mut lab)) = up_lab(
-        "only_first_boot_capture_is_diff_including_after_failure",
+        "first_boot_diff_is_consumed_even_on_capture_failure",
         &sandbox,
         "first-diff",
     )

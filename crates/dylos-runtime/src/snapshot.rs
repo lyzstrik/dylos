@@ -96,7 +96,23 @@ struct SnapshotVm {
     root_dir: PathBuf,
     disk_path: Option<PathBuf>,
     memory_mib: u64,
-    snapshot_type: Arc<Mutex<dylos_fc::snapshot::SnapshotType>>,
+    baseline: crate::vm::SnapshotBaseline,
+    first_boot_diff: Arc<AtomicBool>,
+    dirty_tracking: Arc<AtomicBool>,
+}
+
+// Dropping the caller after delivery but before return also invalidates the epoch.
+// Earlier cancellations are cleared again by the run-to-completion sender.
+#[derive(Default)]
+struct SnapshotCancellationGuard(Vec<(crate::vm::SnapshotBaseline, Arc<AtomicBool>)>);
+
+impl Drop for SnapshotCancellationGuard {
+    fn drop(&mut self) {
+        for (baseline, first_boot_diff) in &self.0 {
+            *poisoned(baseline) = None;
+            first_boot_diff.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 struct SnapshotExecutionState {
@@ -282,16 +298,36 @@ async fn run_snapshot_steps(
     let started_all = Instant::now();
 
     let started_prepare = Instant::now();
+    // Consume every epoch before preparation: any later failure requires Full.
     let preparations = job.vms.iter().map(|vm| {
         let root = vm.root_dir.clone();
         let size = vm.memory_mib * 1024 * 1024;
-        tokio::task::spawn_blocking(move || dylos_store::preallocate_snapshot_memory(&root, size))
+        let baseline = poisoned(&vm.baseline).take();
+        let first_boot_diff = vm.first_boot_diff.swap(false, Ordering::SeqCst);
+        tokio::task::spawn_blocking(move || {
+            if let Some((path, meta)) = baseline {
+                match dylos_store::seed_snapshot_memory(&root, size, &path, &meta) {
+                    Ok(()) => return Ok(dylos_fc::snapshot::SnapshotType::Diff),
+                    Err(error) => tracing::warn!(%error, "baseline unavailable; capturing Full"),
+                }
+                dylos_store::preallocate_snapshot_memory(&root, size)?;
+                Ok(dylos_fc::snapshot::SnapshotType::Full)
+            } else {
+                dylos_store::preallocate_snapshot_memory(&root, size)?;
+                Ok::<_, dylos_store::Error>(if first_boot_diff {
+                    dylos_fc::snapshot::SnapshotType::Diff
+                } else {
+                    dylos_fc::snapshot::SnapshotType::Full
+                })
+            }
+        })
     });
+    let mut snapshot_types = Vec::new();
     for result in join_all(preparations).await {
-        result.map_err(|source| LabError::Task {
+        snapshot_types.push(result.map_err(|source| LabError::Task {
             lab: job.lab_id.clone(),
             source,
-        })??;
+        })??);
     }
 
     // Drain earlier filesystem work while guests are running; disks are synced again paused.
@@ -380,7 +416,7 @@ async fn run_snapshot_steps(
     let snapshot_arc = Arc::new(snapshot);
     let mut storage_handles = Vec::new();
 
-    for vm in &job.vms {
+    for (vm, snapshot_type) in job.vms.iter().zip(snapshot_types) {
         let snap = Arc::clone(&snapshot_arc);
         let node = vm.node.clone();
         let api = vm.client.clone();
@@ -392,7 +428,6 @@ async fn run_snapshot_steps(
         let state_max_bytes = 16 * 1024 * 1024;
         let mem_max_bytes = (vm.memory_mib * 1024 * 1024) + (16 * 1024 * 1024);
 
-        let next_snapshot_type = Arc::clone(&vm.snapshot_type);
         let vm_node = node.clone();
         let capture = move |api_ms| {
             let started = Instant::now();
@@ -428,15 +463,6 @@ async fn run_snapshot_steps(
             ))
         };
         let handle = tokio::spawn(async move {
-            // An ambiguous API failure may have cleared dirty tracking. Consume
-            // eligibility before dispatch; only fresh boot permits a standalone diff.
-            let snapshot_type = {
-                let mut next = next_snapshot_type.lock().map_err(|_| LabError::Invalid {
-                    lab: lab.clone(),
-                    message: format!("snapshot type unavailable for VM {vm_node}"),
-                })?;
-                std::mem::replace(&mut *next, dylos_fc::snapshot::SnapshotType::Full)
-            };
             tracing::info!(lab = %lab, vm = %vm_node, ?snapshot_type, "selected VM snapshot type");
             let started_api = Instant::now();
             let mut params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
@@ -641,6 +667,16 @@ async fn run_snapshot_steps(
         source,
     })??;
     let manifest_ms = u64::try_from(started_manifest.elapsed().as_millis()).unwrap_or(u64::MAX);
+    for vm in &job.vms {
+        if vm.dirty_tracking.load(Ordering::SeqCst) {
+            *poisoned(&vm.baseline) = manifest.vms.get(&vm.node).map(|meta| {
+                (
+                    job.store.snapshot_dir(&job.lab_id, &job.snapshot_id),
+                    meta.memory_file.clone(),
+                )
+            });
+        }
+    }
 
     // Clean jail snapshot files on success as well
     if let Err(e) = clean_jail_files_for_vms(&job.vms).await {
@@ -771,7 +807,9 @@ pub async fn snapshot_vms(
             node,
             disk_path,
             memory_mib,
-            snapshot_type: Arc::clone(&vm.snapshot_type),
+            baseline: Arc::clone(&vm.snapshot_baseline),
+            first_boot_diff: Arc::clone(&vm.first_boot_diff),
+            dirty_tracking: Arc::clone(&vm.dirty_tracking),
         });
     }
     let job = SnapshotJob {
@@ -785,6 +823,7 @@ pub async fn snapshot_vms(
 
     let span = tracing::info_span!("snapshot_lab", lab = %lab_id, snapshot = %snapshot_id);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let mut cancellation = SnapshotCancellationGuard::default();
     let task_id = {
         // Checking and filling the slot under one lock keeps two concurrent callers from
         // both starting a task.
@@ -795,10 +834,18 @@ pub async fn snapshot_vms(
                 message: "snapshot already in progress".into(),
             });
         }
+        cancellation.0 = job
+            .vms
+            .iter()
+            .map(|vm| (Arc::clone(&vm.baseline), Arc::clone(&vm.first_boot_diff)))
+            .collect();
+        let epochs = cancellation.0.clone();
         let handle = tokio::spawn(
             async move {
                 let res = run_snapshot_job(job).await;
-                let _ = result_tx.send(res);
+                if result_tx.send(res).is_err() {
+                    drop(SnapshotCancellationGuard(epochs));
+                }
             }
             .instrument(span),
         );
@@ -835,6 +882,9 @@ pub async fn snapshot_vms(
     };
     // A later invocation may already own the slot once this task has finished.
     slot.0.lock().await.take_if(|handle| handle.id() == task_id);
+    if result.is_ok() {
+        cancellation.0.clear();
+    }
     result
 }
 
