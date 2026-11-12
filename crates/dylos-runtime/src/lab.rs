@@ -721,10 +721,10 @@ impl Lab {
         self.snapshots.wait().await;
     }
 
-    /// Gives integration tests access to the live fabric, until teardown removes it.
-    #[cfg(feature = "test-support")]
-    pub fn network_mut(&mut self) -> Option<&mut LabNetwork> {
-        self.network.as_mut()
+    /// Inspect topology/netns or isolate faults through the existing fabric handle.
+    #[must_use]
+    pub fn network(&self) -> Option<&LabNetwork> {
+        self.network.as_ref()
     }
 
     /// Returns a reference to the VM with the given node name, if present.
@@ -1431,17 +1431,18 @@ fn maps_to_parent_root(map: &str, id: u32) -> bool {
 }
 
 // Each line is `<inside> <outside> <length>`; only the first id of a range starting at outside 0
-// maps to root. A malformed line counts as root.
+// maps to root. An empty or whitespace-only map or a malformed line counts as root.
 fn id_maps_to_root(map: &str, id: u32) -> bool {
-    map.lines().any(|line| {
-        let mut fields = line.split_whitespace().map(str::parse::<u32>);
-        match (fields.next(), fields.next(), fields.next()) {
-            (Some(Ok(inside)), Some(Ok(outside)), Some(Ok(len))) => {
-                inside == id && outside == 0 && len > 0
+    map.trim().is_empty()
+        || map.lines().any(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<u32>);
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(Ok(inside)), Some(Ok(outside)), Some(Ok(len))) => {
+                    inside == id && outside == 0 && len > 0
+                }
+                _ => true,
             }
-            _ => true,
-        }
-    })
+        })
 }
 
 fn stop_cgroup(id: &str, path: &Path) -> Result<()> {
@@ -1638,6 +1639,8 @@ mod tests {
 
     #[test]
     fn only_ids_mapped_to_parent_root_are_root() {
+        assert!(id_maps_to_root("", 65534));
+        assert!(id_maps_to_root(" \t\n\r\n", 65534));
         let initial = "         0          0 4294967295\n";
         assert!(id_maps_to_root(initial, 0));
         assert!(!id_maps_to_root(initial, 65534));

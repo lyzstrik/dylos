@@ -128,7 +128,7 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         let clone = Lab::restore_with(&config, &snapshot, "dst").await.unwrap();
         restored = Some(clone);
         let clone = restored.as_mut().unwrap();
-        let (source, target) = (original.network_mut().unwrap(), clone.network_mut().unwrap());
+        let (source, target) = (original.network().unwrap(), clone.network().unwrap());
         assert_eq!(source.plan().taps(), target.plan().taps());
         assert_eq!(source.plan().bridges(), target.plan().bridges());
         assert_ne!(source.netns_path(), target.netns_path());

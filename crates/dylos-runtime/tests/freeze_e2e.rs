@@ -176,7 +176,7 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
     guest(lab, "A", &format!("ping {family} -c 1 -W 2 {address}")).await;
     guest(lab, "A", &format!("sh -c 'iperf3 {family} -c {address} -P 4 -t 90 > /tmp/freeze-iperf.log 2>&1 & echo $! > /tmp/freeze-iperf.pid'")).await;
     wait_for_rx(lab, guest_rx(lab).await[3]).await;
-    lab.network_mut().unwrap().freeze().await.unwrap();
+    lab.network().unwrap().thaw_handle().freeze().await.unwrap();
     let frozen_at = Instant::now();
     marker(lab, family, address, "AFTER_T_EARLY").await;
     let initial = guest_rx(lab).await;
@@ -228,7 +228,7 @@ async fn exercise(lab: &mut Lab, namespace: &Path, family: &str, address: &str) 
         "RX changed across receiver pause"
     );
     guest(lab, "C", "! grep -q AFTER_T /tmp/freeze-markers").await;
-    lab.network_mut().unwrap().thaw().await.unwrap();
+    lab.network().unwrap().thaw_handle().thaw().await.unwrap();
     wait_for_rx(lab, stable[3]).await;
     wait_marker(lab, family, address, "THAW").await;
     guest(lab, "A", "kill -0 $(cat /tmp/freeze-iperf.pid)").await;
@@ -295,7 +295,7 @@ async fn abc_fabric_freeze_under_real_traffic() {
     };
     let spec = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
     let mut lab = Lab::up_with(&config, &spec, "freeze-e2e").await.unwrap();
-    let namespace = lab.network_mut().unwrap().netns_path().to_owned();
+    let namespace = lab.network().unwrap().netns_path().to_owned();
     let paths: Vec<_> = lab
         .vms()
         .iter()
