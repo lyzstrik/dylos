@@ -602,3 +602,72 @@ fn pause_kpi_enforce_and_report_behavior() {
     });
     assert!(result.is_err(), "enforce mode must fail when pause >= 1s");
 }
+
+async fn memory_checksum(lab: &Lab, command: &str) -> String {
+    let output = lab
+        .exec("writer", command, Duration::from_secs(20))
+        .await
+        .unwrap();
+    assert!(output.success(), "memory proof failed: {output:?}");
+    output.stdout.trim().to_owned()
+}
+
+#[tokio::test]
+#[ignore = "end-to-end: needs root and KVM, run with `just e2e`"]
+async fn first_diff_preserves_guest_and_boot_memory_across_restore_and_fork() {
+    let Some(prereqs) = check_e2e_prerequisites(
+        "first_diff_preserves_guest_and_boot_memory_across_restore_and_fork",
+    ) else {
+        return;
+    };
+    let dir = test_tempdir();
+    let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
+    jailer.jailer = prereqs.bin.join("jailer");
+    jailer.firecracker = prereqs.bin.join("firecracker");
+    let config = LabConfig {
+        store: dylos_store::Store {
+            base: dir.path().join("labs"),
+            image: prereqs.image,
+        },
+        jailer,
+        kernel: prereqs.kernel,
+        netns_dir: dir.path().join("netns"),
+        ..LabConfig::default()
+    };
+    let spec = LabSpec::from_yaml_str(include_str!("../../../labs/writer.yaml")).unwrap();
+    let mut original = Lab::up_with(&config, &spec, "memory-src").await.unwrap();
+    memory_checksum(
+        &original,
+        include_str!("fixtures/memory-proof.sh").trim_end(),
+    )
+    .await;
+    let checksum = "sha256sum /mnt/memory-proof/region /sys/kernel/notes";
+    let before = memory_checksum(&original, checksum).await;
+    original.snapshot("first").await.unwrap();
+    let first = config.store.snapshot_dir("memory-src", "first");
+    let mut clones = Lab::fork_with(&config, &first, &["memory-c1".into(), "memory-c2".into()])
+        .await
+        .unwrap();
+    for clone in &clones {
+        assert_eq!(memory_checksum(clone, checksum).await, before);
+    }
+    // Original pages unchanged since the first snapshot must still be captured in full.
+    original.snapshot("second").await.unwrap();
+    let second = config.store.snapshot_dir("memory-src", "second");
+    let mut restored = Lab::restore_with(&config, &second, "memory-r1")
+        .await
+        .unwrap();
+    assert_eq!(memory_checksum(&restored, checksum).await, before);
+    restored.snapshot("restored").await.unwrap();
+    let third = config.store.snapshot_dir("memory-r1", "restored");
+    let mut restored_again = Lab::restore_with(&config, &third, "memory-r2")
+        .await
+        .unwrap();
+    assert_eq!(memory_checksum(&restored_again, checksum).await, before);
+    for clone in &mut clones {
+        clone.teardown().await.unwrap();
+    }
+    restored_again.teardown().await.unwrap();
+    restored.teardown().await.unwrap();
+    original.teardown().await.unwrap();
+}

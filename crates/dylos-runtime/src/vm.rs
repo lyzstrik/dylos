@@ -100,6 +100,7 @@ pub struct Vm {
     paths: JailPaths,
     node: String,
     client: FcClient,
+    pub(crate) snapshot_type: Arc<std::sync::Mutex<dylos_fc::snapshot::SnapshotType>>,
     timeouts: Timeouts,
     signals: mpsc::UnboundedSender<Signal>,
     state: watch::Receiver<ProcessState>,
@@ -290,6 +291,11 @@ impl Vm {
         tasks.push(tokio::spawn(metrics.in_current_span()));
         Self {
             client: FcClient::new(paths.api_socket()),
+            // Restored or externally configured VMs require a self-contained full image.
+            // Lab boot alone enables the one-shot diff after dirty tracking is configured.
+            snapshot_type: Arc::new(std::sync::Mutex::new(
+                dylos_fc::snapshot::SnapshotType::Full,
+            )),
             paths,
             node,
             lab,
