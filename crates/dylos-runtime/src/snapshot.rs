@@ -872,7 +872,9 @@ pub async fn snapshot_vms(
     };
     // A later invocation may already own the slot once this task has finished.
     slot.0.lock().await.take_if(|handle| handle.id() == task_id);
-    cancellation.0.clear();
+    if result.is_ok() {
+        cancellation.0.clear();
+    }
     result
 }
 
