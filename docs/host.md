@@ -134,6 +134,7 @@ The guest kernel file (`config.kernel`) must also reside on the same
 reflink-capable filesystem and mount as the jail and store directories. Each jail
 receives a mandatory FICLONE reflink of the kernel; preparation fails closed with
 `reflink required` if cloning is unsupported, rather than falling back to a copy.
+`just host-check` probes the actual kernel (`kernels/vmlinux.bin`, overridden with `DYLOS_KERNEL`) into both jail and store directories without modifying it.
 
 `DYLOS_LAB_DIR` overrides the default store `target/labs`. The default jail base is
 its sibling `jails` (`target/jails` with CLI defaults), keeping repository images,

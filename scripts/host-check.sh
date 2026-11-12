@@ -199,4 +199,21 @@ if [ ${#FAILED_PAIRS[@]} -gt 0 ]; then
     fail "$ERR_MSG"
 fi
 
+# Probe the actual kernel source: a writable image directory does not establish
+# that this file can be cloned (it may reside on another mount).
+KERNEL_FILE="${DYLOS_KERNEL:-${REPO_ROOT}/kernels/vmlinux.bin}"
+[ -f "$KERNEL_FILE" ] && [ -r "$KERNEL_FILE" ] ||
+    fail "Guest kernel is not a readable regular file: $KERNEL_FILE (see docs/host.md, or set DYLOS_KERNEL)."
+for destination in "$JAIL_DIR" "$LAB_DIR"; do
+    if ! kernel_probe="$(mktemp "$destination/.reflink_probe_kernel.XXXXXX" 2>/dev/null)"; then
+        fail "Cannot write a kernel probe file in $destination; check ownership/write permissions and available space."
+    fi
+    PROBE_FILES+=("$kernel_probe")
+    if ! cp --reflink=always -- "$KERNEL_FILE" "$kernel_probe" 2>/dev/null; then
+        fail "Guest kernel reflink required: cannot clone $KERNEL_FILE into $destination. Kernel, jail and store must share a reflink-compatible mount (see docs/host.md)."
+    fi
+    rm -f "$kernel_probe"
+done
+echo "  - Guest kernel reflink : OK ($KERNEL_FILE -> jail and store)"
+
 echo -e "\e[32m[SUCCESS]\e[0m All host prerequisites are met."
