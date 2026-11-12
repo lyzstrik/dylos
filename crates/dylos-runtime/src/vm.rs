@@ -104,6 +104,7 @@ pub struct Vm {
     node: String,
     client: FcClient,
     pub(crate) snapshot_baseline: SnapshotBaseline,
+    pub(crate) first_boot_diff: Arc<AtomicBool>,
     pub(crate) dirty_tracking: Arc<AtomicBool>,
     timeouts: Timeouts,
     signals: mpsc::UnboundedSender<Signal>,
@@ -296,6 +297,7 @@ impl Vm {
         Self {
             client: FcClient::new(paths.api_socket()),
             snapshot_baseline: Arc::default(),
+            first_boot_diff: Arc::new(AtomicBool::new(false)),
             dirty_tracking: Arc::new(AtomicBool::new(false)),
             paths,
             node,

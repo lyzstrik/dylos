@@ -549,6 +549,7 @@ impl Lab {
         )?;
         for vm in &self.vms {
             vm.dirty_tracking.store(true, Ordering::SeqCst);
+            vm.first_boot_diff.store(true, Ordering::SeqCst);
         }
         tracing::info!(
             duration_ms = started.elapsed().as_millis(),

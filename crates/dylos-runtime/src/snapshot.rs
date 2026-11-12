@@ -97,18 +97,20 @@ struct SnapshotVm {
     disk_path: Option<PathBuf>,
     memory_mib: u64,
     baseline: crate::vm::SnapshotBaseline,
+    first_boot_diff: Arc<AtomicBool>,
     dirty_tracking: Arc<AtomicBool>,
 }
 
 // Dropping the caller after delivery but before return also invalidates the epoch.
 // Earlier cancellations are cleared again by the run-to-completion sender.
 #[derive(Default)]
-struct SnapshotCancellationGuard(Vec<crate::vm::SnapshotBaseline>);
+struct SnapshotCancellationGuard(Vec<(crate::vm::SnapshotBaseline, Arc<AtomicBool>)>);
 
 impl Drop for SnapshotCancellationGuard {
     fn drop(&mut self) {
-        for baseline in &self.0 {
+        for (baseline, first_boot_diff) in &self.0 {
             *poisoned(baseline) = None;
+            first_boot_diff.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -301,6 +303,7 @@ async fn run_snapshot_steps(
         let root = vm.root_dir.clone();
         let size = vm.memory_mib * 1024 * 1024;
         let baseline = poisoned(&vm.baseline).take();
+        let first_boot_diff = vm.first_boot_diff.swap(false, Ordering::SeqCst);
         tokio::task::spawn_blocking(move || {
             if let Some((path, meta)) = baseline {
                 match dylos_store::seed_snapshot_memory(&root, size, &path, &meta) {
@@ -311,7 +314,11 @@ async fn run_snapshot_steps(
                 Ok(dylos_fc::snapshot::SnapshotType::Full)
             } else {
                 dylos_store::preallocate_snapshot_memory(&root, size)?;
-                Ok::<_, dylos_store::Error>(dylos_fc::snapshot::SnapshotType::Full)
+                Ok::<_, dylos_store::Error>(if first_boot_diff {
+                    dylos_fc::snapshot::SnapshotType::Diff
+                } else {
+                    dylos_fc::snapshot::SnapshotType::Full
+                })
             }
         })
     });
@@ -801,6 +808,7 @@ pub async fn snapshot_vms(
             disk_path,
             memory_mib,
             baseline: Arc::clone(&vm.snapshot_baseline),
+            first_boot_diff: Arc::clone(&vm.first_boot_diff),
             dirty_tracking: Arc::clone(&vm.dirty_tracking),
         });
     }
@@ -826,15 +834,17 @@ pub async fn snapshot_vms(
                 message: "snapshot already in progress".into(),
             });
         }
-        cancellation.0 = job.vms.iter().map(|vm| Arc::clone(&vm.baseline)).collect();
+        cancellation.0 = job
+            .vms
+            .iter()
+            .map(|vm| (Arc::clone(&vm.baseline), Arc::clone(&vm.first_boot_diff)))
+            .collect();
         let epochs = cancellation.0.clone();
         let handle = tokio::spawn(
             async move {
                 let res = run_snapshot_job(job).await;
                 if result_tx.send(res).is_err() {
-                    for baseline in epochs {
-                        *poisoned(&baseline) = None;
-                    }
+                    drop(SnapshotCancellationGuard(epochs));
                 }
             }
             .instrument(span),

@@ -752,7 +752,7 @@ async fn successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork
     restored_again.teardown().await.unwrap();
     restored.teardown().await.unwrap();
     let trace = fs::read_to_string(trace_path).unwrap();
-    assert!(trace.matches("snapshot_type=Diff").count() >= 5, "{trace}");
-    assert!(trace.matches("snapshot_type=Full").count() >= 3, "{trace}");
+    assert!(trace.matches("snapshot_type=Diff").count() >= 6, "{trace}");
+    assert!(trace.matches("snapshot_type=Full").count() >= 2, "{trace}");
     original.teardown().await.unwrap();
 }
