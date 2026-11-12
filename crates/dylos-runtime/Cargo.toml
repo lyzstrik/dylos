@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[features]
-test-support = []
-
 [lints]
 workspace = true
 
@@ -26,7 +23,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 nix = { workspace = true, features = ["mount"] }
-dylos-runtime = { path = ".", features = ["test-support"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["signal", "test-util"] }
