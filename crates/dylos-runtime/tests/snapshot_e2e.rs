@@ -723,7 +723,7 @@ async fn successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork
     let mut fallback = Lab::restore_with(
         &config,
         &config.store.snapshot_dir("memory-src", "missing-base"),
-        "memory-fallback",
+        "memory-fb",
     )
     .await
     .unwrap();
