@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,12 +90,61 @@ struct SnapshotJob {
     fabric: Option<FabricThawHandle>,
 }
 
+#[derive(Clone)]
 struct SnapshotVm {
     node: String,
     client: FcClient,
     root_dir: PathBuf,
+    cgroup_dir: PathBuf,
     disk_path: Option<PathBuf>,
     memory_mib: u64,
+    memory_limits: crate::jailer::VmMemoryLimits,
+    memory_limit_raised: Arc<AtomicBool>,
+}
+
+async fn write_cgroup_memory_max(
+    lab: &str,
+    cgroup_dir: &Path,
+    limit: &str,
+    operation: &'static str,
+) -> Result<(), LabError> {
+    let path = cgroup_dir.join("memory.max");
+    tokio::fs::write(&path, format!("{limit}\n"))
+        .await
+        .map_err(|source| LabError::Io {
+            lab: lab.to_string(),
+            operation,
+            path,
+            source,
+        })
+}
+
+async fn raise_vm_cgroup_memory(lab: &str, vm: &SnapshotVm) -> Result<(), LabError> {
+    if vm.memory_limits.steady_state != vm.memory_limits.snapshot {
+        write_cgroup_memory_max(
+            lab,
+            &vm.cgroup_dir,
+            &vm.memory_limits.snapshot,
+            "raise cgroup memory limit",
+        )
+        .await?;
+        vm.memory_limit_raised.store(true, Ordering::SeqCst);
+    }
+    Ok(())
+}
+
+async fn restore_vm_cgroup_memory(lab: &str, vm: &SnapshotVm) -> Result<(), LabError> {
+    if vm.memory_limit_raised.load(Ordering::SeqCst) {
+        write_cgroup_memory_max(
+            lab,
+            &vm.cgroup_dir,
+            &vm.memory_limits.steady_state,
+            "restore cgroup memory limit",
+        )
+        .await?;
+        vm.memory_limit_raised.store(false, Ordering::SeqCst);
+    }
+    Ok(())
 }
 
 struct SnapshotExecutionState {
@@ -179,11 +228,35 @@ fn combine_rollback(operation: LabError, cleanup: Option<LabError>) -> LabError 
     }
 }
 
+async fn recover_cgroup_memory_limits(
+    lab_id: &str,
+    vms: &[SnapshotVm],
+    cleanups: &mut Vec<Option<LabError>>,
+) {
+    for vm in vms {
+        if vm.memory_limit_raised.load(Ordering::SeqCst) {
+            tracing::warn!(lab = %lab_id, vm = %vm.node, "snapshot restoring cgroup memory limit on recovery");
+            if let Err(e) = restore_vm_cgroup_memory(lab_id, vm).await {
+                tracing::error!(
+                    lab = %lab_id,
+                    vm = %vm.node,
+                    error = %e,
+                    "failed to restore cgroup memory limit on recovery"
+                );
+                cleanups.push(Some(e));
+            }
+        }
+    }
+}
+
 async fn run_snapshot_recovery(
     job: &SnapshotJob,
     state: &SnapshotExecutionState,
 ) -> Option<LabError> {
     let mut cleanups = Vec::new();
+
+    // Restore cgroup memory limits before resuming VMs so steady-state limits apply.
+    recover_cgroup_memory_limits(&job.lab_id, &job.vms, &mut cleanups).await;
 
     // 1. Recover paused VMs
     let mut resume_ok = true;
@@ -269,6 +342,9 @@ async fn run_snapshot_recovery(
             }
         }
     }
+
+    // 5. Ensure any limits that failed to restore earlier are retried after files are cleaned.
+    recover_cgroup_memory_limits(&job.lab_id, &job.vms, &mut cleanups).await;
 
     combine_cleanups(cleanups)
 }
@@ -425,7 +501,10 @@ async fn run_snapshot_steps(
                 storage_ms,
             ))
         };
+        let vm_ref = vm.clone();
         let handle = tokio::spawn(async move {
+            raise_vm_cgroup_memory(&lab, &vm_ref).await?;
+
             let started_api = Instant::now();
             let params = SnapshotCreateParams::full("/snap.state", "/snap.mem")
                 .with_sync_snapshot_files(false);
@@ -439,12 +518,19 @@ async fn run_snapshot_steps(
             let api_ms = u64::try_from(started_api.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::info!(lab = %lab, vm = %vm_node, api_snapshot_ms = api_ms, "VM snapshot API completed");
             let capture = tokio::task::spawn_blocking(move || capture(api_ms));
-            capture.await.map_err(|source| {
+            let capture_res = capture.await.map_err(|source| {
                 if source.is_panic() {
                     std::panic::resume_unwind(source.into_panic());
                 }
-                LabError::Task { lab, source }
-            })?
+                LabError::Task {
+                    lab: lab.clone(),
+                    source,
+                }
+            })??;
+
+            restore_vm_cgroup_memory(&lab, &vm_ref).await?;
+
+            Ok::<_, LabError>(capture_res)
         });
         storage_handles.push(handle);
     }
@@ -501,6 +587,11 @@ async fn run_snapshot_steps(
 
     if let Some(err) = first_storage_error {
         return Err(err);
+    }
+
+    // Ensure all VM cgroup limits are restored before resume.
+    for vm in &job.vms {
+        restore_vm_cgroup_memory(&job.lab_id, vm).await?;
     }
 
     let snapshot_ms = u64::try_from(started_all.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -755,9 +846,12 @@ pub async fn snapshot_vms(
         vms.push(SnapshotVm {
             client: vm.client().clone(),
             root_dir: vm.paths().root.clone(),
+            cgroup_dir: vm.paths().cgroup_dir.clone(),
             node,
             disk_path,
             memory_mib,
+            memory_limits: vm.memory_limits().clone(),
+            memory_limit_raised: Arc::new(AtomicBool::new(false)),
         });
     }
     let job = SnapshotJob {

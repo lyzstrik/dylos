@@ -328,6 +328,67 @@ pub struct JailerConfig {
     pub launcher_args: Vec<OsString>,
 }
 
+/// Margin added to guest RAM for Firecracker runtime overhead (heap, stacks, mappings, I/O buffers).
+pub const DEFAULT_MEMORY_OVERHEAD_MIB: u64 = 128;
+
+/// Extra margin added during snapshot for memory output headroom (snap.state and serialization buffers).
+pub const SNAPSHOT_MEMORY_HEADROOM_MARGIN_MIB: u64 = 128;
+
+/// Steady-state and snapshot memory limits configured for a VM cgroup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmMemoryLimits {
+    /// Steady-state memory limit in bytes, or `"max"`.
+    pub steady_state: String,
+    /// Temporary memory limit in bytes during snapshot capture, or `"max"`.
+    pub snapshot: String,
+    /// Whether this limit was explicitly overridden by the operator.
+    pub explicit_override: bool,
+}
+
+/// Derives the steady-state and snapshot memory limits for a VM.
+#[must_use]
+pub fn derive_memory_limits(config: &JailerConfig, mem_size_mib: u32) -> VmMemoryLimits {
+    let (steady_state, explicit_override) = if let Some(entry) = config
+        .cgroups
+        .iter()
+        .rev()
+        .find(|c| c.starts_with("memory.max="))
+    {
+        let val = entry.split_once('=').map_or("max", |(_, v)| v);
+        (val.to_string(), true)
+    } else if let Some(bytes) = config.memory_max {
+        (bytes.to_string(), true)
+    } else {
+        let bytes = (u64::from(mem_size_mib) + DEFAULT_MEMORY_OVERHEAD_MIB) * 1024 * 1024;
+        (bytes.to_string(), false)
+    };
+
+    let snapshot = if steady_state == "max" {
+        "max".to_string()
+    } else {
+        let headroom =
+            (u64::from(mem_size_mib) + SNAPSHOT_MEMORY_HEADROOM_MARGIN_MIB) * 1024 * 1024;
+        if let Ok(steady_bytes) = steady_state.parse::<u64>() {
+            format!("{}", steady_bytes + headroom)
+        } else {
+            format!(
+                "{}",
+                (u64::from(mem_size_mib) * 2
+                    + DEFAULT_MEMORY_OVERHEAD_MIB
+                    + SNAPSHOT_MEMORY_HEADROOM_MARGIN_MIB)
+                    * 1024
+                    * 1024
+            )
+        }
+    };
+
+    VmMemoryLimits {
+        steady_state,
+        snapshot,
+        explicit_override,
+    }
+}
+
 impl JailerConfig {
     #[must_use]
     pub fn new(chroot_base_dir: impl Into<PathBuf>, uid: u32, gid: u32) -> Self {
@@ -497,11 +558,11 @@ pub fn jailer_args(
     }
     if !config.cgroups.iter().any(|c| c.starts_with("memory.max=")) {
         // Guest RAM plus 128 MiB for Firecracker's heap, stacks, mappings and I/O buffers.
-        // Promote before arithmetic so even the largest u32 MiB value cannot overflow.
-        let memory = config
-            .memory_max
-            .unwrap_or((u64::from(mem_size_mib) + 128) * 1024 * 1024);
-        flags.push(("--cgroup", format!("memory.max={memory}").into()));
+        let limits = derive_memory_limits(config, mem_size_mib);
+        flags.push((
+            "--cgroup",
+            format!("memory.max={}", limits.steady_state).into(),
+        ));
     }
     for (index, entry) in config.cgroups.iter().enumerate() {
         let property = entry.split_once('=').map(|(property, _)| property);
@@ -572,6 +633,7 @@ impl Drop for Jail {
         if !self.owned {
             return;
         }
+        let _ = std::fs::remove_file(self.paths.cgroup_dir.join("memory.max"));
         let res = ignore_missing(std::fs::remove_dir(&self.paths.cgroup_dir))
             .and_then(|()| ignore_missing(std::fs::remove_dir_all(&self.paths.jail_dir)));
         if let Err(e) = res {
@@ -889,6 +951,7 @@ fn ignore_missing(res: std::io::Result<()>) -> std::io::Result<()> {
 ///
 /// [`Error::Io`] on any failure other than "not found".
 pub async fn remove_jail(paths: &JailPaths) -> Result<()> {
+    let _ = tokio::fs::remove_file(paths.cgroup_dir.join("memory.max")).await;
     let res = tokio::fs::remove_dir(&paths.cgroup_dir).await;
     ignore_missing(res).map_err(io_error(paths, "remove cgroup", &paths.cgroup_dir))?;
     let res = tokio::fs::remove_dir_all(&paths.jail_dir).await;

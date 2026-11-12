@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use dylos_runtime::Error;
 use dylos_runtime::jailer::{
     ChrootFile, JailPaths, JailerConfig, MAX_UNIX_SOCKET_PATH, check_static_firecracker,
-    check_static_firecracker_sync, has_elf_interpreter, jailer_args, prepare_chroot, remove_jail,
-    validate_unix_socket_path,
+    check_static_firecracker_sync, derive_memory_limits, has_elf_interpreter, jailer_args,
+    prepare_chroot, remove_jail, validate_unix_socket_path,
 };
 
 fn config() -> JailerConfig {
@@ -300,6 +300,45 @@ fn explicit_cgroups_override_only_matching_properties_once() {
             .collect();
         assert_eq!(properties.len(), values.len());
     }
+}
+
+#[test]
+fn derive_memory_limits_handles_defaults_and_explicit_overrides() {
+    let mut config = JailerConfig::new("/srv/dylos", 1234, 5678);
+
+    // Default derivation: 256 MiB RAM -> 384 MiB steady-state, 768 MiB snapshot.
+    let limits = derive_memory_limits(&config, 256);
+    assert_eq!(limits.steady_state, "402653184");
+    assert_eq!(limits.snapshot, "805306368");
+    assert!(!limits.explicit_override);
+
+    // Explicit numeric memory_max override: 512 MiB steady-state, 512 + 384 MiB snapshot.
+    config.memory_max = Some(536_870_912);
+    let limits = derive_memory_limits(&config, 256);
+    assert_eq!(limits.steady_state, "536870912");
+    assert_eq!(limits.snapshot, "939524096");
+    assert!(limits.explicit_override);
+
+    // Explicit cgroups memory.max override replaces numeric override.
+    config.cgroups = vec!["memory.max=1073741824".into()];
+    let limits = derive_memory_limits(&config, 256);
+    assert_eq!(limits.steady_state, "1073741824");
+    assert_eq!(limits.snapshot, "1476395008");
+    assert!(limits.explicit_override);
+
+    // Explicit memory.max=max opts out of limit: snapshot stays max.
+    config.cgroups = vec!["memory.max=max".into()];
+    let limits = derive_memory_limits(&config, 256);
+    assert_eq!(limits.steady_state, "max");
+    assert_eq!(limits.snapshot, "max");
+    assert!(limits.explicit_override);
+
+    // Repeated cgroup entries: last one wins.
+    config.cgroups = vec!["memory.max=536870912".into(), "memory.max=805306368".into()];
+    let limits = derive_memory_limits(&config, 256);
+    assert_eq!(limits.steady_state, "805306368");
+    assert_eq!(limits.snapshot, "1207959552");
+    assert!(limits.explicit_override);
 }
 
 #[tokio::test]

@@ -114,6 +114,7 @@ pub struct Vm {
     output_tasks_done: mpsc::Receiver<()>,
     stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
     lines_tx: tokio::sync::broadcast::Sender<String>,
+    memory_limits: jailer::VmMemoryLimits,
 }
 
 /// Validates VM vCPU count and memory size against Firecracker constraints.
@@ -201,19 +202,15 @@ impl Vm {
                     });
                 }
             };
-            let mut child = child;
-            let child_stdin = child
-                .stdin
-                .take()
-                .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
+            let memory_limits = jailer::derive_memory_limits(config, spec.mem_size_mib);
             let mut vm = Self::start(
                 child,
                 jail,
                 spec.timeouts,
                 boot_start,
-                child_stdin,
                 spec.node.clone(),
                 lab.to_owned(),
+                memory_limits,
             );
             if let Err(e) = vm.wait_ready().await {
                 vm.expected_exit.store(true, Ordering::SeqCst);
@@ -235,10 +232,14 @@ impl Vm {
         jail: Jail,
         timeouts: Timeouts,
         boot_start: Instant,
-        child_stdin: Option<Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>>,
         node: String,
         lab: String,
+        memory_limits: jailer::VmMemoryLimits,
     ) -> Self {
+        let child_stdin = child
+            .stdin
+            .take()
+            .map(|s| Arc::new(tokio::sync::Mutex::new(s)));
         let paths = jail.paths().clone();
         let pid = child.id();
         let mut tasks = Vec::new();
@@ -307,7 +308,13 @@ impl Vm {
             output_tasks_done: done_rx,
             stdin: child_stdin,
             lines_tx,
+            memory_limits,
         }
+    }
+
+    #[must_use]
+    pub fn memory_limits(&self) -> &jailer::VmMemoryLimits {
+        &self.memory_limits
     }
 
     #[must_use]

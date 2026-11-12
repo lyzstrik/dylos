@@ -16,7 +16,8 @@ use dylos_core::LabSpec;
 use dylos_core::manifest::SnapshotManifest;
 use dylos_net::LabNetwork;
 use dylos_runtime::{
-    Lab, LabConfig, LabError, SnapshotRequest, SnapshotSlot, Timeouts, Vm, VmSpec, snapshot_vms,
+    Lab, LabConfig, LabError, SnapshotRequest, SnapshotSlot, Timeouts, Vm, VmSpec,
+    jailer::JailerConfig, snapshot_vms,
 };
 use dylos_store::{SnapshotOpener, Store};
 use support::{Mode, Sandbox, StaleSummaryCounters, verify_e2fsck_readonly_output, wait_until};
@@ -96,7 +97,15 @@ impl Parts {
 }
 
 async fn setup_lab(lab_id: &str) -> (Sandbox, Store, LabSpec, Parts) {
-    let sandbox = Sandbox::in_target(Mode::ParallelPause);
+    setup_lab_with_config(lab_id, |_| {}).await
+}
+
+async fn setup_lab_with_config<F>(lab_id: &str, modify: F) -> (Sandbox, Store, LabSpec, Parts)
+where
+    F: FnOnce(&mut JailerConfig),
+{
+    let mut sandbox = Sandbox::in_target(Mode::ParallelPause);
+    modify(&mut sandbox.config);
     let store_dir = sandbox.dir.path().join("labs");
     let image = sandbox.dir.path().join("base_rootfs.ext4");
     fs::write(&image, b"simulated rootfs content").unwrap();
@@ -1606,6 +1615,128 @@ async fn memory_reservation_failure_precedes_pause_and_cleans_all_outputs() {
     assert!(!store.snapshot_dir("reserve-fail", ".staging-snap").exists());
     assert!(!store.snapshot_dir("reserve-fail", "snap").exists());
     lab.teardown().await.unwrap();
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_raises_and_restores_cgroup_memory_limit() {
+    let (sandbox, _store, _spec, lab) = setup_lab("cgroup-raise").await;
+    let root = lab.vms[0].paths().root.clone();
+    let cgroup_mem = lab.vms[0].paths().cgroup_dir.join("memory.max");
+    let expected_snapshot = lab.vms[0].memory_limits().snapshot.clone();
+    let expected_steady = lab.vms[0].memory_limits().steady_state.clone();
+
+    // Stall snapshot API so we can inspect memory.max during the API window.
+    fs::write(root.join("stall-snapshot"), b"").unwrap();
+
+    let task = tokio::spawn(async move {
+        let result = lab.snapshot("snap-cgroup").await;
+        (result, lab)
+    });
+
+    // Wait until Firecracker receives PUT /snapshot/create.
+    wait_until("snapshot started", Duration::from_secs(5), || {
+        root.join("snapshot-started").exists()
+    })
+    .await;
+
+    // During the snapshot API window, memory.max must be raised to provide headroom.
+    let raised = fs::read_to_string(&cgroup_mem).unwrap();
+    assert_eq!(raised.trim(), expected_snapshot);
+
+    // Release the stall.
+    fs::remove_file(root.join("stall-snapshot")).unwrap();
+
+    // Snapshot completes.
+    let (result, mut lab) = task.await.unwrap();
+    result.unwrap();
+
+    // After snapshot completion, memory.max must be restored to steady-state before resume.
+    let restored = fs::read_to_string(&cgroup_mem).unwrap();
+    assert_eq!(restored.trim(), expected_steady);
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_rollback_restores_cgroup_memory_limit_on_failure() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("cgroup-err").await;
+    let vm = &lab.vms[0];
+    let cgroup_mem = vm.paths().cgroup_dir.join("memory.max");
+
+    // Make snapshot API fail on all VMs so rollback triggers without partial capture barrier panic.
+    for vm in &lab.vms {
+        fs::write(vm.paths().root.join("fail-snapshot"), b"").unwrap();
+    }
+
+    let res = lab.snapshot("snap-fail").await;
+    assert!(res.is_err(), "snapshot must fail");
+
+    // On rollback, memory.max must be restored to steady-state limit.
+    let restored = fs::read_to_string(&cgroup_mem).unwrap();
+    assert_eq!(restored.trim(), vm.memory_limits().steady_state);
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_respects_explicit_operator_memory_max_override() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab_with_config("cgroup-override", |cfg| {
+        // Explicit operator override: 512 MiB
+        cfg.memory_max = Some(536_870_912);
+    })
+    .await;
+
+    for vm in &lab.vms {
+        assert!(vm.memory_limits().explicit_override);
+        assert_eq!(vm.memory_limits().steady_state, "536870912");
+    }
+
+    let cgroup_mem = lab.vms[0].paths().cgroup_dir.join("memory.max");
+    let manifest = lab.snapshot("snap-ovr").await.unwrap();
+    assert_eq!(manifest.vms.len(), 3);
+
+    // After snapshot, the operator's explicit override is restored, NOT the default guest RAM + 128 MiB.
+    let restored = fs::read_to_string(&cgroup_mem).unwrap();
+    assert_eq!(restored.trim(), "536870912");
+
+    lab.teardown().await.unwrap();
+    sandbox.assert_no_jail_left();
+}
+
+#[tokio::test]
+async fn snapshot_restore_memory_limit_failure_cannot_fail_silently() {
+    let (sandbox, _store, _spec, mut lab) = setup_lab("cgroup-ro").await;
+    let vm = &lab.vms[0];
+    let cgroup_mem = vm.paths().cgroup_dir.join("memory.max");
+
+    // Pre-create memory.max and make it read-only (mode 0444) so restoring fails.
+    fs::write(&cgroup_mem, b"ro\n").unwrap();
+    let mut perms = fs::metadata(&cgroup_mem).unwrap().permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(&cgroup_mem, perms).unwrap();
+
+    let res = lab.snapshot("snap-ro").await;
+    assert!(
+        res.is_err(),
+        "snapshot must fail when restoring memory limit fails"
+    );
+    let err_str = res.unwrap_err().to_string();
+    assert!(
+        err_str.contains("cgroup memory limit"),
+        "error must mention cgroup memory limit: {err_str}"
+    );
+
+    // Restore permissions so teardown can clean up.
+    if let Ok(meta) = fs::metadata(&cgroup_mem) {
+        let mut perms = meta.permissions();
+        perms.set_mode(0o644);
+        let _ = fs::set_permissions(&cgroup_mem, perms);
+    }
+
     lab.teardown().await.unwrap();
     sandbox.assert_no_jail_left();
 }
