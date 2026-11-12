@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{ErrorKind, Read, Seek, SeekFrom};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Component;
 
 use nix::fcntl::{AtFlags, OFlag, openat};
@@ -351,11 +351,13 @@ impl JailerConfig {
 ///
 /// It is hard-linked when possible, so the chroot shares the inode with `source`: callers pass
 /// per-VM files (disks cloned by `dylos-store`), never a disk shared by several VMs.
+/// Shared kernels must use [`ChrootFile::immutable`] for a private, read-only reflink.
 #[derive(Debug, Clone)]
 pub struct ChrootFile {
     pub source: PathBuf,
     pub name: String,
     pub read_only: bool,
+    private_copy: bool,
 }
 
 impl ChrootFile {
@@ -364,6 +366,7 @@ impl ChrootFile {
             source: source.into(),
             name: name.into(),
             read_only: false,
+            private_copy: false,
         }
     }
 
@@ -373,6 +376,19 @@ impl ChrootFile {
             source: source.into(),
             name: name.into(),
             read_only: true,
+            private_copy: false,
+        }
+    }
+
+    /// A private immutable reflink, owned by the orchestrator rather than the jailer.
+    /// Use for shared boot kernels; the source inode is never linked, chmodded or chowned.
+    #[must_use]
+    pub fn immutable(source: impl Into<PathBuf>, name: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            name: name.into(),
+            read_only: true,
+            private_copy: true,
         }
     }
 
@@ -581,7 +597,8 @@ impl Drop for Jail {
 }
 
 /// Atomically claims the jail directory, then places `files`, the `/run` directory and the
-/// metrics file in it, owned by the jailer uid/gid.
+/// metrics file in it. Writable files are owned by the jailer uid/gid; immutable files
+/// retain orchestrator ownership.
 ///
 /// Everything runs in one blocking task that owns the [`Jail`]: if this future is dropped, the
 /// task still finishes and the jail is removed when its unread result is dropped. On error, only
@@ -744,7 +761,28 @@ fn populate(jail: &Jail, files: &[ChrootFile], uid: u32, gid: u32) -> Result<()>
 fn place_file(paths: &JailPaths, root: &File, file: &ChrootFile) -> Result<File> {
     let metadata = validate_source(paths, file)?;
     let source = open_source(paths, file, &metadata)?;
-    link_source(paths, root, file, source)
+    if file.private_copy {
+        let dest = paths.host_path(&file.jailed_path());
+        let placed = openat(
+            root,
+            file.name.as_str(),
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map(File::from)
+        .map_err(|e| io_error(paths, "create private copy", &dest)(e.into()))?;
+        dylos_store::reflink(&source.file, &placed).map_err(io_error(
+            paths,
+            "reflink required",
+            &dest,
+        ))?;
+        placed
+            .set_permissions(std::fs::Permissions::from_mode(0o444))
+            .map_err(io_error(paths, "protect private copy", &dest))?;
+        Ok(placed)
+    } else {
+        link_source(paths, root, file, source)
+    }
 }
 
 fn validate_source(paths: &JailPaths, file: &ChrootFile) -> Result<std::fs::Metadata> {
@@ -798,7 +836,7 @@ fn open_source<'a>(
             ErrorKind::InvalidInput.into(),
         ));
     }
-    if file.read_only {
+    if file.read_only && !file.private_copy {
         trusted_read_only(&pinned).map_err(io("validate read-only source", &file.source))?;
     }
     Ok(OpenSource {

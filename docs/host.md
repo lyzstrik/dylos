@@ -130,6 +130,11 @@ btrfs filesystem are insufficient: Linux FICLONE can return EXDEV across mounts.
 `lab up` probes actual reflinks before creating lab resources and reports both paths
 when the preflight fails; its unnamed temporary files are automatically removed.
 
+The guest kernel file (`config.kernel`) must also reside on the same
+reflink-capable filesystem and mount as the jail and store directories. Each jail
+receives a mandatory FICLONE reflink of the kernel; preparation fails closed with
+`reflink required` if cloning is unsupported, rather than falling back to a copy.
+
 `DYLOS_LAB_DIR` overrides the default store `target/labs`. The default jail base is
 its sibling `jails` (`target/jails` with CLI defaults), keeping repository images,
 labs and jails together when the repository is on a different mount from `/srv`.

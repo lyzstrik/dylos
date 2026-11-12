@@ -126,6 +126,16 @@ async fn restored_tcp_flows_keep_their_sockets_and_progress() {
         tokio::time::sleep_until(tokio::time::Instant::now() + Duration::from_secs(30)).await;
         let snapshot = config.store.snapshot_dir("src", "tcp");
         let clone = Lab::restore_with(&config, &snapshot, "dst").await.unwrap();
+        for vm in clone.vms() {
+            use std::os::unix::fs::MetadataExt;
+            let published = std::fs::metadata(snapshot.join(&manifest.vms[vm.node()].memory_file.path)).unwrap();
+            let linked = std::fs::metadata(vm.paths().root.join("vm.mem")).unwrap();
+            assert_eq!(published.uid(), 0);
+            assert_eq!(published.mode() & 0o222, 0);
+            assert_ne!(published.uid(), config.jailer.uid);
+            assert_eq!((linked.dev(), linked.ino(), linked.uid(), linked.mode()),
+                (published.dev(), published.ino(), published.uid(), published.mode()));
+        }
         restored = Some(clone);
         let clone = restored.as_mut().unwrap();
         let (source, target) = (original.network().unwrap(), clone.network().unwrap());
