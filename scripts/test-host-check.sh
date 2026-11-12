@@ -20,11 +20,16 @@ BIN
 cat > "$TEST_ROOT/bin/cp" <<'BIN'
 #!/usr/bin/env bash
 set -euo pipefail
+[ "$1" = --reflink=always ] || exit 1
 if [ "${CANCEL_PROBE:-}" = 1 ]; then
     kill -TERM "$PPID"
     exit 1
 fi
 case "$*" in *incompatible*) exit 1 ;; esac
+if [[ "$*" == *'.reflink_probe_kernel.'* ]] &&
+    [[ "${*: -1}" == *"/${KERNEL_FAIL_DEST:-no-match}/"* ]]; then
+    exit 1
+fi
 exec /bin/cp "${@:2}"
 BIN
 cat > "$TEST_ROOT/bin/mktemp" <<'BIN'
@@ -38,7 +43,11 @@ export DYLOS_FC_BIN_DIR="$TEST_ROOT/bin"
 export DYLOS_SYS_MODULE_DIR="$TEST_ROOT/sys/module"
 export DYLOS_KERNEL_MODULE_DIR="$TEST_ROOT/modules/running"
 mkdir -p "$DYLOS_SYS_MODULE_DIR/sch_netem" "$DYLOS_KERNEL_MODULE_DIR"
-unset DYLOS_LAB_DIR DYLOS_IMAGE_DIR DYLOS_IMAGE DYLOS_JAIL_DIR
+unset DYLOS_LAB_DIR DYLOS_IMAGE_DIR DYLOS_IMAGE DYLOS_JAIL_DIR DYLOS_KERNEL
+mkdir -p "$TEST_ROOT/repo/kernels"
+printf 'guest kernel fixture\n' > "$TEST_ROOT/repo/kernels/vmlinux.bin"
+chmod 444 "$TEST_ROOT/repo/kernels/vmlinux.bin"
+kernel_before="$(stat -c '%a:%u:%g:%s:%Y' "$TEST_ROOT/repo/kernels/vmlinux.bin")"
 CHECK_SCRIPT="$TEST_ROOT/repo/scripts/host-check.sh"
 
 assert_clean() {
@@ -66,6 +75,25 @@ assert_result() {
 }
 
 assert_result pass 'default probe succeeds' 'All host prerequisites are met' bash "$CHECK_SCRIPT"
+assert_result pass 'read-only kernel reflinks into jail and store' 'Guest kernel reflink : OK' bash "$CHECK_SCRIPT"
+mkdir -p "$TEST_ROOT/kernel override" "$TEST_ROOT/incompatible/kernel"
+/bin/cp "$TEST_ROOT/repo/kernels/vmlinux.bin" "$TEST_ROOT/kernel override/vmlinux.bin"
+/bin/cp "$TEST_ROOT/repo/kernels/vmlinux.bin" "$TEST_ROOT/incompatible/kernel/vmlinux.bin"
+assert_result pass 'kernel path override accepts spaces' 'Guest kernel reflink : OK' \
+    env DYLOS_KERNEL="$TEST_ROOT/kernel override/vmlinux.bin" bash "$CHECK_SCRIPT"
+assert_result fail 'kernel on incompatible mount fails closed' 'Guest kernel reflink required: cannot clone' \
+    env DYLOS_KERNEL="$TEST_ROOT/incompatible/kernel/vmlinux.bin" bash "$CHECK_SCRIPT"
+for destination in jails labs; do
+    assert_result fail "kernel reflink unsupported in $destination fails closed" 'Guest kernel reflink required: cannot clone' \
+        env KERNEL_FAIL_DEST="$destination" bash "$CHECK_SCRIPT"
+done
+for location in "$TEST_ROOT/missing-kernel" "$TEST_ROOT/repo/kernels"; do
+    assert_result fail 'missing or non-regular kernel rejected' 'Guest kernel is not a readable regular file' \
+        env DYLOS_KERNEL="$location" bash "$CHECK_SCRIPT"
+done
+cmp "$TEST_ROOT/repo/kernels/vmlinux.bin" "$TEST_ROOT/kernel override/vmlinux.bin"
+cmp "$TEST_ROOT/repo/kernels/vmlinux.bin" "$TEST_ROOT/incompatible/kernel/vmlinux.bin"
+test "$kernel_before" = "$(stat -c '%a:%u:%g:%s:%Y' "$TEST_ROOT/repo/kernels/vmlinux.bin")"
 assert_result pass 'loaded netem succeeds without a module tree' 'sch_netem : loaded' \
     env DYLOS_KERNEL_MODULE_DIR="$TEST_ROOT/missing" bash "$CHECK_SCRIPT"
 rmdir "$DYLOS_SYS_MODULE_DIR/sch_netem"
