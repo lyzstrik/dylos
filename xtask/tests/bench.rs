@@ -264,16 +264,17 @@ fn empty_results_make_no_positive_claim() {
         .find(|l| l.contains("address conflict"))
         .unwrap();
     assert!(!conflict.contains("**GO**"), "{conflict}");
-    assert!(conflict.contains("Not evaluated"), "{conflict}");
+    assert!(conflict.contains("Covered by E2E"), "{conflict}");
     assert!(report.contains("Criteria not met or not measured"));
 }
 
 #[test]
-fn passing_report_keeps_lyz27_pending_and_claims_nothing_unmeasured() {
+fn passing_report_references_e2e_and_claims_nothing_unmeasured() {
     let report = render_markdown_report(&passing());
     assert!(report.contains("Overall Spike Verdict:** **PENDING"));
     assert!(report.contains("Every measured criterion passed"));
-    assert!(report.contains("Pending verification in LYZ-27"));
+    assert!(!report.contains("Pending verification in LYZ-27"));
+    assert!(!report.contains("awaiting LYZ-27"));
     assert!(!report.contains("Zero address conflict across concurrent clones:** **GO"));
     assert!(report.contains("end-to-end p95 300.0 ms"));
     assert!(report.contains("amortized p95 400.0 ms/clone"));
@@ -1166,4 +1167,44 @@ fn exhausted_candidates_fail_selection_with_clear_tmp_dir_error() {
     );
 
     fs::remove_dir_all(&ws).unwrap();
+}
+
+#[test]
+fn report_names_e2e_evidence_without_claiming_observed_results() {
+    for results in [empty(), passing()] {
+        let report = render_markdown_report(&results);
+        for (criterion, test) in [
+            (
+                "Dual-stack TCP survivability in 100% clones",
+                "dylos-runtime::reliability_e2e tcp_survives_in_all_ten_clones",
+            ),
+            (
+                "Zero address conflict across concurrent clones",
+                "dylos-runtime::fork_e2e fork_ten_simultaneous_clones_independent_and_isolated",
+            ),
+            (
+                "100 snapshot/fork/destroy cycles without resource leak",
+                "dylos-runtime::reliability_e2e snapshot_fork_down_endurance",
+            ),
+        ] {
+            let line = report
+                .lines()
+                .find(|line| line.contains(criterion))
+                .unwrap();
+            assert!(line.contains("**Covered by E2E**"), "{line}");
+            assert!(line.contains(&format!("`{test}`")), "{line}");
+            assert!(line.contains("`just e2e`"), "{line}");
+            assert!(
+                !line.contains("**PASS**") && !line.contains("**GO**"),
+                "{line}"
+            );
+        }
+        assert!(
+            report.contains(
+                "The overall verdict is computed only from what this benchmark measures."
+            )
+        );
+        assert!(report.contains("this benchmark does not observe their results"));
+        assert!(report.contains("100 cycles by default, 5 in CI"));
+    }
 }

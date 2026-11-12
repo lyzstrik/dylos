@@ -560,7 +560,7 @@ impl BenchResults {
         let failing = self.failing_criteria();
         if failing.is_empty() {
             String::from(
-                "PENDING (measured criteria pass; awaiting LYZ-27 endurance suite and bare-metal reference run)",
+                "PENDING (measured criteria pass; E2E results and bare-metal reference run require separate evaluation)",
             )
         } else {
             format!("NO-GO (not met or not measured: {})", failing.join(", "))
@@ -1788,14 +1788,14 @@ fn conclusion(results: &BenchResults) -> String {
         "This is not the 20-repetition reference run outside CI, so the figures are indicative."
     };
     format!(
-        "{outcome} {scope} The LYZ-27 criteria (dual-stack TCP survivability across clones, 100 snapshot/fork/destroy cycles) are not covered by this report; no go decision is made until they are verified."
+        "{outcome} {scope} The unmeasured criteria are covered by E2E as listed above; this benchmark does not observe their results."
     )
 }
 
 /// Generates the complete Markdown report for docs/bench/spike.md.
 ///
-/// Every verdict and statement is derived from `results`; missing data renders as
-/// "no data" and counts as unmet.
+/// Measured verdicts are derived from `results`; missing data renders as
+/// "no data" and counts as unmet. Unmeasured criteria reference separate E2E tests.
 pub fn render_markdown_report(results: &BenchResults) -> String {
     let host = &results.host;
     let mut out = String::new();
@@ -1809,15 +1809,16 @@ Quantified benchmark results evaluating Dylos technical spike microVM network co
 ## Executive Summary & Verdict
 
 - **Overall Spike Verdict:** **{overall}** ({mode}, {reps} repetitions per measurement)
+- The overall verdict is computed only from what this benchmark measures.
 - **Evaluation against Go Criteria:**
   - **Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **{snapshot}** (p95: {snap_pause_p95} vs target < 1000 ms)
   - **Fork of one clone in under 500 ms (complete fork operation, end-to-end and amortized per clone):** **{fork}** ({forks})
   - **Fabric freeze in under 1 s:** **{freeze}** (p95: {freeze_p95})
   - **Pause confirmation skew in under 100 ms:** **{skew}** (p95: {skew_p95})
   - **Per-clone PSS under 256 MiB once the reading settled:** **{pss}** ({pss_text})
-  - **Dual-stack TCP survivability in 100% clones:** **Pending verification in LYZ-27**
-  - **Zero address conflict across concurrent clones:** **Not evaluated by this benchmark** (clone isolation is exercised by the E2E test `fork_ten_simultaneous_clones_independent_and_isolated`, not by this report)
-  - **100 snapshot/fork/destroy cycles without resource leak:** **Pending verification in LYZ-27**
+  - **Dual-stack TCP survivability in 100% clones:** **Covered by E2E** (`dylos-runtime::reliability_e2e tcp_survives_in_all_ten_clones`; run `just e2e`)
+  - **Zero address conflict across concurrent clones:** **Covered by E2E** (`dylos-runtime::fork_e2e fork_ten_simultaneous_clones_independent_and_isolated`; run `just e2e`)
+  - **100 snapshot/fork/destroy cycles without resource leak:** **Covered by E2E** (`dylos-runtime::reliability_e2e snapshot_fork_down_endurance`; run `just e2e`; 100 cycles by default, 5 in CI)
 
 ## Host Configuration ({mode})
 

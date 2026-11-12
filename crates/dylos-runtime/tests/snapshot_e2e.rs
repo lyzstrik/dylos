@@ -96,7 +96,7 @@ async fn five_vms_snapshot_measurement_and_integrity() {
         .with_test_writer()
         .with_ansi(false)
         .try_init()
-        .unwrap();
+        .ok();
     let bin = prereqs.bin;
     let kernel = prereqs.kernel;
     let image = prereqs.image;
