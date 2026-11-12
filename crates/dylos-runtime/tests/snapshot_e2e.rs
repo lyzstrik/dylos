@@ -663,6 +663,12 @@ async fn successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork
         return;
     };
     let dir = test_tempdir();
+    let trace_path = dir.path().join("capture.log");
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(fs::File::create(&trace_path).unwrap())
+        .try_init()
+        .unwrap();
     let mut jailer = JailerConfig::new(dir.path().join("j"), 65534, 65534);
     jailer.jailer = prereqs.bin.join("jailer");
     jailer.firecracker = prereqs.bin.join("firecracker");
@@ -745,5 +751,8 @@ async fn successive_diffs_preserve_guest_and_boot_memory_across_restore_and_fork
     }
     restored_again.teardown().await.unwrap();
     restored.teardown().await.unwrap();
+    let trace = fs::read_to_string(trace_path).unwrap();
+    assert!(trace.matches("snapshot_type=Diff").count() >= 5, "{trace}");
+    assert!(trace.matches("snapshot_type=Full").count() >= 3, "{trace}");
     original.teardown().await.unwrap();
 }

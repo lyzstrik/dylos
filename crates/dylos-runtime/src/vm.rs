@@ -87,6 +87,9 @@ enum Readiness {
     Failed(Instant),
 }
 
+pub(crate) type SnapshotBaseline =
+    Arc<std::sync::Mutex<Option<(PathBuf, dylos_core::manifest::FileMeta)>>>;
+
 /// A running Firecracker process inside its jail.
 ///
 /// The supervisor task owns the child and the [`Jail`]: whatever the reason the process exits,
@@ -100,8 +103,7 @@ pub struct Vm {
     paths: JailPaths,
     node: String,
     client: FcClient,
-    pub(crate) snapshot_baseline:
-        Arc<std::sync::Mutex<Option<(PathBuf, dylos_core::manifest::FileMeta)>>>,
+    pub(crate) snapshot_baseline: SnapshotBaseline,
     pub(crate) dirty_tracking: Arc<AtomicBool>,
     timeouts: Timeouts,
     signals: mpsc::UnboundedSender<Signal>,

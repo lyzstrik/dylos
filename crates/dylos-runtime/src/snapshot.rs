@@ -96,8 +96,21 @@ struct SnapshotVm {
     root_dir: PathBuf,
     disk_path: Option<PathBuf>,
     memory_mib: u64,
-    baseline: Arc<Mutex<Option<(PathBuf, dylos_core::manifest::FileMeta)>>>,
+    baseline: crate::vm::SnapshotBaseline,
     dirty_tracking: Arc<AtomicBool>,
+}
+
+// Dropping the caller after delivery but before return also invalidates the epoch.
+// Earlier cancellations are cleared again by the run-to-completion sender.
+#[derive(Default)]
+struct SnapshotCancellationGuard(Vec<crate::vm::SnapshotBaseline>);
+
+impl Drop for SnapshotCancellationGuard {
+    fn drop(&mut self) {
+        for baseline in &self.0 {
+            *poisoned(baseline) = None;
+        }
+    }
 }
 
 struct SnapshotExecutionState {
@@ -802,6 +815,7 @@ pub async fn snapshot_vms(
 
     let span = tracing::info_span!("snapshot_lab", lab = %lab_id, snapshot = %snapshot_id);
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let mut cancellation = SnapshotCancellationGuard::default();
     let task_id = {
         // Checking and filling the slot under one lock keeps two concurrent callers from
         // both starting a task.
@@ -812,9 +826,10 @@ pub async fn snapshot_vms(
                 message: "snapshot already in progress".into(),
             });
         }
+        cancellation.0 = job.vms.iter().map(|vm| Arc::clone(&vm.baseline)).collect();
+        let epochs = cancellation.0.clone();
         let handle = tokio::spawn(
             async move {
-                let epochs: Vec<_> = job.vms.iter().map(|vm| Arc::clone(&vm.baseline)).collect();
                 let res = run_snapshot_job(job).await;
                 if result_tx.send(res).is_err() {
                     for baseline in epochs {
@@ -857,6 +872,7 @@ pub async fn snapshot_vms(
     };
     // A later invocation may already own the slot once this task has finished.
     slot.0.lock().await.take_if(|handle| handle.id() == task_id);
+    cancellation.0.clear();
     result
 }
 
