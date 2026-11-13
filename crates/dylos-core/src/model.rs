@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LabSpec {
-    /// Requested policy; enforcement is staged separately from schema support.
-    #[serde(default)]
+    /// Enables strict source authentication unless a segment overrides it.
+    #[serde(default = "default_peer_filtering")]
     pub peer_filtering: bool,
     pub segments: Vec<Segment>,
     pub nodes: Vec<Node>,
@@ -59,4 +59,8 @@ impl LabSpec {
     pub fn peer_filtering_for(&self, segment: &Segment) -> bool {
         segment.peer_filtering.unwrap_or(self.peer_filtering)
     }
+}
+
+const fn default_peer_filtering() -> bool {
+    true
 }

@@ -99,3 +99,16 @@ fn kernel_accepts_rendered_atomic_batch_in_private_namespace() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn missing_policy_prepares_enforcement_by_default() {
+    let yaml = include_str!("fixtures/peer-filter.yaml").replace("peer_filtering: true\n", "");
+    let lab = LabSpec::from_yaml_str(&yaml).unwrap();
+    assert!(lab.peer_filtering);
+    assert!(
+        FabricPlan::new("legacy", &lab)
+            .unwrap()
+            .peer_filter_rules()
+            .is_some()
+    );
+}
