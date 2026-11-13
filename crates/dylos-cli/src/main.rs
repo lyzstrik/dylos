@@ -658,6 +658,9 @@ fn print_human_segments(segments: &dylos_core::diff::SegmentDiff) {
     }
     for changed in &segments.changed {
         print!("    ~ {}:", changed.name.escape_debug());
+        if let Some(ref policy) = changed.peer_filtering {
+            print!(" peer_filtering: {} -> {}", policy.from, policy.to);
+        }
         if let Some(ref ipv6) = changed.ipv6 {
             print!(" ipv6: {} -> {}", ipv6.from, ipv6.to);
         }

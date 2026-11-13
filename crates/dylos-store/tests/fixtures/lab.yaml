@@ -1,3 +1,5 @@
+# Routed sources require an explicit peer-filtering opt-out.
+peer_filtering: false
 # Valid two-segment, dual-stack fixture used as the base of the acceptance tests.
 # Tests derive invalid variants from it by replacing exact substrings, so keep
 # this file stable: changing a line may break tests that edit that line.

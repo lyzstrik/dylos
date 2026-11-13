@@ -995,6 +995,7 @@ const GW_V6_HOST: u16 = 0x64;
 fn build(segs: usize, dual: &[bool], masks: &[u8], v6_len: u8, v4_len: u8) -> LabSpec {
     let segments = (0..segs)
         .map(|s| Segment {
+            peer_filtering: None,
             name: format!("seg{s}"),
             ipv6: format!("fd64:1:{s}::/64").parse().unwrap(),
             ipv4: dual[s].then(|| format!("10.0.{s}.0/24").parse().unwrap()),
@@ -1040,7 +1041,11 @@ fn build(segs: usize, dual: &[bool], masks: &[u8], v6_len: u8, v4_len: u8) -> La
             }
         })
         .collect();
-    LabSpec { nodes, segments }
+    LabSpec {
+        peer_filtering: false,
+        nodes,
+        segments,
+    }
 }
 
 fn valid_spec_with(stack: Stack) -> BoxedStrategy<LabSpec> {

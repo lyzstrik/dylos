@@ -23,6 +23,7 @@ fn topology_diff_segments() {
     let mut spec_b = sample_spec();
     spec_b.segments.retain(|s| s.name != "seg2");
     spec_b.segments.push(Segment {
+        peer_filtering: None,
         name: "seg3".into(),
         ipv6: "2001:db8:3::/64".parse().unwrap(),
         ipv4: None,

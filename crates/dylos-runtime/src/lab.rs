@@ -1343,6 +1343,7 @@ impl Lab {
         validate(
             config,
             &LabSpec {
+                peer_filtering: false,
                 nodes: vec![],
                 segments: vec![],
             },
