@@ -58,6 +58,7 @@ fn create_test_snapshot(dir: &Path, vm_names: &[&str]) -> (SnapshotOpener, Snaps
     }
 
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: LabSpec::from_yaml_str(include_str!("fixtures/verify_lab.yaml")).unwrap(),
         vms,

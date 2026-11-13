@@ -16,6 +16,7 @@ fn manifest_verifies_through_public_descriptor_opener() {
         sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
     };
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: dylos_core::LabSpec::from_yaml_str(include_str!("fixtures/manifest_lab.yaml"))
             .unwrap(),
@@ -72,6 +73,7 @@ fn opener_verify_rejects_undeclared_entries() {
         sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
     };
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: dylos_core::LabSpec::from_yaml_str(include_str!("fixtures/manifest_lab.yaml"))
             .unwrap(),
@@ -150,6 +152,7 @@ fn opener_verify_rejects_symlinked_manifest_and_declared_files() {
         sha256: "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".into(),
     };
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: dylos_core::LabSpec::from_yaml_str(include_str!("fixtures/manifest_lab.yaml"))
             .unwrap(),
