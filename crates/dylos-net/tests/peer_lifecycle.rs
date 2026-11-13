@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used)]
 
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use dylos_core::LabSpec;
 use dylos_net::{FabricPlan, LabNetwork, teardown};
@@ -102,4 +103,174 @@ fn policy_survives_freeze_and_clone_and_teardown_is_idempotent() {
 #[ignore = "requires nft and user/network namespaces; exercised by just e2e"]
 fn peer_filter_lifecycle_e2e() {
     policy_survives_freeze_and_clone_and_teardown_is_idempotent();
+}
+
+fn packets(path: &Path, mode: &str) {
+    let mut child = Command::new("nsenter")
+        .arg(format!("--net={}", path.display()))
+        .args(["python3", "-", mode])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(include_str!("fixtures/peer-packets.py").as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    eprint!("{}", String::from_utf8_lossy(&output.stdout));
+}
+
+#[test]
+fn packet_guards_and_bypasses_survive_freeze_and_clone() {
+    if !sandbox("packet_guards_and_bypasses_survive_freeze_and_clone") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut original = LabNetwork::create(
+            FabricPlan::new("original", &spec).unwrap(),
+            dir.path(),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        let mut clone =
+            LabNetwork::create_frozen(FabricPlan::new("clone", &spec).unwrap(), dir.path(), 0, 0)
+                .await
+                .unwrap();
+        packets(original.netns_path(), "filtered");
+        packets(clone.netns_path(), "frozen");
+        original.freeze().await.unwrap();
+        packets(original.netns_path(), "frozen");
+        original.thaw().await.unwrap();
+        clone.thaw().await.unwrap();
+        packets(original.netns_path(), "filtered");
+        packets(clone.netns_path(), "filtered");
+        let old_plan = original.plan().clone();
+        teardown(&old_plan, dir.path()).await.unwrap();
+        let mut replacement = LabNetwork::create(old_plan, dir.path(), 0, 0)
+            .await
+            .unwrap();
+        original.teardown().await.unwrap();
+        packets(replacement.netns_path(), "filtered");
+        replacement.teardown().await.unwrap();
+        clone.teardown().await.unwrap();
+        spec.peer_filtering = false;
+        let mut unfiltered = LabNetwork::create(
+            FabricPlan::new("unfiltered", &spec).unwrap(),
+            dir.path(),
+            0,
+            0,
+        )
+        .await
+        .unwrap();
+        packets(unfiltered.netns_path(), "unfiltered");
+        unfiltered.teardown().await.unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    });
+}
+
+#[test]
+#[ignore = "requires nft and user/network namespaces; exercised by just e2e"]
+fn peer_filter_packets_e2e() {
+    packet_guards_and_bypasses_survive_freeze_and_clone();
+    cancelled_filtered_creation_rolls_back();
+}
+
+#[test]
+fn rejected_executable_or_failed_atomic_install_leaves_no_fabric() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !sandbox("rejected_executable_or_failed_atomic_install_leaves_no_fabric") {
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let executable = fixture.path().join("nft");
+    std::fs::write(&executable, include_str!("fixtures/nft-install-failure.sh")).unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o555)).unwrap();
+    for candidate in ["/usr/sbin/nft", "/usr/bin/nft"] {
+        if Path::new(candidate).exists() {
+            assert!(
+                Command::new("mount")
+                    .arg("--bind")
+                    .arg(&executable)
+                    .arg(candidate)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+        let plan = FabricPlan::new("failure", &spec).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let error = LabNetwork::create(plan, dir.path(), 0, 0)
+            .await
+            .unwrap_err()
+            .to_string();
+        if std::fs::metadata("/").unwrap().uid() == std::fs::metadata(&executable).unwrap().uid() {
+            assert!(error.contains("exit status: 1"), "{error}");
+        } else {
+            assert!(error.contains("filesystem root owner"), "{error}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    });
+}
+
+#[test]
+#[ignore = "requires nft and user/network namespaces; exercised by just e2e"]
+fn peer_filter_install_failure_e2e() {
+    rejected_executable_or_failed_atomic_install_leaves_no_fabric();
+}
+
+#[test]
+fn cancelled_filtered_creation_rolls_back() {
+    if !sandbox("cancelled_filtered_creation_rolls_back") {
+        return;
+    }
+    let spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+    let plan = FabricPlan::new("cancelled", &spec).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(plan.netns_name());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut creation = Box::pin(LabNetwork::create(plan, dir.path(), 0, 0));
+        std::future::poll_fn(|context| {
+            let _ = creation.as_mut().poll(context);
+            std::task::Poll::Ready(())
+        })
+        .await;
+    });
+    drop(runtime);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cancelled namespace retained"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
