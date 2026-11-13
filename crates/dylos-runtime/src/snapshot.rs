@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use dylos_core::LabSpec;
-use dylos_core::manifest::{SnapshotManifest, StepDurations, VmManifest};
+use dylos_core::manifest::{SnapshotManifest, SnapshotParent, StepDurations, VmManifest};
 use dylos_fc::FcClient;
 use dylos_fc::snapshot::SnapshotCreateParams;
 use dylos_net::{FabricThawHandle, LabNetwork};
@@ -51,6 +51,18 @@ pub struct SnapshotRequest<'a> {
     pub vms: &'a [Vm],
     /// Without a network, the freeze and thaw steps are skipped.
     pub network: Option<&'a LabNetwork>,
+    pub parent: Option<dylos_core::manifest::SnapshotParent>,
+}
+
+impl SnapshotRequest<'_> {
+    fn validate(&self) -> Result<(), LabError> {
+        dylos_core::validate_name(self.snapshot_id, 32)
+            .map_err(|e| LabError::Store(dylos_store::Error::InvalidId(e.to_string())))?;
+        self.parent
+            .as_ref()
+            .map_or(Ok(()), SnapshotParent::validate)?;
+        Ok(())
+    }
 }
 
 /// Holds the run-to-completion snapshot task of one lab; at most one runs at a time.
@@ -90,6 +102,7 @@ struct SnapshotJob {
     store: dylos_store::Store,
     vms: Vec<SnapshotVm>,
     fabric: Option<FabricThawHandle>,
+    parent: Option<dylos_core::manifest::SnapshotParent>,
 }
 
 struct SnapshotVm {
@@ -641,6 +654,7 @@ async fn run_snapshot_steps(
     .unwrap_or(0);
 
     let manifest = SnapshotManifest {
+        parent: job.parent.clone(),
         format_version: 1,
         lab_spec: job.spec.clone(),
         vms: vms_manifest,
@@ -794,9 +808,7 @@ pub async fn snapshot_vms(
 ) -> Result<(SnapshotManifest, SnapshotTimings), LabError> {
     let lab_id = request.lab_id.to_string();
     let snapshot_id = request.snapshot_id;
-    dylos_core::validate_name(snapshot_id, 32)
-        .map_err(|e| LabError::Store(dylos_store::Error::InvalidId(e.to_string())))?;
-
+    request.validate()?;
     let mut vms = Vec::new();
     for vm in request.vms {
         let node = vm.node().to_string();
@@ -828,6 +840,7 @@ pub async fn snapshot_vms(
         store: request.store.clone(),
         vms,
         fabric: request.network.map(LabNetwork::thaw_handle),
+        parent: request.parent,
     };
 
     let span = tracing::info_span!("snapshot_lab", lab = %lab_id, snapshot = %snapshot_id);
@@ -960,6 +973,7 @@ mod tests {
             store: store.clone(),
             vms: vec![],
             fabric: None,
+            parent: None,
         };
         let state = SnapshotExecutionState {
             frozen: AtomicBool::new(false),

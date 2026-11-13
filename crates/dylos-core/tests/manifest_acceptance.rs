@@ -46,6 +46,7 @@ fn durations() -> StepDurations {
 
 fn manifest(vms: BTreeMap<String, VmManifest>) -> SnapshotManifest {
     SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: lab_spec(),
         vms,
