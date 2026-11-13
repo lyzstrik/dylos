@@ -19,6 +19,7 @@ pub mod error;
 pub mod fleet;
 pub mod jailer;
 pub mod lab;
+pub mod lineage;
 pub mod pause;
 pub mod snapshot;
 pub mod vm;

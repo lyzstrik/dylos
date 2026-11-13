@@ -463,3 +463,16 @@ The manifest is serialized JSON validated against version 1 (`format_version: 1`
 
 - Paths are relative to the snapshot directory; absolute paths or paths containing `..` components are rejected.
 - All declared files are checked for matching size and SHA-256 before restoration. Undeclared or extraneous entries in the snapshot directory are strictly rejected.
+
+## `dylos snapshot tree [PATH]`
+
+Print informational snapshot ancestry, indented by generation and identified as
+`LAB/SNAPSHOT`. PATH may be one snapshot, a lab's snapshot directory, or the store's
+`snapshots` directory (the default). A missing directory is an error; an empty
+collection prints nothing. The scan covers the normal `snapshots/LAB/SNAPSHOT`
+layout, excludes staging directories, and rejects symlinks and unreadable entries.
+
+Every discovered snapshot is parsed and its payload verified before output.
+A deleted parent appears as `LAB/SNAPSHOT [missing]`; malformed parents, duplicate
+identities and cycles are errors. Lineage is display-only and is not authenticated
+against a writer of the snapshot directory; see [snapshot lineage](snapshot-lineage.md).

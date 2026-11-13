@@ -18,6 +18,14 @@ no separate index to update, and deletion loses the deleted node's own ancestry.
 Identities are scoped by lab so equal snapshot names in different labs do not
 collide. Duplicate identities and cycles are errors; output order is deterministic.
 
-Runtime recording and CLI discovery are implemented in the stacked follow-up.
+A running lab records the last successfully returned snapshot as its next parent.
+Restored and forked labs initially record the source directory's `LAB/SNAPSHOT`
+identity. Imported snapshots whose directory names are not valid identifiers have
+no recorded origin; restore behavior is unchanged. An operation whose caller is
+cancelled may publish without advancing the in-memory lineage pointer; lineage
+is informational and does not determine snapshot baselines.
+
+`dylos snapshot tree` discovers the normal snapshots layout and verifies payloads
+before rendering. Directory names identify nodes; manifests supply only edges.
 Lineage adds no work between fabric freeze and thaw (ADR-0001), and does not
 change diff snapshot or baseline selection.
