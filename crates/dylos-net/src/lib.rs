@@ -20,6 +20,7 @@ mod error;
 mod fabric;
 mod freeze;
 mod netns;
+mod peer_filter;
 mod plan;
 mod tap;
 

@@ -34,6 +34,7 @@ pub struct FabricPlan {
     lab_id: String,
     bridges: Vec<Bridge>,
     taps: Vec<Tap>,
+    pub(crate) peer_filters: Vec<crate::peer_filter::PeerFilter>,
 }
 
 impl FabricPlan {
@@ -84,6 +85,7 @@ impl FabricPlan {
             });
         }
         let mut taps = Vec::new();
+        let mut peer_filters = Vec::new();
         for node in &spec.nodes {
             for iface in &node.interfaces {
                 let bridge = bridges
@@ -100,6 +102,15 @@ impl FabricPlan {
                     format!("tap-{}-{}", node.name, iface.name),
                     format!("node {:?} interface {:?}", node.name, iface.name),
                 )?;
+                let segment = spec.segments.iter().find(|s| s.name == iface.segment);
+                if segment.is_some_and(|s| spec.peer_filtering_for(s)) {
+                    peer_filters.push(crate::peer_filter::PeerFilter::new(
+                        name.clone(),
+                        dylos_core::guest_net::mac_for_interface(&node.name, &iface.name),
+                        iface.ipv6.addr(),
+                        iface.ipv4.map(|ip| ip.addr()),
+                    ));
+                }
                 taps.push(Tap {
                     node: node.name.clone(),
                     interface: iface.name.clone(),
@@ -112,6 +123,7 @@ impl FabricPlan {
             lab_id: lab_id.to_owned(),
             bridges,
             taps,
+            peer_filters,
         })
     }
 

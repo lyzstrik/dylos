@@ -23,3 +23,9 @@ VLAN/QinQ, unsupported encapsulations and unspecified-source DAD. These
 restrictions reduce workload compatibility; source filtering is not a peer
 communication ACL. Host rule counters and token buckets restart on clone
 creation and are not part of guest snapshot state.
+
+The initial renderer rejects all IPv6 extension headers (including atomic
+fragments), IPv4 header options, and protocols other than TCP, UDP, ICMP,
+ICMPv6 and Ethernet/IPv4 ARP. NDP accepts only optionless NS/NA or a single
+correctly typed link-layer option matching the declared MAC. This bounded
+profile avoids treating unparsed options or extension chains as authenticated.

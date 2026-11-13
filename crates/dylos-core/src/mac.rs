@@ -18,6 +18,11 @@ impl MacAddr {
     }
 
     #[must_use]
+    pub fn octets(self) -> [u8; 6] {
+        self.0
+    }
+
+    #[must_use]
     pub fn is_locally_administered(&self) -> bool {
         self.0[0] & 0b0000_0010 != 0
     }
