@@ -19,10 +19,13 @@ fn sandbox(test: &str) -> bool {
         eprintln!("SKIPPED {test}: unprivileged user namespaces unavailable");
         return false;
     }
+    let binary_dir = tempfile::tempdir().unwrap();
+    let binary = binary_dir.path().join("peer-lifecycle");
+    std::fs::copy(std::env::current_exe().unwrap(), &binary).unwrap();
     assert!(
         Command::new("unshare")
             .arg("-Urmn")
-            .arg(std::env::current_exe().unwrap())
+            .arg(&binary)
             .args([test, "--exact", "--nocapture"])
             .env("DYLOS_PEER_SANDBOX", "1")
             .status()
