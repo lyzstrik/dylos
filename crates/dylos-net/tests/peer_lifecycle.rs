@@ -274,3 +274,113 @@ fn cancelled_filtered_creation_rolls_back() {
     }
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn measure_peer_filter_baseline_and_install_overhead() {
+    if !sandbox("measure_peer_filter_baseline_and_install_overhead") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+        let rendered = FabricPlan::new("measure", &spec)
+            .unwrap()
+            .peer_filter_rules()
+            .unwrap();
+        spec.peer_filtering = false;
+        let dir = tempfile::tempdir().unwrap();
+        let mut net =
+            LabNetwork::create(FabricPlan::new("measure", &spec).unwrap(), dir.path(), 0, 0)
+                .await
+                .unwrap();
+        packets(net.netns_path(), "baseline");
+        let batch = |text: &str| {
+            let started = std::time::Instant::now();
+            let mut child = Command::new("nsenter")
+                .arg(format!("--net={}", net.netns_path().display()))
+                .args(["nft", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            started.elapsed().as_secs_f64() * 1000.0
+        };
+        let mut durations = Vec::new();
+        for _ in 0..20 {
+            durations.push(batch(&rendered));
+            batch("destroy table bridge dylos_peer_filter\n");
+        }
+        durations.sort_by(f64::total_cmp);
+        eprintln!(
+            "install_with_nsenter_ms p50={:.3} p95={:.3} samples=20",
+            durations[10], durations[18]
+        );
+        net.teardown().await.unwrap();
+        spec.peer_filtering = true;
+        let mut durations = Vec::new();
+        for index in 0..20 {
+            let started = std::time::Instant::now();
+            let mut clone = LabNetwork::create_frozen(
+                FabricPlan::new(&format!("clone{index}"), &spec).unwrap(),
+                dir.path(),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+            durations.push(started.elapsed().as_secs_f64() * 1000.0);
+            clone.teardown().await.unwrap();
+        }
+        durations.sort_by(f64::total_cmp);
+        eprintln!(
+            "filtered_frozen_fabric_ms p50={:.3} p95={:.3} samples=20",
+            durations[10], durations[18]
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    });
+}
+
+#[test]
+#[ignore = "requires nft and user/network namespaces; exercised by just e2e"]
+fn peer_filter_measurements_e2e() {
+    measure_peer_filter_baseline_and_install_overhead();
+    independent_packet_byte_and_control_budgets_recover();
+}
+
+#[test]
+fn independent_packet_byte_and_control_budgets_recover() {
+    if !sandbox("independent_packet_byte_and_control_budgets_recover") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for id in ["original", "clone"] {
+            let mut net = LabNetwork::create(FabricPlan::new(id, &spec).unwrap(), dir.path(), 0, 0)
+                .await
+                .unwrap();
+            packets(net.netns_path(), "rates");
+            net.teardown().await.unwrap();
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    });
+}

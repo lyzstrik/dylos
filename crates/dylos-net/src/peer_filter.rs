@@ -46,6 +46,8 @@ impl PeerFilter {
     }
 
     fn render(&self, index: usize, rules: &mut Vec<String>) {
+        rules.push(format!(" chain data{index} {{\n  limit rate over 10000/second burst 1000 packets counter drop\n  limit rate over 10485760 bytes/second burst 1048576 bytes counter drop\n  counter accept\n }}\n"));
+        rules.push(format!(" chain control{index} {{\n  limit rate over 1000/second burst 100 packets counter drop\n  limit rate over 262144 bytes/second burst 32768 bytes counter drop\n  counter accept\n }}\n"));
         let mac = self.mac;
         let sources = format!("{{ {}, {} }}", self.ipv6, self.link_local);
         rules.push(format!(
@@ -73,16 +75,20 @@ impl PeerFilter {
             let prefix = format!(
                 "  ether type ip6 ip6 nexthdr ipv6-icmp ip6 hoplimit 255 icmpv6 type {kind} icmpv6 code 0{target}"
             );
-            rules.push(format!("{prefix} ip6 length 24 counter accept\n"));
-            rules.push(format!("{prefix} ip6 length 32 @th,192,16 0x{option:02x}01 @th,208,48 0x{} counter accept\n", mac.to_string().replace(':', "")));
+            rules.push(format!(
+                "{prefix} ip6 length 24 counter jump control{index}\n"
+            ));
+            rules.push(format!("{prefix} ip6 length 32 @th,192,16 0x{option:02x}01 @th,208,48 0x{} counter jump control{index}\n", mac.to_string().replace(':', "")));
         }
-        rules.push("  ether type ip6 meta l4proto ipv6-icmp icmpv6 type { 1, 2, 3, 4, 128, 129 } counter accept\n".into());
-        rules.push("  ether type ip6 meta l4proto { tcp, udp } counter accept\n".into());
+        rules.push(format!("  ether type ip6 meta l4proto ipv6-icmp icmpv6 type {{ 1, 2, 3, 4 }} counter jump control{index}\n  ether type ip6 meta l4proto ipv6-icmp icmpv6 type {{ 128, 129 }} counter jump data{index}\n"));
+        rules.push(format!(
+            "  ether type ip6 meta l4proto {{ tcp, udp }} counter jump data{index}\n"
+        ));
         if let Some(ip) = self.ipv4 {
             rules.push(format!("  ether type ip ip saddr != {ip} counter drop\n"));
             // No IPv4 options or fragments: neither can obscure a guarded transport header.
-            rules.push("  ether type ip ip hdrlength != 5 counter drop\n  ether type ip ip frag-off & 0x3fff != 0 counter drop\n  ether type ip ip protocol udp udp sport 67 counter drop\n  ether type ip ip protocol { tcp, udp, icmp } counter accept\n".into());
-            rules.push(format!("  ether type arp arp htype 1 arp ptype ip arp hlen 6 arp plen 4 arp operation {{ request, reply }} arp saddr ether {mac} arp saddr ip {ip} counter accept\n"));
+            rules.push(format!("  ether type ip ip hdrlength != 5 counter drop\n  ether type ip ip frag-off & 0x3fff != 0 counter drop\n  ether type ip ip protocol udp udp sport 67 counter drop\n  ether type ip ip protocol {{ tcp, udp, icmp }} counter jump data{index}\n"));
+            rules.push(format!("  ether type arp arp htype 1 arp ptype ip arp hlen 6 arp plen 4 arp operation {{ request, reply }} arp saddr ether {mac} arp saddr ip {ip} counter jump control{index}\n"));
         }
         rules.push("  counter drop\n }\n".into());
     }

@@ -99,6 +99,18 @@ try:
     for fd in fds.values():
         while select.select([fd], [], [], 0)[0]:
             os.read(fd, 65536)
+    if sys.argv[1] == 'baseline':
+        for size in [64, 1514]:
+            packet = bytes(10) + ether(ipv6(udp(payload=bytes(size - 62)), 17))
+            started = time.monotonic()
+            for index in range(10000):
+                os.write(fds['a'], packet)
+                if not select.select([fds['b']], [], [], 5)[0]:
+                    raise AssertionError('baseline receive timeout')
+                os.read(fds['b'], 65536)
+            elapsed = time.monotonic() - started
+            print(f'baseline frame_bytes={size} packets_per_second={10000 / elapsed:.0f} bytes_per_second={10000 * size / elapsed:.0f}', flush=True)
+        sys.exit(0)
     sequence = 0
 
     def expect(packet, allowed=True, source='a'):
@@ -121,6 +133,63 @@ try:
             seen |= received == packet
         assert seen == allowed, f'case {sequence}: expected allowed={allowed}, frame={packet.hex()}'
 
+    if sys.argv[1] == 'rates':
+        def counters(chain):
+            document = json.loads(subprocess.check_output(['nft', '-j', 'list', 'chain', 'bridge', 'dylos_peer_filter', chain]))
+            return [expression['counter'] for item in document['nftables'] if 'rule' in item
+                    for expression in item['rule']['expr'] if 'counter' in expression]
+
+        def drain():
+            for fd in fds.values():
+                while select.select([fd], [], [], 0)[0]:
+                    os.read(fd, 65536)
+
+        def exhaust(chain, source, packet, drop_index, packet_rate, packet_burst, byte_rate, byte_burst):
+            before = counters(chain)
+            started = time.monotonic()
+            deadline = started + 5
+            while True:
+                for _ in range(1000):
+                    os.write(fds[source], bytes(10) + packet)
+                drain()
+                after = counters(chain)
+                if after[drop_index]['packets'] > before[drop_index]['packets']:
+                    break
+                assert time.monotonic() < deadline, f'{chain} never limited traffic'
+            elapsed = time.monotonic() - started
+            accepted = after[2]['packets'] - before[2]['packets']
+            accepted_bytes = after[2]['bytes'] - before[2]['bytes']
+            assert accepted <= packet_burst + packet_rate * elapsed + 8
+            # nft byte buckets include one second of quota plus the configured burst.
+            assert accepted_bytes <= byte_rate + byte_burst + byte_rate * elapsed + 1514
+            print(f'{chain} drops={[entry["packets"] for entry in after[:2]]} accepted={accepted} elapsed={elapsed:.3f}', flush=True)
+
+        small = ether(ipv6(udp(payload=b'ab'), 17))
+        large = ether(ipv6(udp(payload=bytes(1452)), 17, 'fd00::2', 'fd00::1'), source='b')
+        exhaust('data0', 'a', small, 0, 10000, 1000, 10485760, 1048576)
+        # NDP has a separate budget even while this TAP's data bucket is exhausted.
+        control = ether(ipv6(neighbor()))
+        os.write(fds['a'], bytes(10) + control)
+        deadline = time.monotonic() + 5
+        while True:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and select.select([fds['b']], [], [], remaining)[0]
+            if os.read(fds['b'], 65536)[10:] == control:
+                break
+        assert counters('control0')[2]['packets'] > 0
+        assert counters('data1')[2]['packets'] == 0
+        exhaust('data1', 'b', large, 1, 10000, 1000, 10485760, 1048576)
+        exhaust('control0', 'a', control, 0, 1000, 100, 262144, 32768)
+        large_control = ether(ipv6(b'\x01' + bytes(1459), address='fd00::2', target='fd00::1'), source='b')
+        exhaust('control1', 'b', large_control, 1, 1000, 100, 262144, 32768)
+        for chain, source, packet in [('data0', 'a', small), ('data1', 'b', large), ('control0', 'a', control), ('control1', 'b', large_control)]:
+            before = counters(chain)[2]['packets']
+            deadline = time.monotonic() + 5
+            while counters(chain)[2]['packets'] == before:
+                assert time.monotonic() < deadline, f'{chain} never recovered'
+                os.write(fds[source], bytes(10) + packet)
+                drain()
+        sys.exit(0)
     if sys.argv[1] == 'unfiltered':
         expect(ether(ipv6(udp(), 17, address='fd00::99'), hardware=b'\x02' + b'\x99' * 5))
         expect(ether(ipv4(udp(67, 68), 17, address='192.0.2.99'), 0x800))
