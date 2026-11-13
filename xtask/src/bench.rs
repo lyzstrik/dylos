@@ -1513,7 +1513,6 @@ impl Bench<'_> {
         let mut metrics = SnapshotMetrics::default();
         let mut last_snapshot_dir: Option<PathBuf> = None;
         for rep in 1..=self.options.repetitions {
-            self.memory.check()?;
             // Keep the preceding memory image available as the Diff baseline.
             if let Some(obsolete) = obsolete_snapshot_id(rep) {
                 let prev_dir = self.lab_config.store.snapshot_dir("b-src", &obsolete);
@@ -1526,13 +1525,17 @@ impl Bench<'_> {
                     })?;
             }
 
+            self.memory.check()?;
             if self.options.working_set_mib > 0 {
                 let command = working_set_command(self.options.working_set_mib, rep);
-                for node in &self.prereqs.spec.nodes {
-                    self.memory.check()?;
-                    let output = source
-                        .exec(&node.name, &command, Duration::from_secs(120))
-                        .await?;
+                let writes = self
+                    .prereqs
+                    .spec
+                    .nodes
+                    .iter()
+                    .map(|node| source.exec(&node.name, &command, Duration::from_secs(120)));
+                for (node, result) in self.prereqs.spec.nodes.iter().zip(join_all(writes).await) {
+                    let output = result?;
                     if !output.success() {
                         bail!("working set failed on {}: {:?}", node.name, output);
                     }
