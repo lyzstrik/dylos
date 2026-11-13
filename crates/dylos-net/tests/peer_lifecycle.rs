@@ -191,6 +191,7 @@ fn peer_filter_packets_e2e() {
     packet_guards_and_bypasses_survive_freeze_and_clone();
     cancelled_filtered_creation_rolls_back();
     unspecified_dad_is_rejected_even_if_declared_in_the_spec();
+    measure_peer_filter_install_overhead();
 }
 
 #[test]
@@ -296,6 +297,66 @@ fn unspecified_dad_is_rejected_even_if_declared_in_the_spec() {
             .unwrap();
         packets(net.netns_path(), "unspecified");
         net.teardown().await.unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    });
+}
+
+#[test]
+fn measure_peer_filter_install_overhead() {
+    if !sandbox("measure_peer_filter_install_overhead") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut installs = Vec::new();
+        let mut fabrics = Vec::new();
+        for index in 0..20 {
+            let plan = FabricPlan::new(&format!("measure{index}"), &spec).unwrap();
+            let rendered = plan.peer_filter_rules().unwrap();
+            let started = std::time::Instant::now();
+            let mut net = LabNetwork::create_frozen(plan, dir.path(), 0, 0)
+                .await
+                .unwrap();
+            fabrics.push(started.elapsed().as_secs_f64() * 1000.0);
+            let started = std::time::Instant::now();
+            let mut child = Command::new("nsenter")
+                .arg(format!("--net={}", net.netns_path().display()))
+                .args(["nft", "-f", "-"])
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let batch = format!("delete table bridge dylos_peer_filter\n{rendered}");
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(batch.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            installs.push(started.elapsed().as_secs_f64() * 1000.0);
+            net.teardown().await.unwrap();
+        }
+        installs.sort_by(f64::total_cmp);
+        fabrics.sort_by(f64::total_cmp);
+        eprintln!(
+            "install_with_nsenter_ms p50={:.3} p95={:.3} samples=20",
+            installs[10], installs[18]
+        );
+        eprintln!(
+            "filtered_frozen_fabric_ms p50={:.3} p95={:.3} samples=20",
+            fabrics[10], fabrics[18]
+        );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     });
 }
