@@ -106,6 +106,8 @@ try:
         sequence += 1
         target = 'b' if source == 'a' else 'a'
         address, destination = ('fd00::1', 'fd00::2') if source == 'a' else ('fd00::2', 'fd00::1')
+        if sys.argv[1] == 'unspecified':
+            address = locals6[source]
         barrier = ether(ipv6(udp(payload=f'barrier-{sequence}'.encode()), 17,
                               address, destination), source=source)
         os.write(fds[source], bytes(10) + packet)
@@ -121,6 +123,9 @@ try:
             seen |= received == packet
         assert seen == allowed, f'case {sequence}: expected allowed={allowed}, frame={packet.hex()}'
 
+    if sys.argv[1] == 'unspecified':
+        expect(ether(ipv6(neighbor(), address='::')), False)
+        sys.exit(0)
     if sys.argv[1] == 'unfiltered':
         expect(ether(ipv6(udp(), 17, address='fd00::99'), hardware=b'\x02' + b'\x99' * 5))
         expect(ether(ipv4(udp(67, 68), 17, address='192.0.2.99'), 0x800))

@@ -53,6 +53,7 @@ impl PeerFilter {
         ));
         // Accept lists reject VLAN, encapsulation and extension headers, including fragments.
         rules.push("  ether type != { ip6, ip, arp } counter drop\n".into());
+        rules.push("  ether type ip6 ip6 saddr :: counter drop\n".into());
         rules.push(format!(
             "  ether type ip6 ip6 saddr != {sources} counter drop\n"
         ));
