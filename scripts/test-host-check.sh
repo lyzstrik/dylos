@@ -7,6 +7,30 @@ trap 'rm -rf "$TEST_ROOT"' EXIT
 mkdir -p "$TEST_ROOT/repo/scripts" "$TEST_ROOT/repo/labs" "$TEST_ROOT/bin"
 # Only the test copy substitutes the KVM device; production has no test hooks.
 sed "s|/dev/kvm|$TEST_ROOT/kvm|g" "$REPO_ROOT/scripts/host-check.sh" > "$TEST_ROOT/repo/scripts/host-check.sh"
+# Replace the fixed system search only in the private test copy.
+sed -i "s|/usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft|$TEST_ROOT/trusted/nft|" "$TEST_ROOT/repo/scripts/host-check.sh"
+mkdir -p "$TEST_ROOT/trusted"
+cat > "$TEST_ROOT/trusted/nft" <<'BIN'
+#!/usr/bin/env bash
+[ "$#" = 1 ] && [ "$1" = --version ] || exit 99
+[ "${NFT_VERSION_FAIL:-}" != 1 ] || exit 1
+echo "${NFT_VERSION_TEXT:-nftables v1.0.9 (fixture)}"
+BIN
+chmod +x "$TEST_ROOT/trusted/nft"
+cat > "$TEST_ROOT/bin/stat" <<'BIN'
+#!/usr/bin/env bash
+# Simulate trusted system ownership for the private executable and its ancestors.
+case "$2" in
+    %u) echo "${NFT_OWNER:-0}" ;;
+    %a)
+        if [ "${NFT_UNTRUSTED_PATH:-}" = "${*: -1}" ]; then
+            echo 777
+        else
+            echo "${NFT_MODE:-755}"
+        fi ;;
+    *) exec /usr/bin/stat "$@" ;;
+esac
+BIN
 touch "$TEST_ROOT/kvm"
 cat > "$TEST_ROOT/bin/firecracker" <<'BIN'
 #!/usr/bin/env bash
@@ -43,6 +67,11 @@ export DYLOS_FC_BIN_DIR="$TEST_ROOT/bin"
 export DYLOS_SYS_MODULE_DIR="$TEST_ROOT/sys/module"
 export DYLOS_KERNEL_MODULE_DIR="$TEST_ROOT/modules/running"
 mkdir -p "$DYLOS_SYS_MODULE_DIR/sch_netem" "$DYLOS_KERNEL_MODULE_DIR"
+for module in bridge nf_tables nft_limit; do
+    mkdir -p "$DYLOS_SYS_MODULE_DIR/$module"
+done
+export DYLOS_KERNEL_CONFIG="$TEST_ROOT/kernel.config"
+printf '%s\n' 'CONFIG_NF_TABLES_BRIDGE=y' > "$DYLOS_KERNEL_CONFIG"
 unset DYLOS_LAB_DIR DYLOS_IMAGE_DIR DYLOS_IMAGE DYLOS_JAIL_DIR DYLOS_KERNEL
 mkdir -p "$TEST_ROOT/repo/kernels"
 printf 'guest kernel fixture\n' > "$TEST_ROOT/repo/kernels/vmlinux.bin"
@@ -160,4 +189,31 @@ assert_result fail 'derived jail inside labs rejected' 'must not resolve inside 
     env DYLOS_LAB_DIR="$TEST_ROOT/repo/labs/store" bash "$CHECK_SCRIPT"
 assert_result 143 'cancellation terminates and cleans probes' '' \
     env CANCEL_PROBE=1 bash "$CHECK_SCRIPT"
+for module in bridge nf_tables nft_limit; do
+    rmdir "$DYLOS_SYS_MODULE_DIR/$module"
+    assert_result fail "missing $module rejected" "$module unavailable" bash "$CHECK_SCRIPT"
+    printf 'kernel/net/%s.ko\n' "$module" > "$DYLOS_KERNEL_MODULE_DIR/modules.builtin"
+    assert_result pass "builtin $module accepted" "$module : built in" bash "$CHECK_SCRIPT"
+    rm "$DYLOS_KERNEL_MODULE_DIR/modules.builtin"
+    for suffix in ko ko.xz ko.zst ko.gz; do
+        touch "$DYLOS_KERNEL_MODULE_DIR/$module.$suffix"
+        assert_result pass "available $module.$suffix accepted" "$module : available" bash "$CHECK_SCRIPT"
+        rm "$DYLOS_KERNEL_MODULE_DIR/$module.$suffix"
+    done
+    mkdir -p "$DYLOS_SYS_MODULE_DIR/$module"
+done
+printf '%s\n' '# CONFIG_NF_TABLES_BRIDGE is not set' > "$DYLOS_KERNEL_CONFIG"
+assert_result fail 'bridge family disabled rejected' 'lacks CONFIG_NF_TABLES_BRIDGE' bash "$CHECK_SCRIPT"
+printf '%s\n' 'CONFIG_NF_TABLES_BRIDGE=m' > "$DYLOS_KERNEL_CONFIG"
+assert_result pass 'modular bridge family accepted without fictitious module' 'CONFIG_NF_TABLES_BRIDGE : enabled' bash "$CHECK_SCRIPT"
+assert_result fail 'unreadable config rejected' 'Cannot read kernel config' \
+    env DYLOS_KERNEL_CONFIG="$TEST_ROOT/missing-config" bash "$CHECK_SCRIPT"
+assert_result fail 'non-root nft rejected' 'Untrusted nft path' env NFT_OWNER=1000 bash "$CHECK_SCRIPT"
+assert_result fail 'writable nft rejected' 'Untrusted nft path' env NFT_MODE=775 bash "$CHECK_SCRIPT"
+assert_result fail 'writable nft ancestor rejected' 'Untrusted nft path' \
+    env NFT_UNTRUSTED_PATH="$TEST_ROOT/trusted" bash "$CHECK_SCRIPT"
+assert_result fail 'nft version query failure rejected' 'Cannot query nft version' env NFT_VERSION_FAIL=1 bash "$CHECK_SCRIPT"
+assert_result fail 'invalid nft version rejected' 'Unexpected nft version' env NFT_VERSION_TEXT=invalid bash "$CHECK_SCRIPT"
+chmod -x "$TEST_ROOT/trusted/nft"
+assert_result fail 'missing executable nft rejected despite PATH' 'nft binary missing' bash "$CHECK_SCRIPT"
 echo 'PASS: all host-check regression tests'
