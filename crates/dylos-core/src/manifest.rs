@@ -17,6 +17,31 @@ pub struct SnapshotManifest {
     pub host_cpu_model: String,
     pub created_at_unix_ms: u64,
     pub step_durations_ms: StepDurations,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SnapshotParent>,
+}
+
+/// Informational snapshot identity; never a filesystem path or restore dependency.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotParent {
+    pub lab_id: String,
+    pub snapshot: String,
+}
+
+impl SnapshotParent {
+    /// # Errors
+    /// Rejects identifiers that do not follow the lab/snapshot naming rules.
+    pub fn validate(&self) -> Result<(), Error> {
+        for (field, value) in [("lab_id", &self.lab_id), ("snapshot", &self.snapshot)] {
+            crate::validate_name(value, 32).map_err(|reason| Error::InvalidName {
+                path: format!("manifest.parent.{field}"),
+                value: value.clone(),
+                reason,
+            })?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -146,6 +171,8 @@ struct RawSnapshotManifest {
     host_cpu_model: String,
     created_at_unix_ms: u64,
     step_durations_ms: StepDurations,
+    #[serde(default)]
+    parent: Option<SnapshotParent>,
 }
 
 /// A JSON object with a repeated VM name must be rejected: a plain `BTreeMap` would keep
@@ -197,6 +224,7 @@ impl RawSnapshotManifest {
             host_cpu_model: self.host_cpu_model,
             created_at_unix_ms: self.created_at_unix_ms,
             step_durations_ms: self.step_durations_ms,
+            parent: self.parent,
         };
         manifest.validate_paths()?;
         Ok(manifest)
@@ -264,6 +292,9 @@ impl SnapshotManifest {
     ///
     /// Returns [`Error::InvalidPath`] if any file path is absolute or contains parent components.
     pub fn validate_paths(&self) -> Result<(), Error> {
+        if let Some(parent) = &self.parent {
+            parent.validate()?;
+        }
         for (vm_name, vm_manifest) in &self.vms {
             for file in vm_manifest.files() {
                 Self::validate_single_path(vm_name, &file.path)?;
