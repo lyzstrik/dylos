@@ -178,6 +178,14 @@ pub fn validate_lab_path(workspace: &Path, path: &Path) -> anyhow::Result<PathBu
     Ok(resolved)
 }
 
+/// Frame the guest script for the serial exec shell without leaking shell options.
+pub fn working_set_command(mib: u64, repetition: usize) -> String {
+    include_str!("bench-working-set.sh")
+        .trim_end()
+        .replace("WORKING_SET_MIB", &mib.to_string())
+        .replace("SNAPSHOT_REPETITION", &repetition.to_string())
+}
+
 /// Clone private memory is conservatively bounded by all configured guest RAM.
 pub fn preflight_estimate_mib(spec: &LabSpec, options: &BenchOptions) -> anyhow::Result<u64> {
     let mut configured = 0_u64;
@@ -197,13 +205,12 @@ pub fn preflight_estimate_mib(spec: &LabSpec, options: &BenchOptions) -> anyhow:
             .context("working set overflow")?;
     }
     let clones = u64::try_from(options.fork_counts.iter().copied().max().unwrap_or(0))?;
+    let private = configured
+        .checked_mul(clones)
+        .context("clone memory estimate overflow")?;
     resident
         .checked_mul(2)
-        .and_then(|v| {
-            configured
-                .checked_mul(clones)
-                .and_then(|c| v.checked_add(c))
-        })
+        .and_then(|v| v.checked_add(private))
         .and_then(|v| v.checked_add(1024))
         .context("memory estimate overflow")
 }
@@ -1520,9 +1527,7 @@ impl Bench<'_> {
             }
 
             if self.options.working_set_mib > 0 {
-                let command = include_str!("bench-working-set.sh")
-                    .replace("WORKING_SET_MIB", &self.options.working_set_mib.to_string())
-                    .replace("SNAPSHOT_REPETITION", &rep.to_string());
+                let command = working_set_command(self.options.working_set_mib, rep);
                 for node in &self.prereqs.spec.nodes {
                     self.memory.check()?;
                     let output = source

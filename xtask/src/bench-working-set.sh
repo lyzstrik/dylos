@@ -1,3 +1,4 @@
+(
 set -eu
 mkdir -p /mnt/bench-memory
 if [ SNAPSHOT_REPETITION = 1 ]; then
@@ -20,3 +21,4 @@ with path.open('w+b' if first else 'r+b') as f:
         for offset in range(0, end, len(chunk)):
             region[offset:min(offset + len(chunk), end)] = chunk[:min(len(chunk), end - offset)]
 PY
+)

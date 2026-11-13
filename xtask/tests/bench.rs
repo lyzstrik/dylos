@@ -1303,3 +1303,17 @@ fn scale_up_options_paths_and_memory_budget() {
         );
     }
 }
+
+#[test]
+fn working_set_script_fits_serial_exec_framing() {
+    let command = xtask::bench::working_set_command(16, 2);
+    assert!(command.contains("size=16m"));
+    assert!(command.contains("2 == 1"));
+    assert!(!command.contains("WORKING_SET_MIB"));
+    let framed = format!("{{ {command} ; }}; printf '%d' $?");
+    let syntax = Command::new("sh")
+        .args(["-n", "-c", &framed])
+        .output()
+        .unwrap();
+    assert!(syntax.status.success());
+}
