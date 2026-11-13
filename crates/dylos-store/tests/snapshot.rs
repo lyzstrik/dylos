@@ -108,6 +108,7 @@ fn snapshot_clone_disk_save_vm_file_and_manifest_verify() {
     );
 
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: spec,
         vms,
@@ -381,6 +382,7 @@ fn restore_fixture(store: &Store, spec: LabSpec) -> (PathBuf, SnapshotManifest) 
         );
     }
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: spec,
         vms,
@@ -574,6 +576,7 @@ fn staging_with_manifest_cannot_restore_and_publication_is_atomic() {
     let mut snapshot = store.stage_snapshot("lab", "snap").unwrap();
     let staging = snapshot.root().to_owned();
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: spec,
         vms: BTreeMap::new(),
@@ -621,6 +624,7 @@ fn staged_publication_never_replaces_existing_snapshot() {
     let (_temp, store, spec) = setup();
     let mut staging = store.stage_snapshot("lab", "snap").unwrap();
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: spec,
         vms: BTreeMap::new(),

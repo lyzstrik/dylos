@@ -146,6 +146,7 @@ pub struct Lab {
     cleanup_on_drop: bool,
     snapshots: SnapshotSlot,
     restore_latency: Option<Duration>,
+    origin_snapshot: Option<dylos_core::manifest::SnapshotParent>,
 }
 
 impl Lab {
@@ -205,6 +206,7 @@ impl Lab {
                 cleanup_on_drop: true,
                 snapshots: SnapshotSlot::default(),
                 restore_latency: None,
+                origin_snapshot: None,
             };
             let result = lab.bring_up(config, spec, plan, false).await;
             if let Err(operation) = result {
@@ -268,6 +270,7 @@ impl Lab {
             cleanup_on_drop: true,
             snapshots: SnapshotSlot::default(),
             restore_latency: None,
+            origin_snapshot: snapshot_identity(snapshot),
         };
         let started = Instant::now();
         if let Err(operation) = lab
@@ -708,8 +711,14 @@ impl Lab {
             storage: self.storage.as_ref(),
             vms: &self.vms,
             network: self.network.as_ref(),
+            parent: self.origin_snapshot.clone(),
         };
-        crate::snapshot_vms(request, &self.snapshots).await
+        let result = crate::snapshot_vms(request, &self.snapshots).await?;
+        self.origin_snapshot = Some(dylos_core::manifest::SnapshotParent {
+            lab_id: self.id.clone(),
+            snapshot: snapshot_id.into(),
+        });
+        Ok(result)
     }
 
     #[must_use]
@@ -1580,6 +1589,7 @@ impl Drop for Lab {
                 cleanup_on_drop: false,
                 snapshots: self.snapshots.clone(),
                 restore_latency: self.restore_latency,
+                origin_snapshot: self.origin_snapshot.clone(),
             };
             runtime.spawn(async move {
                 if let Err(error) = owned.teardown().await {
@@ -1632,6 +1642,15 @@ async fn create_network(config: &LabConfig, plan: FabricPlan, frozen: bool) -> R
     };
     tracing::info!(duration_ms = started.elapsed().as_millis(), "fabric ready");
     Ok(network)
+}
+
+fn snapshot_identity(path: &Path) -> Option<dylos_core::manifest::SnapshotParent> {
+    let identity = dylos_core::manifest::SnapshotParent {
+        lab_id: path.parent()?.file_name()?.to_str()?.into(),
+        snapshot: path.file_name()?.to_str()?.into(),
+    };
+    identity.validate().ok()?;
+    Some(identity)
 }
 
 // Unprivileged tests only see the initial map and a single-line `unshare -r` map.
