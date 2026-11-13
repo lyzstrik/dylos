@@ -118,6 +118,8 @@ try:
         sequence += 1
         target = 'b' if source == 'a' else 'a'
         address, destination = ('fd00::1', 'fd00::2') if source == 'a' else ('fd00::2', 'fd00::1')
+        if sys.argv[1] == 'unspecified':
+            address = locals6[source]
         barrier = ether(ipv6(udp(payload=f'barrier-{sequence}'.encode()), 17,
                               address, destination), source=source)
         os.write(fds[source], bytes(10) + packet)
@@ -133,6 +135,9 @@ try:
             seen |= received == packet
         assert seen == allowed, f'case {sequence}: expected allowed={allowed}, frame={packet.hex()}'
 
+    if sys.argv[1] == 'unspecified':
+        expect(ether(ipv6(neighbor(), address='::')), False)
+        sys.exit(0)
     if sys.argv[1] == 'rates':
         def counters(chain):
             document = json.loads(subprocess.check_output(['nft', '-j', 'list', 'chain', 'bridge', 'dylos_peer_filter', chain]))

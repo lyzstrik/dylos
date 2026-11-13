@@ -190,6 +190,7 @@ fn packet_guards_and_bypasses_survive_freeze_and_clone() {
 fn peer_filter_packets_e2e() {
     packet_guards_and_bypasses_survive_freeze_and_clone();
     cancelled_filtered_creation_rolls_back();
+    unspecified_dad_is_rejected_even_if_declared_in_the_spec();
 }
 
 #[test]
@@ -381,6 +382,30 @@ fn independent_packet_byte_and_control_budgets_recover() {
             packets(net.netns_path(), "rates");
             net.teardown().await.unwrap();
         }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    });
+}
+
+#[test]
+fn unspecified_dad_is_rejected_even_if_declared_in_the_spec() {
+    if !sandbox("unspecified_dad_is_rejected_even_if_declared_in_the_spec") {
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut spec = LabSpec::from_yaml_str(include_str!("fixtures/peer-filter.yaml")).unwrap();
+        spec.segments[0].ipv6 = "::/0".parse().unwrap();
+        spec.nodes[0].interfaces[0].ipv6 = "::/128".parse().unwrap();
+        spec.validate().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut net = LabNetwork::create(FabricPlan::new("dad", &spec).unwrap(), dir.path(), 0, 0)
+            .await
+            .unwrap();
+        packets(net.netns_path(), "unspecified");
+        net.teardown().await.unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     });
 }
