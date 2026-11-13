@@ -83,6 +83,26 @@ struct Cli {
 enum Commands {
     /// Manage lab environments
     Lab(LabArgs),
+    /// Inspect snapshot lineage
+    Snapshot(SnapshotCommandArgs),
+}
+
+#[derive(Args, Debug)]
+struct SnapshotCommandArgs {
+    #[command(subcommand)]
+    command: SnapshotCommands,
+}
+
+#[derive(Subcommand, Debug)]
+enum SnapshotCommands {
+    /// Print an informational lineage tree
+    Tree(TreeArgs),
+}
+
+#[derive(Args, Debug)]
+struct TreeArgs {
+    /// Snapshot, lab snapshot directory, or snapshots collection (defaults to configured store)
+    path: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -225,6 +245,18 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     match cli.command {
+        Commands::Snapshot(args) => match args.command {
+            SnapshotCommands::Tree(args) => {
+                let path = args
+                    .path
+                    .unwrap_or_else(|| build_base_config().store.base.join("snapshots"));
+                let tree = dylos_runtime::lineage::snapshot_tree(&path)
+                    .await
+                    .with_context(|| format!("failed to read lineage from {}", path.display()))?;
+                print!("{tree}");
+                Ok(())
+            }
+        },
         Commands::Lab(lab_args) => match lab_args.command {
             LabCommands::List => {
                 let config = build_base_config();
