@@ -641,6 +641,7 @@ async fn run_snapshot_steps(
     .unwrap_or(0);
 
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: job.spec.clone(),
         vms: vms_manifest,

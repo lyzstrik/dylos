@@ -16,6 +16,7 @@
 pub mod diff;
 pub mod error;
 pub mod guest_net;
+pub mod lineage;
 pub mod mac;
 pub mod manifest;
 pub mod model;

@@ -77,6 +77,7 @@ fn manifest_strategy() -> impl Strategy<Value = SnapshotManifest> {
         .prop_map(
             |(vms, firecracker_version, host_cpu_model, created_at_unix_ms, step_durations_ms)| {
                 SnapshotManifest {
+                    parent: None,
                     format_version: 1,
                     lab_spec: valid_lab_spec(),
                     vms,
@@ -160,6 +161,7 @@ fn test_verify_integrity() {
     let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
 
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: valid_lab_spec(),
         vms: {
@@ -224,6 +226,7 @@ fn test_verify_validates_paths_first() {
     let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
 
     let mut manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: valid_lab_spec(),
         vms: std::collections::BTreeMap::new(),
@@ -334,6 +337,7 @@ fn test_verify_interrupted() {
     let sha256 = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_string();
 
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: valid_lab_spec(),
         vms: {
