@@ -81,3 +81,13 @@ mismatched verity digests, legacy fallback, reflink consumption, shared memory
 mappings and cleanup. CI logs must compare unchanged snapshot verification and
 fork timings against the baseline. The first PR supplies the decision and
 storage probes; following stacked PRs implement publication and consumption.
+
+## Revision: 2026-11-13 (LYZ-136)
+
+Before sealing, lazily probe a 32 MiB page-sparse file on the first store
+filesystem, including fsync, verity enablement, cache eviction and full comparison.
+Some btrfs kernels accept enablement but return EIO when sparse content is read
+back. Any probe failure disables new sealing process-wide and retains full
+SHA-256 verification; existing declared verity digests still fail closed.
+The probe runs once after thaw, never on restore or fork. Other store devices
+conservatively retain full hashing rather than reuse a different device's success.

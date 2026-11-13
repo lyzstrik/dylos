@@ -181,3 +181,5 @@ labs and jails together when the repository is on a different mount from `/srv`.
 same mount to keep Unix socket paths below 108 bytes. These directories must remain
 operator-controlled and not writable by the jailer uid. Existing labs created with
 `/srv/jailer` need `DYLOS_JAIL_DIR=/srv/jailer` for teardown before switching defaults.
+
+On kernel 7.2.15-zen1, btrfs `no_holes` can return EIO for sealed sparse memory images; a lazy 32 MiB store probe disables new fs-verity sealing on failure and retains full SHA-256 verification.

@@ -673,7 +673,7 @@ impl Snapshot {
             .permissions();
         file.set_permissions(std::fs::Permissions::from_mode(permissions.mode() | 0o200))
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
-        let sealed = verity::enable(&file);
+        let sealed = verity::enable_checked(&file, &self.directory);
         file.set_permissions(permissions)
             .map_err(|e| contextual(&self.root.join(&meta.path), e))?;
         meta.fsverity = sealed.map_err(|e| contextual(&self.root.join(&meta.path), e))?;
