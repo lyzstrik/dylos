@@ -25,7 +25,7 @@ fn policy_inherits_and_segment_overrides_in_both_directions() {
 }
 
 #[test]
-fn old_specs_and_snapshot_specs_keep_protection_inactive_during_rollout() {
+fn old_specs_and_snapshot_specs_enable_filtering_when_policy_is_absent() {
     let lab = spec();
     let mut json = serde_json::to_value(&lab).unwrap();
     json.as_object_mut().unwrap().remove("peer_filtering");
@@ -33,7 +33,13 @@ fn old_specs_and_snapshot_specs_keep_protection_inactive_during_rollout() {
         segment.as_object_mut().unwrap().remove("peer_filtering");
     }
     let restored: LabSpec = serde_json::from_value(json).unwrap();
-    assert!(!restored.peer_filtering);
+    assert!(restored.peer_filtering);
+    assert!(
+        restored
+            .segments
+            .iter()
+            .all(|s| restored.peer_filtering_for(s))
+    );
     assert!(restored.segments.iter().all(|s| s.peer_filtering.is_none()));
 }
 
@@ -71,4 +77,11 @@ fn topology_diff_reports_effective_policy_changes() {
     b.segments[0].peer_filtering = Some(false);
     let diff = dylos_core::diff::TopologyDiff::diff(&a, &b);
     assert_eq!(diff.segments.changed.len(), a.segments.len() - 1);
+}
+
+#[test]
+fn reference_router_keeps_its_explicit_opt_out() {
+    let lab = LabSpec::from_yaml_str(include_str!("../../../labs/abc.yaml")).unwrap();
+    assert!(!lab.peer_filtering);
+    assert!(lab.segments.iter().all(|s| !lab.peer_filtering_for(s)));
 }
