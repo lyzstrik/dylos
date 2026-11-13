@@ -66,6 +66,7 @@ struct Parts {
 impl Parts {
     async fn snapshot(&self, snapshot_id: &str) -> Result<SnapshotManifest, LabError> {
         let request = SnapshotRequest {
+            parent: None,
             lab_id: &self.id,
             snapshot_id,
             spec: &self.spec,

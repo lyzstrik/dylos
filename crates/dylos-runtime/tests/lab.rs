@@ -512,7 +512,19 @@ async fn restore_loads_frozen_then_resumes_and_supervises() {
     let mut source = Lab::up_with(&config, &spec, "src").await.unwrap();
     let manifest = source.snapshot("saved").await.unwrap();
     let snapshot = config.store.snapshot_dir("src", "saved");
-    let lab = Lab::restore_with(&config, &snapshot, "lab").await.unwrap();
+    assert!(manifest.parent.is_none());
+    let mut lab = Lab::restore_with(&config, &snapshot, "lab").await.unwrap();
+    let child = lab.snapshot("child").await.unwrap();
+    let parent = child.parent.unwrap();
+    assert_eq!(
+        (parent.lab_id.as_str(), parent.snapshot.as_str()),
+        ("src", "saved")
+    );
+    let next = lab.snapshot("next").await.unwrap().parent.unwrap();
+    assert_eq!(
+        (next.lab_id.as_str(), next.snapshot.as_str()),
+        ("lab", "child")
+    );
     for vm in lab.vms() {
         let requests = fs::read_to_string(vm.paths().root.join("requests")).unwrap();
         assert!(requests.contains("PUT /snapshot/load "));
@@ -639,16 +651,21 @@ async fn fork_restores_clones_in_parallel_with_deterministic_ids_and_measures_la
     source.snapshot("saved").await.unwrap();
     let snapshot = config.store.snapshot_dir("s", "saved");
 
-    let clones = Lab::fork(&config, &snapshot, "s", 3).await.unwrap();
+    let mut clones = Lab::fork(&config, &snapshot, "s", 3).await.unwrap();
     assert_eq!(clones.len(), 3);
     let node0 = &spec.nodes[0].name;
     let first_mem = clones[0].root().join("vms").join(node0).join("vm.mem");
     let first_ino = fs::metadata(&first_mem).unwrap().ino();
     assert!(fs::metadata(&first_mem).unwrap().permissions().readonly());
 
-    for (i, clone) in clones.iter().enumerate() {
+    for (i, clone) in clones.iter_mut().enumerate() {
         assert_eq!(clone.id(), format!("s-c{}", i + 1));
         assert!(clone.restore_latency().is_some());
+        let parent = clone.snapshot("child").await.unwrap().parent.unwrap();
+        assert_eq!(
+            (parent.lab_id.as_str(), parent.snapshot.as_str()),
+            ("s", "saved")
+        );
         let clone_mem = clone.root().join("vms").join(node0).join("vm.mem");
         assert_eq!(fs::metadata(&clone_mem).unwrap().ino(), first_ino);
         assert!(fs::metadata(&clone_mem).unwrap().permissions().readonly());
