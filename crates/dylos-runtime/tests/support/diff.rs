@@ -61,6 +61,7 @@ pub fn create_test_snapshot(
     }
 
     let manifest = SnapshotManifest {
+        parent: None,
         format_version: 1,
         lab_spec: spec,
         vms,
