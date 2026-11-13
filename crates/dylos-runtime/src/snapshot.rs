@@ -452,7 +452,7 @@ async fn run_snapshot_steps(
         let vm_node = node.clone();
         let capture = move |api_ms| {
             let started = Instant::now();
-            // Disk sync and reflink complete before buffering VM bytes.
+            // Disk sync and reflink complete before isolating VM output.
             let mut disks = Vec::new();
             let mut fsync_ms = 0u64;
             let mut reflink_ms = 0u64;
@@ -462,12 +462,12 @@ async fn run_snapshot_steps(
                 fsync_ms = timings.fsync_ms;
                 reflink_ms = timings.reflink_ms;
             }
-            let state_file = snap.buffer_vm_source(
+            let (state_file, _) = snap.capture_vm_source(
                 dylos_store::VmFileSource::open(&state_src, state_max_bytes)?,
                 &node,
                 "vm.state",
             )?;
-            let memory_file = snap.buffer_vm_source(
+            let (memory_file, _) = snap.capture_vm_source(
                 dylos_store::VmFileSource::open(&mem_src, mem_max_bytes)?,
                 &node,
                 "vm.mem",
@@ -599,7 +599,7 @@ async fn run_snapshot_steps(
     let freeze_to_thaw_ms =
         u64::try_from(started_freeze_to_thaw.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-    // Persist private VM bytes and finalize all captured files only after thaw.
+    // Finalize all captured files only after thaw.
     let snapshot = poisoned(&state.partial_snapshot)
         .take()
         .ok_or_else(|| LabError::Invalid {
@@ -614,8 +614,8 @@ async fn run_snapshot_steps(
             let snapshot = Arc::clone(&snapshot);
             tokio::task::spawn_blocking(move || {
                 let mut vm = VmManifest {
-                    state_file: snapshot.persist_buffered_vm_file(state)?,
-                    memory_file: snapshot.persist_buffered_vm_file(memory)?,
+                    state_file: state,
+                    memory_file: memory,
                     disks,
                 };
                 snapshot.hash_file(&mut vm.state_file)?;

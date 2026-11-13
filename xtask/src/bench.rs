@@ -209,8 +209,7 @@ pub fn preflight_estimate_mib(spec: &LabSpec, options: &BenchOptions) -> anyhow:
         .checked_mul(clones)
         .context("clone memory estimate overflow")?;
     resident
-        .checked_mul(2)
-        .and_then(|v| v.checked_add(private))
+        .checked_add(private)
         .and_then(|v| v.checked_add(1024))
         .context("memory estimate overflow")
 }
@@ -259,7 +258,7 @@ fn lab_summary(spec: &LabSpec, options: &BenchOptions) -> anyhow::Result<String>
         .map(|n| format!("{}: {} MiB", n.name, n.memory))
         .collect();
     Ok(format!(
-        "Lab: {}\n\nVM count: {}; configured RAM: {}; total: {} MiB.\nWorking set: {} MiB per VM; later snapshots rewrite the first 25% (rounded up to a page).\nPeak preflight estimate: {} MiB (2 x resident working set + largest fork count x sum min(configured VM RAM, 160 MiB) + 1024 MiB).\nCapture/buffering share unavailable: SnapshotTimings exposes only aggregate storage and API stages.\n\n",
+        "Lab: {}\n\nVM count: {}; configured RAM: {}; total: {} MiB.\nWorking set: {} MiB per VM; later snapshots rewrite the first 25% (rounded up to a page).\nPeak preflight estimate: {} MiB (1 x resident working set + largest fork count x sum min(configured VM RAM, 160 MiB) + 1024 MiB).\nDisk fsync and reflink are reported separately within storage; VM output isolation uses rename.\n\n",
         options.lab.display(),
         spec.nodes.len(),
         configured.join(", "),
@@ -536,6 +535,8 @@ pub struct SnapshotStages {
     pub pause_ms: MetricSamples,
     pub api_snapshot_ms: MetricSamples,
     pub storage_ms: MetricSamples,
+    pub fsync_ms: MetricSamples,
+    pub reflink_ms: MetricSamples,
     pub resume_ms: MetricSamples,
     pub thaw_ms: MetricSamples,
     pub hash_ms: MetricSamples,
@@ -543,12 +544,14 @@ pub struct SnapshotStages {
 }
 
 impl SnapshotStages {
-    pub fn as_slice(&self) -> [(&'static str, &MetricSamples); 8] {
+    pub fn as_slice(&self) -> [(&'static str, &MetricSamples); 10] {
         [
             ("freeze", &self.freeze_ms),
             ("pause", &self.pause_ms),
             ("API snapshot", &self.api_snapshot_ms),
             ("storage", &self.storage_ms),
+            ("disk fsync (within storage)", &self.fsync_ms),
+            ("disk reflink (within storage)", &self.reflink_ms),
             ("resume", &self.resume_ms),
             ("thaw", &self.thaw_ms),
             ("hashing", &self.hash_ms),
@@ -1449,6 +1452,8 @@ struct SnapshotMetrics {
     skew: MetricSamples,
     api_snapshot: MetricSamples,
     storage: MetricSamples,
+    fsync: MetricSamples,
+    reflink: MetricSamples,
     resume: MetricSamples,
     thaw: MetricSamples,
     freeze_to_thaw: MetricSamples,
@@ -1574,6 +1579,8 @@ impl Bench<'_> {
             metrics.skew.add(skew);
             metrics.api_snapshot.add(api_snapshot);
             metrics.storage.add(storage);
+            metrics.fsync.add(timings.fsync_ms as f64);
+            metrics.reflink.add(timings.reflink_ms as f64);
             metrics.resume.add(resume);
             metrics.thaw.add(thaw);
             metrics.freeze_to_thaw.add(freeze_to_thaw);
@@ -1835,6 +1842,8 @@ async fn measure_into(
             pause_ms: snapshot.pause,
             api_snapshot_ms: snapshot.api_snapshot,
             storage_ms: snapshot.storage,
+            fsync_ms: snapshot.fsync,
+            reflink_ms: snapshot.reflink,
             resume_ms: snapshot.resume,
             thaw_ms: snapshot.thaw,
             hash_ms: snapshot.hash,
@@ -1855,7 +1864,7 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
     let available = available_mib()?;
     if estimate > available {
         bail!(
-            "memory preflight refused: peak estimate {estimate} MiB exceeds MemAvailable {available} MiB (guest + capture = 2 x working set, clones budgeted at min(configured RAM, 160 MiB) per VM, plus 1024 MiB margin)"
+            "memory preflight refused: peak estimate {estimate} MiB exceeds MemAvailable {available} MiB (guest = 1 x working set, clones budgeted at min(configured RAM, 160 MiB) per VM, plus 1024 MiB margin)"
         );
     }
     let parent_dir =
@@ -2124,6 +2133,8 @@ The benchmark uses the lab configuration recorded above (dual-stack IPv6/IPv4 ne
     let stage_pause = stat(Some(&results.snapshot_stages.pause_ms), 1.0, 1, "ms");
     let stage_api = stat(Some(&results.snapshot_stages.api_snapshot_ms), 1.0, 1, "ms");
     let stage_storage = stat(Some(&results.snapshot_stages.storage_ms), 1.0, 1, "ms");
+    let stage_fsync = stat(Some(&results.snapshot_stages.fsync_ms), 1.0, 1, "ms");
+    let stage_reflink = stat(Some(&results.snapshot_stages.reflink_ms), 1.0, 1, "ms");
     let stage_resume = stat(Some(&results.snapshot_stages.resume_ms), 1.0, 1, "ms");
     let stage_thaw = stat(Some(&results.snapshot_stages.thaw_ms), 1.0, 1, "ms");
     let stage_hash = stat(Some(&results.snapshot_stages.hash_ms), 1.0, 1, "ms");
@@ -2140,6 +2151,8 @@ The benchmark uses the lab configuration recorded above (dual-stack IPv6/IPv4 ne
 | Pause | {stage_pause_med} | {stage_pause_p95} | VM pause API |
 | API snapshot | {stage_api_med} | {stage_api_p95} | Memory & state serialization |
 | Storage | {stage_storage_med} | {stage_storage_p95} | Disk reflink & file capture |
+| Disk fsync (within storage) | {stage_fsync_med} | {stage_fsync_p95} | Rootfs writeback |
+| Disk reflink (within storage) | {stage_reflink_med} | {stage_reflink_p95} | Rootfs isolation |
 | Resume | {stage_resume_med} | {stage_resume_p95} | VM resume API |
 | Thaw | {stage_thaw_med} | {stage_thaw_p95} | Network fabric thaw |
 | Hashing | {stage_hash_med} | {stage_hash_p95} | SHA-256 integrity hashing (post-thaw) |
@@ -2153,6 +2166,10 @@ The benchmark uses the lab configuration recorded above (dual-stack IPv6/IPv4 ne
         stage_api_p95 = stage_api.1,
         stage_storage_med = stage_storage.0,
         stage_storage_p95 = stage_storage.1,
+        stage_fsync_med = stage_fsync.0,
+        stage_fsync_p95 = stage_fsync.1,
+        stage_reflink_med = stage_reflink.0,
+        stage_reflink_p95 = stage_reflink.1,
         stage_resume_med = stage_resume.0,
         stage_resume_p95 = stage_resume.1,
         stage_thaw_med = stage_thaw.0,

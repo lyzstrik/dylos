@@ -49,6 +49,29 @@ Lab snapshot sequence (each step completes for all VMs before the next starts; s
 
 **Revision (2026-11-12):** Enable dirty-page tracking at boot and load. The first snapshot after boot uses Diff into a new empty file: untouched guest pages are zero, so the image is self-contained. Later snapshots use Diff over a reflink copy of the VM's last verified published memory image. Restored VMs before their own published baseline, and any failure or uncertainty, require Full. Consume eligibility before capture and advance only after successful publication. The private buffered copy and all six step boundaries above remain unchanged.
 
+**Revision (2026-11-13, LYZ-137):** After Firecracker acknowledges capture, rename
+state and memory outputs into private staging on the same filesystem, then
+transfer ownership to the orchestrator and set mode 0444 through the verified
+source descriptor. Reject hard links and changed source identity, checking again
+after rename and revocation; never chown an unverified replacement. This replaces
+the buffered copy with O(1) metadata work per file; disk fsync and reflink still
+precede resume. Diff-over-baseline preparation and all six barriers are unchanged.
+After thaw, fsync, seal, hash, manifest and publication retain their existing order.
+
+The former copy prevented writes through retained Firecracker descriptors from
+changing captured bytes. Rename and permission changes prevent new jail pathname
+access, but cannot revoke an already open writable descriptor or mapping. A
+compromised Firecracker already controls all bytes of its own snapshot before
+acknowledgement; retained writes therefore add no new content authority for that
+VM. Other VMs remain separated by their chroots (the spike shares a jail uid).
+Publication still requires sealing and hashing, and restore verifies content.
+A retained writer can cause sealing to fail, or race hashing on filesystems
+without verity: availability and the logical coherence of a compromised VM's own
+snapshot remain residual risks. We do not promise a consistent cut for a
+compromised VMM. Inspecting `/proc/<pid>/fd` cannot revoke descriptors or mappings
+or establish absence without races, so no such inspection is added. Trusted
+operator-controlled staging and kernel/filesystem behavior remain prerequisites.
+
 Staging directories are unpublished: restore and fork reject them even if a manifest is already present. Any failure before publication removes staging and recovers paused VMs and the frozen fabric in that order. A failed hash never publishes a snapshot; no partial snapshot may be restored or forked.
 
 Restore sequence: create the namespace and the fabric already frozen, load each VM (`PUT /snapshot/load` without resuming), resume all VMs, then thaw.

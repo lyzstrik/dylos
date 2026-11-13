@@ -215,17 +215,6 @@ pub struct VmFileSource {
     max_bytes: u64,
 }
 
-/// Isolated sparse VM bytes owned until they are persisted after thaw.
-pub struct BufferedVmFile {
-    source_device: u64,
-    destination: File,
-    path: PathBuf,
-    node: String,
-    file_name: String,
-    size: u64,
-    chunks: Vec<(u64, Vec<u8>)>,
-}
-
 impl VmFileSource {
     /// # Errors
     /// Rejects symlinks in any component, non-regular files and files over `max_bytes`.
@@ -473,113 +462,88 @@ impl Snapshot {
         node: &str,
         file_name: &str,
     ) -> Result<(FileMeta, u64), Error> {
-        self.save_vm_source_impl(source, node, file_name, true)
+        self.save_vm_source_impl(source, node, file_name)
     }
 
-    /// Captures an isolated state or memory file without hashing or syncing it.
+    /// Renames acknowledged VM output into staging and revokes jail pathname access.
+    /// Finalize with `hash_file` after thaw. Existing writable descriptors are not revoked.
     /// # Errors
-    /// Enforces the same source and size checks as `save_vm_source`.
+    /// Rejects cross-device moves, hard links, replacements, growth and existing destinations.
     pub fn capture_vm_source(
         &self,
         source: VmFileSource,
         node: &str,
         file_name: &str,
     ) -> Result<(FileMeta, u64), Error> {
-        self.save_vm_source_impl(source, node, file_name, false)
-    }
-
-    /// Captures bounded, private sparse bytes without writing to the filesystem.
-    /// Persist the result after thaw, then finalize it with `hash_file`.
-    /// # Errors
-    /// Rejects invalid names, cross-device sources, read errors and excessive growth.
-    pub fn buffer_vm_source(
-        &self,
-        source: VmFileSource,
-        node: &str,
-        file_name: &str,
-    ) -> Result<BufferedVmFile, Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
         let vm_dir = self.vm_directory(node)?;
         let path = PathBuf::from(format!("vms/{node}/{file_name}"));
         let dest_path = self.root.join(&path);
-        let destination = open(
-            &vm_dir,
-            file_name.as_ref(),
-            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL,
-        )
-        .map_err(|e| contextual(&dest_path, e))?;
-        let fail = |e| {
-            contextual(
-                &dest_path,
-                with_cleanup(e, cleanup_dest(&vm_dir, file_name, &dest_path)),
-            )
-        };
-        if source.meta.dev() != destination.metadata().map_err(fail)?.dev() {
-            return Err(fail(io::Error::from_raw_os_error(libc::EXDEV)));
-        }
-        tracing::info!(node, file_name, created = ?source.meta.created(), modified = ?source.meta.modified(), "snapshot source timestamps");
-        let mut chunks = Vec::new();
-        let size = read_sparse_bounded(&source.file, source.max_bytes, |offset, bytes| {
-            chunks.push((offset, bytes.to_vec()));
-            Ok(())
-        })
-        .map_err(fail)?;
-        safe_unlink_source(&source.dir, &source.name, &source.meta).map_err(fail)?;
-        let source_device = source.meta.dev();
-        drop(source);
-        Ok(BufferedVmFile {
-            source_device,
-            destination,
-            path,
-            node: node.into(),
-            file_name: file_name.into(),
-            size,
-            chunks,
-        })
-    }
-
-    /// Writes private buffered bytes into staging; sync, seal and hash before publication.
-    /// # Errors
-    /// Returns contextual directory, write and cross-device errors; removes partial output.
-    pub fn persist_buffered_vm_file(&self, captured: BufferedVmFile) -> Result<FileMeta, Error> {
-        let BufferedVmFile {
-            source_device,
-            destination: mut file,
-            path,
-            node,
-            file_name,
-            size,
-            chunks,
-        } = captured;
-        let vm_dir = self.vm_directory(&node)?;
-        let dest_path = self.root.join(&path);
-        let write = || -> io::Result<()> {
-            if source_device != file.metadata()?.dev() {
+        let capture = || -> io::Result<u64> {
+            let owner = vm_dir.metadata()?;
+            if source.meta.dev() != owner.dev() {
                 return Err(io::Error::from_raw_os_error(libc::EXDEV));
             }
-            for (offset, bytes) in chunks {
-                file.seek(SeekFrom::Start(offset))?;
-                file.write_all(&bytes)?;
-            }
-            file.set_len(size)?;
-            if file_name == "vm.mem" {
-                file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
-            }
-            Ok(())
+            let verify = |file: &File| -> io::Result<u64> {
+                let meta = file.metadata()?;
+                if meta.dev() != source.meta.dev()
+                    || meta.ino() != source.meta.ino()
+                    || meta.nlink() != 1
+                    || meta.len() > source.max_bytes
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "snapshot source changed or has hard links",
+                    ));
+                }
+                Ok(meta.len())
+            };
+            let current = open(
+                &source.dir,
+                &source.name,
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+            )?;
+            verify(&current)?;
+            renameat2(
+                &source.dir,
+                source.name.as_os_str(),
+                &vm_dir,
+                std::ffi::OsStr::new(file_name),
+                RenameFlags::RENAME_NOREPLACE,
+            )?;
+            let revoke = || -> io::Result<u64> {
+                let moved = open(
+                    &vm_dir,
+                    file_name.as_ref(),
+                    OFlag::O_RDONLY | OFlag::O_NONBLOCK,
+                )?;
+                // Verify the moved entry before chown: a jail-side rename race must
+                // never redirect privileged metadata changes to a replacement inode.
+                verify(&moved)?;
+                nix::unistd::fchown(
+                    &source.file,
+                    Some(nix::unistd::Uid::from_raw(owner.uid())),
+                    Some(nix::unistd::Gid::from_raw(owner.gid())),
+                )?;
+                source
+                    .file
+                    .set_permissions(std::fs::Permissions::from_mode(0o444))?;
+                verify(&source.file)
+            };
+            revoke().map_err(|e| with_cleanup(e, cleanup_dest(&vm_dir, file_name, &dest_path)))
         };
-        write().map_err(|e| {
-            contextual(
-                &dest_path,
-                with_cleanup(e, cleanup_dest(&vm_dir, &file_name, &dest_path)),
-            )
-        })?;
-        Ok(FileMeta {
-            fsverity: None,
-            path,
-            sha256: String::new(),
-            size,
-        })
+        let size = capture().map_err(|e| contextual(&source.path, e))?;
+        drop(source);
+        Ok((
+            FileMeta {
+                fsverity: None,
+                path,
+                sha256: String::new(),
+                size,
+            },
+            0,
+        ))
     }
 
     fn vm_directory(&self, node: &str) -> Result<File, Error> {
@@ -598,7 +562,6 @@ impl Snapshot {
         source: VmFileSource,
         node: &str,
         file_name: &str,
-        hash: bool,
     ) -> Result<(FileMeta, u64), Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
@@ -634,22 +597,13 @@ impl Snapshot {
             ));
         }
 
-        // FICLONE flushes dirty source pages before remapping extents. Deferred
-        // capture uses buffered copy to defer explicit writeback until after thaw.
-        let capture = if hash {
-            reflink(&source_file, &dest_file)
-        } else {
-            copy_bounded(&source_file, &mut dest_file, max_bytes)
-        };
-        match capture {
+        match reflink(&source_file, &dest_file) {
             Ok(()) => {}
-            Err(err) if !hash => return Err(contextual(&dest_path, fail(err))),
             Err(err)
-                if hash
-                    && matches!(
-                        err.raw_os_error(),
-                        Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
-                    ) =>
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EINVAL)
+                ) =>
             {
                 if let Err(copy_err) = copy_bounded(&source_file, &mut dest_file, max_bytes)
                     .and_then(|()| dest_file.sync_all())
@@ -670,18 +624,8 @@ impl Snapshot {
 
         // A reflink clones the current length, so the bound is enforced here as well.
         let t_hash = Instant::now();
-        let (sha256, size) = if hash {
-            compute_file_sha256_and_size(&dest_file, max_bytes)
-        } else {
-            dest_file.metadata().and_then(|meta| {
-                if meta.len() > max_bytes {
-                    Err(io::ErrorKind::InvalidData.into())
-                } else {
-                    Ok((String::new(), meta.len()))
-                }
-            })
-        }
-        .map_err(|e| contextual(&dest_path, fail(e)))?;
+        let (sha256, size) = compute_file_sha256_and_size(&dest_file, max_bytes)
+            .map_err(|e| contextual(&dest_path, fail(e)))?;
         let hash_ms = u64::try_from(t_hash.elapsed().as_millis()).unwrap_or(0);
 
         if file_name == "vm.mem" {
