@@ -70,7 +70,7 @@ is 2.12% of the 500 ms per-clone fork budget. The measurement test reruns
 both timings after rate rules are added and in E2E CI.
 
 With the final rate rules, the same 20-sample local test measured atomic
-installation (including nsenter) at 7.983 ms median / 9.540 ms p95, and full
-filtered frozen-fabric creation at 16.292 ms median / 19.312 ms p95. The
-install p95 is 1.91% of the 500 ms per-clone budget; this does not replace
+installation (including nsenter) at 5.701 ms median / 6.480 ms p95, and full
+filtered frozen-fabric creation at 18.525 ms median / 52.596 ms p95. The
+install p95 is 1.30% of the 500 ms per-clone budget; this does not replace
 the full fork E2E measurement.
