@@ -1,0 +1,24 @@
+peer_filtering: true
+segments:
+  - name: lan
+    ipv6: fd00::/64
+    ipv4: 192.0.2.0/24
+nodes:
+  - name: a
+    image: alpine
+    vcpus: 1
+    memory: 128
+    interfaces:
+      - name: eth0
+        segment: lan
+        ipv6: fd00::1/64
+        ipv4: 192.0.2.1/24
+  - name: b
+    image: alpine
+    vcpus: 1
+    memory: 128
+    interfaces:
+      - name: eth0
+        segment: lan
+        ipv6: fd00::2/64
+        ipv4: 192.0.2.2/24
