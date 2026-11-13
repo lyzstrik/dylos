@@ -1264,11 +1264,17 @@ fn scale_up_options_paths_and_memory_budget() {
     let spec = LabSpec::from_yaml_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(
         preflight_estimate_mib(&spec, &options).unwrap(),
-        2 * 2 * 512 + 2 * 2 * 8192 + 1024
+        2 * 2 * 512 + 2 * 2 * 160 + 1024
     );
     options.working_set_mib = 8192;
     assert!(preflight_estimate_mib(&spec, &options).is_err());
     options.working_set_mib = 0;
+    let mut smaller = spec.clone();
+    smaller.nodes[0].memory = 128;
+    assert_eq!(
+        preflight_estimate_mib(&smaller, &options).unwrap(),
+        2 * (128 + 160) + 1024
+    );
     options.fork_counts = vec![usize::MAX];
     assert!(preflight_estimate_mib(&spec, &options).is_err());
     for bad in ["--lab", "--working-set-mib"] {

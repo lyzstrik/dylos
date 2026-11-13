@@ -186,9 +186,9 @@ pub fn working_set_command(mib: u64, repetition: usize) -> String {
         .replace("SNAPSHOT_REPETITION", &repetition.to_string())
 }
 
-/// Clone private memory is conservatively bounded by all configured guest RAM.
+/// Budget 160 MiB per cloned VM: spike PSS p95 was 149.6 MiB at n=1 (docs/bench/spike.md).
 pub fn preflight_estimate_mib(spec: &LabSpec, options: &BenchOptions) -> anyhow::Result<u64> {
-    let mut configured = 0_u64;
+    let mut clone_private = 0_u64;
     let mut resident = 0_u64;
     for node in &spec.nodes {
         if options.working_set_mib > u64::from(node.memory).saturating_sub(128) {
@@ -199,13 +199,13 @@ pub fn preflight_estimate_mib(spec: &LabSpec, options: &BenchOptions) -> anyhow:
                 node.memory
             );
         }
-        configured += u64::from(node.memory);
+        clone_private += u64::from(node.memory).min(160);
         resident = resident
             .checked_add(options.working_set_mib)
             .context("working set overflow")?;
     }
     let clones = u64::try_from(options.fork_counts.iter().copied().max().unwrap_or(0))?;
-    let private = configured
+    let private = clone_private
         .checked_mul(clones)
         .context("clone memory estimate overflow")?;
     resident
@@ -259,7 +259,7 @@ fn lab_summary(spec: &LabSpec, options: &BenchOptions) -> anyhow::Result<String>
         .map(|n| format!("{}: {} MiB", n.name, n.memory))
         .collect();
     Ok(format!(
-        "Lab: {}\n\nVM count: {}; configured RAM: {}; total: {} MiB.\nWorking set: {} MiB per VM; later snapshots rewrite the first 25% (rounded up to a page).\nPeak preflight estimate: {} MiB (2 x resident working set + largest fork count x configured RAM + 1024 MiB).\nCapture/buffering share unavailable: SnapshotTimings exposes only aggregate storage and API stages.\n\n",
+        "Lab: {}\n\nVM count: {}; configured RAM: {}; total: {} MiB.\nWorking set: {} MiB per VM; later snapshots rewrite the first 25% (rounded up to a page).\nPeak preflight estimate: {} MiB (2 x resident working set + largest fork count x sum min(configured VM RAM, 160 MiB) + 1024 MiB).\nCapture/buffering share unavailable: SnapshotTimings exposes only aggregate storage and API stages.\n\n",
         options.lab.display(),
         spec.nodes.len(),
         configured.join(", "),
@@ -1527,6 +1527,10 @@ impl Bench<'_> {
 
             self.memory.check()?;
             if self.options.working_set_mib > 0 {
+                // The writer runs only in b-src; clones must keep their working-set pages shared.
+                if source.id() != "b-src" {
+                    bail!("working-set writer must never run in a clone");
+                }
                 let command = working_set_command(self.options.working_set_mib, rep);
                 let writes = self
                     .prereqs
@@ -1851,7 +1855,7 @@ pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResult
     let available = available_mib()?;
     if estimate > available {
         bail!(
-            "memory preflight refused: peak estimate {estimate} MiB exceeds MemAvailable {available} MiB (guest + capture = 2 x working set, clones conservatively private at configured RAM, plus 1024 MiB margin)"
+            "memory preflight refused: peak estimate {estimate} MiB exceeds MemAvailable {available} MiB (guest + capture = 2 x working set, clones budgeted at min(configured RAM, 160 MiB) per VM, plus 1024 MiB margin)"
         );
     }
     let parent_dir =
