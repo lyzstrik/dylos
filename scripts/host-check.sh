@@ -28,6 +28,61 @@ else
     fail "netem qdisc unavailable for running kernel $KERNEL_RELEASE: sch_netem is neither loaded, built in, nor available in $KERNEL_MODULE_DIR. A reboot after a kernel upgrade may be needed (see docs/host.md)."
 fi
 
+# Resolve only operator-controlled system locations, never PATH or a LabSpec value.
+echo "==> Checking nftables userspace..."
+NFT_BIN=""
+for candidate in /usr/sbin/nft /usr/bin/nft /sbin/nft /bin/nft; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+        NFT_BIN="$(realpath -e "$candidate")" || fail "Cannot resolve nft binary: $candidate"
+        break
+    fi
+done
+[ -n "$NFT_BIN" ] || fail "nft binary missing from system locations; install nftables (see docs/host.md)."
+trusted_path="$NFT_BIN"
+while :; do
+    owner="$(stat -c '%u' -- "$trusted_path")"
+    mode="$(stat -c '%a' -- "$trusted_path")"
+    if [ "$owner" != 0 ] || (( (8#$mode & 8#022) != 0 )); then
+        fail "Untrusted nft path: $trusted_path must be root-owned and not group/world writable."
+    fi
+    [ "$trusted_path" != / ] || break
+    trusted_path="$(dirname "$trusted_path")"
+done
+NFT_VERSION="$("$NFT_BIN" --version)" || fail "Cannot query nft version at $NFT_BIN."
+[[ "$NFT_VERSION" =~ ^nftables[[:space:]]v[0-9]+\.[0-9]+ ]] || fail "Unexpected nft version at $NFT_BIN: $NFT_VERSION"
+echo "  - nft : $NFT_BIN ($NFT_VERSION)"
+
+# Metadata probes only: even nft --check may trigger kernel module autoload.
+echo "==> Checking native bridge nftables support..."
+for module in bridge nf_tables nft_limit; do
+    if [ -d "$SYS_MODULE_DIR/$module" ]; then
+        echo "  - $module : loaded"
+    elif [ -r "$KERNEL_MODULE_DIR/modules.builtin" ] &&
+        grep -Eq "(^|/)$module\\.ko$" "$KERNEL_MODULE_DIR/modules.builtin"; then
+        echo "  - $module : built in"
+    elif [ -d "$KERNEL_MODULE_DIR" ] &&
+        module_file="$(find "$KERNEL_MODULE_DIR/" -type f -name "$module.ko*" -print -quit)" &&
+        [ -n "$module_file" ]; then
+        echo "  - $module : available ($module_file)"
+    else
+        fail "$module unavailable for running kernel $KERNEL_RELEASE: neither loaded, built in, nor available. Install matching kernel modules or reboot (see docs/host.md)."
+    fi
+done
+# Bridge chain registration is part of nf_tables, not an nf_tables_bridge module.
+KERNEL_CONFIG="${DYLOS_KERNEL_CONFIG:-}"
+if [ -n "$KERNEL_CONFIG" ]; then
+    config_text="$(cat "$KERNEL_CONFIG")" || fail "Cannot read kernel config $KERNEL_CONFIG."
+elif [ -r /proc/config.gz ]; then
+    config_text="$(gzip -cd /proc/config.gz)" || fail "Cannot decompress /proc/config.gz."
+elif [ -r "/boot/config-$KERNEL_RELEASE" ]; then
+    config_text="$(cat "/boot/config-$KERNEL_RELEASE")" || fail "Cannot read running kernel config."
+else
+    fail "Cannot verify CONFIG_NF_TABLES_BRIDGE; expose /proc/config.gz or set DYLOS_KERNEL_CONFIG to the running kernel config (see docs/host.md)."
+fi
+grep -Eq '^CONFIG_NF_TABLES_BRIDGE=(y|m)$' <<< "$config_text" ||
+    fail "Running kernel config lacks CONFIG_NF_TABLES_BRIDGE (see docs/host.md)."
+echo "  - CONFIG_NF_TABLES_BRIDGE : enabled"
+
 # 1. Check /dev/kvm
 echo "==> Checking KVM..."
 [ -e /dev/kvm ] || fail "/dev/kvm does not exist."

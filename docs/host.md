@@ -112,6 +112,44 @@ modules, reboot into the installed kernel and rerun `just host-check`.
 `DYLOS_SYS_MODULE_DIR` and `DYLOS_KERNEL_MODULE_DIR` override the inspected
 directories (the latter defaults to `/lib/modules/$(uname -r)`).
 
+### Native bridge nftables prerequisites
+
+Install the distribution's `nftables` userspace package (`nft --version` must
+report an nftables version). Host-check resolves an executable only from
+`/usr/sbin/nft`, `/usr/bin/nft`, `/sbin/nft`, or `/bin/nft`, canonicalizes it,
+and requires root ownership with no group/world write permission on the binary
+or any ancestor. PATH entries are not trusted. The future enforcement path must
+resolve this trusted absolute path before entering a lab network namespace;
+LabSpec never supplies executable paths or nft source text.
+
+The running kernel must enable `CONFIG_BRIDGE`, `CONFIG_NETFILTER`,
+`CONFIG_NETFILTER_NETLINK`, `CONFIG_NF_TABLES`, `CONFIG_NF_TABLES_BRIDGE`, and
+`CONFIG_NFT_LIMIT`, plus `CONFIG_USER_NS` and `CONFIG_NET_NS` for unprivileged
+namespace tests. Host-check verifies `bridge`, `nf_tables`, and `nft_limit`
+using the loaded/built-in/available pattern above. It also requires
+`CONFIG_NF_TABLES_BRIDGE=y` or `m` in `/proc/config.gz` or
+`/boot/config-$(uname -r)`. `DYLOS_KERNEL_CONFIG` selects an uncompressed config
+for the running kernel when neither default is readable; the operator must
+ensure it matches the running kernel.
+
+There is no separate mandatory `nf_tables_bridge` module: bridge chain
+registration is compiled into `nf_tables`. Modern nf_tables includes the core
+payload, meta, comparison, lookup, and extension-header expressions. Native
+bridge filtering does not require `br_netfilter`, bridge-nf-call-iptables/ip6tables
+sysctls, connection tracking, ebtables, or BPF. `CONFIG_NFT_BRIDGE_META`
+(`nft_meta_bridge`) is only needed for bridge-specific keys such as `ibrname`,
+which the planned TAP `iifname` policy does not use. Counter expressions will
+require counter support if emitted by a future policy.
+
+These are read-only metadata/version probes, not proof of rule installation or
+unprivileged nft access. They do not run `nft --check` (which can autoload
+modules), install rules, load modules, or change sysctls. Install matching kernel
+packages, reboot after a kernel/module mismatch, and have the operator preload
+modules if unprivileged autoload is unavailable. Exact policy acceptance belongs
+to the subsequent namespace enforcement tests. This prerequisite change does
+not activate peer filtering. The Ubuntu 24.04 E2E runner installs `nftables`
+alongside its existing host packages and runs these probes via `just e2e`.
+
 ## End-to-end tests
 End-to-end tests (`just e2e`) require root and `/dev/kvm`. They run automatically in CI on disposable GitHub-hosted runners (`.github/workflows/e2e.yml`). On a developer host, they are run by a human (never run `sudo` inside tests).
 
