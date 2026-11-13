@@ -20,6 +20,7 @@ use std::fs::{self, DirBuilder, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
@@ -39,6 +40,8 @@ const NOBODY_UID_GID: u32 = 65534;
 /// Configuration options for the benchmark run.
 #[derive(Debug, Clone)]
 pub struct BenchOptions {
+    pub lab: PathBuf,
+    pub working_set_mib: u64,
     pub quick: bool,
     pub repetitions: usize,
     pub fork_counts: Vec<usize>,
@@ -50,6 +53,8 @@ pub struct BenchOptions {
 impl Default for BenchOptions {
     fn default() -> Self {
         Self {
+            lab: FIVE_VM_SPEC_PATH.into(),
+            working_set_mib: 0,
             quick: false,
             repetitions: DEFAULT_REPETITIONS_FULL,
             fork_counts: DEFAULT_FORK_COUNTS.to_vec(),
@@ -67,6 +72,14 @@ pub fn parse_bench_args(mut args: impl Iterator<Item = String>) -> anyhow::Resul
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--lab" => options.lab = args.next().context("missing value for --lab")?.into(),
+            "--working-set-mib" => {
+                options.working_set_mib = args
+                    .next()
+                    .context("missing value for --working-set-mib")?
+                    .parse()
+                    .context("invalid --working-set-mib")?;
+            }
             "--quick" => {
                 options.quick = true;
                 if !repetitions_explicit {
@@ -133,11 +146,13 @@ pub fn print_usage() {
     println!(
         "Usage: cargo xtask bench [OPTIONS]\n\
          \n\
-         Runs quantified benchmarks for the Dylos technical spike on a 5-VM lab.\n\
+         Runs quantified benchmarks for the Dylos technical spike on a selected lab.\n\
          Measures cold boot latency, snapshot freeze/pause/total timings, parallel\n\
          clone fork latencies (fork -n 1, 10, 20), and per-clone PSS after it settles.\n\
          \n\
          Options:\n\
+           --lab <PATH>          LabSpec inside repository labs/ (default labs/five.yaml)\n\
+           --working-set-mib <N>  Resident non-zero MiB per guest; rewrite 25% before later snapshots (default 0)\n\
            --quick                Run in reduced mode (default {DEFAULT_REPETITIONS_QUICK} repetitions) for CI verification\n\
            --repetitions <N>      Number of repetitions per measurement (default: {DEFAULT_REPETITIONS_FULL}, or {DEFAULT_REPETITIONS_QUICK} with --quick)\n\
            --fork-counts <LIST>   Comma-separated clone counts to benchmark (default: 1,10,20)\n\
@@ -145,6 +160,113 @@ pub fn print_usage() {
            --tmp-dir <PATH>       Parent for the private run directory (must support reflink; it and its ancestors must be operator-controlled; only the run child is removed)\n\
            -h, --help             Show this help message\n"
     );
+}
+
+/// Resolve symlinks before enforcing the repository labs boundary.
+pub fn validate_lab_path(workspace: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let labs = workspace.join("labs").canonicalize()?;
+    let resolved = workspace
+        .join(path)
+        .canonicalize()
+        .with_context(|| format!("cannot resolve lab {}", path.display()))?;
+    if !resolved.starts_with(labs) || !resolved.is_file() {
+        bail!(
+            "lab must resolve to a file inside repository labs/: {}",
+            resolved.display()
+        );
+    }
+    Ok(resolved)
+}
+
+/// Frame the guest script for the serial exec shell without leaking shell options.
+pub fn working_set_command(mib: u64, repetition: usize) -> String {
+    include_str!("bench-working-set.sh")
+        .trim_end()
+        .replace("WORKING_SET_MIB", &mib.to_string())
+        .replace("SNAPSHOT_REPETITION", &repetition.to_string())
+}
+
+/// Budget 160 MiB per cloned VM: spike PSS p95 was 149.6 MiB at n=1 (docs/bench/spike.md).
+pub fn preflight_estimate_mib(spec: &LabSpec, options: &BenchOptions) -> anyhow::Result<u64> {
+    let mut clone_private = 0_u64;
+    let mut resident = 0_u64;
+    for node in &spec.nodes {
+        if options.working_set_mib > u64::from(node.memory).saturating_sub(128) {
+            bail!(
+                "working set {} MiB leaves less than 128 MiB guest headroom on {} ({} MiB)",
+                options.working_set_mib,
+                node.name,
+                node.memory
+            );
+        }
+        clone_private += u64::from(node.memory).min(160);
+        resident = resident
+            .checked_add(options.working_set_mib)
+            .context("working set overflow")?;
+    }
+    let clones = u64::try_from(options.fork_counts.iter().copied().max().unwrap_or(0))?;
+    let private = clone_private
+        .checked_mul(clones)
+        .context("clone memory estimate overflow")?;
+    resident
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(private))
+        .and_then(|v| v.checked_add(1024))
+        .context("memory estimate overflow")
+}
+
+fn available_mib() -> anyhow::Result<u64> {
+    let info = fs::read_to_string("/proc/meminfo")?;
+    let value = info
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .context("MemAvailable missing from /proc/meminfo")?;
+    Ok(value
+        .split_whitespace()
+        .next()
+        .context("missing MemAvailable value")?
+        .parse::<u64>()?
+        / 1024)
+}
+
+#[derive(Default)]
+struct MemoryWatch {
+    reason: Mutex<Option<String>>,
+    samples: Mutex<String>,
+}
+
+impl MemoryWatch {
+    fn check(&self) -> anyhow::Result<()> {
+        if let Some(reason) = &*self.reason.lock().map_err(|e| anyhow::anyhow!("{e}"))? {
+            bail!("ABORTED: {reason}");
+        }
+        Ok(())
+    }
+
+    fn record(&self, sample: &str) -> anyhow::Result<()> {
+        self.samples
+            .lock()
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .push_str(sample);
+        Ok(())
+    }
+}
+
+fn lab_summary(spec: &LabSpec, options: &BenchOptions) -> anyhow::Result<String> {
+    let configured: Vec<_> = spec
+        .nodes
+        .iter()
+        .map(|n| format!("{}: {} MiB", n.name, n.memory))
+        .collect();
+    Ok(format!(
+        "Lab: {}\n\nVM count: {}; configured RAM: {}; total: {} MiB.\nWorking set: {} MiB per VM; later snapshots rewrite the first 25% (rounded up to a page).\nPeak preflight estimate: {} MiB (2 x resident working set + largest fork count x sum min(configured VM RAM, 160 MiB) + 1024 MiB).\nCapture/buffering share unavailable: SnapshotTimings exposes only aggregate storage and API stages.\n\n",
+        options.lab.display(),
+        spec.nodes.len(),
+        configured.join(", "),
+        spec.nodes.iter().map(|n| u64::from(n.memory)).sum::<u64>(),
+        options.working_set_mib,
+        preflight_estimate_mib(spec, options)?
+    ))
 }
 
 /// Host hardware, kernel, filesystem, and tool configuration.
@@ -407,7 +529,7 @@ impl Row {
     }
 }
 
-/// Detailed stage breakdown for the snapshot operation across all 5 VMs.
+/// Detailed stage breakdown for the snapshot operation across all lab VMs.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStages {
     pub freeze_ms: MetricSamples,
@@ -596,7 +718,7 @@ impl BenchResults {
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = vec![
             Row::new(
-                "Cold boot (5 VMs)",
+                "Cold boot",
                 "baseline",
                 stat(Some(&self.cold_boot_ms), 1.0, 1, "ms"),
                 "INFO",
@@ -614,13 +736,13 @@ impl BenchResults {
                 self.skew_verdict(),
             ),
             Row::new(
-                "Snapshot pause window, freeze to thaw (5 VMs)",
+                "Snapshot pause window, freeze to thaw",
                 "< 1000 ms",
                 stat(Some(&self.snapshot_freeze_to_thaw_ms), 1.0, 1, "ms"),
                 self.snapshot_verdict(),
             ),
             Row::new(
-                "Snapshot total until published (5 VMs)",
+                "Snapshot total until published",
                 "informational",
                 stat(Some(&self.snapshot_total_ms), 1.0, 1, "ms"),
                 if self.snapshot_total_ms.is_empty() {
@@ -678,7 +800,7 @@ struct Prerequisites {
     spec: LabSpec,
 }
 
-fn check_prerequisites() -> anyhow::Result<Prerequisites> {
+fn check_prerequisites(options: &BenchOptions) -> anyhow::Result<Prerequisites> {
     // 1. Must run as root for network namespace, TAP, and jailer chroot
     let is_root = fs::metadata("/proc/self").is_ok_and(|m| {
         use std::os::unix::fs::MetadataExt;
@@ -735,19 +857,11 @@ fn check_prerequisites() -> anyhow::Result<Prerequisites> {
         );
     }
 
-    // 6. 5-VM spec
-    let spec_file = workspace.join(FIVE_VM_SPEC_PATH);
+    let spec_file = validate_lab_path(&workspace, &options.lab)?;
     let spec_content = fs::read_to_string(&spec_file)
         .with_context(|| format!("cannot read {}", spec_file.display()))?;
     let spec = LabSpec::from_yaml_str(&spec_content)
         .with_context(|| format!("invalid LabSpec in {}", spec_file.display()))?;
-    if spec.nodes.len() != 5 {
-        bail!(
-            "expected 5 nodes in {}, found {}",
-            spec_file.display(),
-            spec.nodes.len()
-        );
-    }
 
     Ok(Prerequisites {
         workspace,
@@ -1347,13 +1461,15 @@ struct Bench<'a> {
     options: &'a BenchOptions,
     prereqs: &'a Prerequisites,
     lab_config: LabConfig,
+    memory: &'a MemoryWatch,
 }
 
 impl Bench<'_> {
     async fn cold_boot(&self, failures: &mut Vec<anyhow::Error>) -> anyhow::Result<MetricSamples> {
-        println!("--- [1/3] Benchmarking Cold Boot Time (5 VMs, 256 MiB each) ---");
+        println!("--- [1/3] Benchmarking Cold Boot Time ---");
         let mut cold_boot_ms = MetricSamples::new();
         for rep in 1..=self.options.repetitions {
+            self.memory.check()?;
             let start = Instant::now();
             let mut lab = Lab::up_with(
                 &self.lab_config,
@@ -1377,12 +1493,15 @@ impl Bench<'_> {
                 );
                 bail!("cold boot teardown failed on repetition {rep}");
             }
+            self.memory
+                .record(&format!("Cold boot {rep}: {ms:.1} ms\n"))?;
         }
         println!(
             "Cold boot summary: median = {:.1} ms, p95 = {:.1} ms\n",
             cold_boot_ms.median(),
             cold_boot_ms.p95()
         );
+        self.memory.check()?;
         Ok(cold_boot_ms)
     }
 
@@ -1406,6 +1525,27 @@ impl Bench<'_> {
                     })?;
             }
 
+            self.memory.check()?;
+            if self.options.working_set_mib > 0 {
+                // The writer runs only in b-src; clones must keep their working-set pages shared.
+                if source.id() != "b-src" {
+                    bail!("working-set writer must never run in a clone");
+                }
+                let command = working_set_command(self.options.working_set_mib, rep);
+                let writes = self
+                    .prereqs
+                    .spec
+                    .nodes
+                    .iter()
+                    .map(|node| source.exec(&node.name, &command, Duration::from_secs(120)));
+                for (node, result) in self.prereqs.spec.nodes.iter().zip(join_all(writes).await) {
+                    let output = result?;
+                    if !output.success() {
+                        bail!("working set failed on {}: {:?}", node.name, output);
+                    }
+                }
+            }
+            self.memory.check()?;
             let snap_id = format!("snap-{rep}");
             let (_manifest, timings) = source
                 .snapshot_with_timings(&snap_id)
@@ -1423,6 +1563,11 @@ impl Bench<'_> {
             let manifest = timings.manifest_ms as f64;
             let total = timings.total_ms as f64;
 
+            self.memory.record(&format!(
+                "Snapshot {rep}: pause {} ms, total {} ms\n",
+                timings.freeze_to_thaw_ms, timings.total_ms
+            ))?;
+            self.memory.check()?;
             metrics.captures.push(timings.capture_counts);
             metrics.freeze.add(freeze);
             metrics.pause.add(pause);
@@ -1478,6 +1623,7 @@ impl Bench<'_> {
             let mut unsettled = 0;
 
             for rep in 1..=self.options.repetitions {
+                self.memory.check()?;
                 let clone_ids = Lab::generate_clone_ids(&format!("f-n{count}-r{rep}"), count)
                     .with_context(|| format!("could not generate {count} clone ids"))?;
 
@@ -1495,10 +1641,19 @@ impl Bench<'_> {
                 wall.add(wall_ms);
                 amortized.add(wall_ms / count as f64);
 
-                let readings = measure_clones(&clones).await;
+                let readings = if self.memory.check().is_ok() {
+                    measure_clones(&clones).await
+                } else {
+                    Err(anyhow::anyhow!(
+                        "ABORTED: memory monitor requested teardown"
+                    ))
+                };
                 let teardown_failures = teardown_clones(&mut clones).await;
                 let torn_down = teardown_failures.is_empty();
                 failures.extend(teardown_failures);
+                self.memory
+                    .record(&format!("Fork n={count} rep={rep}: {wall_ms:.1} ms\n"))?;
+                self.memory.check()?;
                 let readings = readings?;
                 if !torn_down {
                     bail!("clone teardown failed for n={count} on repetition {rep}");
@@ -1549,6 +1704,7 @@ impl Bench<'_> {
                 )
             })?;
         let result = async {
+            self.memory.check()?;
             let (snapshot, snapshot_dir) = self.snapshots(&mut source).await?;
             // Keep the source quiet so it does not consume CPU during fork measurements.
             source
@@ -1602,9 +1758,10 @@ async fn measure(
     options: &BenchOptions,
     prereqs: &Prerequisites,
     run_dir: PathBuf,
+    memory: &MemoryWatch,
 ) -> PhaseOutcome<BenchResults> {
     let mut teardown_failures = Vec::new();
-    let result = measure_into(options, prereqs, &run_dir, &mut teardown_failures).await;
+    let result = measure_into(options, prereqs, &run_dir, &mut teardown_failures, memory).await;
     PhaseOutcome {
         result,
         teardown_failures,
@@ -1616,6 +1773,7 @@ async fn measure_into(
     prereqs: &Prerequisites,
     run_dir: &Path,
     failures: &mut Vec<anyhow::Error>,
+    memory: &MemoryWatch,
 ) -> anyhow::Result<BenchResults> {
     validate_bench_socket_path(run_dir, options, &prereqs.spec, &prereqs.fc_bin)?;
 
@@ -1655,6 +1813,7 @@ async fn measure_into(
         options,
         prereqs,
         lab_config,
+        memory,
     };
 
     let cold_boot_ms = bench.cold_boot(failures).await?;
@@ -1691,16 +1850,72 @@ async fn measure_into(
 
 /// Executes the full benchmark suite.
 pub async fn run_benchmarks(options: BenchOptions) -> anyhow::Result<BenchResults> {
-    let prereqs = check_prerequisites()?;
+    let prereqs = check_prerequisites(&options)?;
+    let estimate = preflight_estimate_mib(&prereqs.spec, &options)?;
+    let available = available_mib()?;
+    if estimate > available {
+        bail!(
+            "memory preflight refused: peak estimate {estimate} MiB exceeds MemAvailable {available} MiB (guest + capture = 2 x working set, clones budgeted at min(configured RAM, 160 MiB) per VM, plus 1024 MiB margin)"
+        );
+    }
     let parent_dir =
         resolve_bench_parent(&prereqs.workspace, &options, &prereqs.spec, &prereqs.fc_bin)?;
 
-    let results =
-        run_in_private_dir(&parent_dir, |run_dir| measure(&options, &prereqs, run_dir)).await?;
+    let summary = lab_summary(&prereqs.spec, &options)?;
+    println!("{summary}");
+    let memory = Arc::new(MemoryWatch::default());
+    let watcher = Arc::clone(&memory);
+    let monitor = tokio::spawn(async move {
+        let mut poll = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            poll.tick().await;
+            let reason = match tokio::task::spawn_blocking(available_mib).await {
+                Ok(Ok(mib)) if mib >= 1024 => continue,
+                Ok(Ok(mib)) => format!("MemAvailable {mib} MiB fell below 1024 MiB"),
+                other => format!("cannot monitor MemAvailable: {other:?}"),
+            };
+            *watcher.reason.lock().map_err(|e| anyhow::anyhow!("{e}"))? = Some(reason);
+            return Ok::<(), anyhow::Error>(());
+        }
+    });
+    let outcome = run_in_private_dir(&parent_dir, |run_dir| {
+        measure(&options, &prereqs, run_dir, &memory)
+    })
+    .await;
+    monitor.abort();
+    match monitor.await {
+        Ok(result) => result?,
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => return Err(e).context("memory monitor failed"),
+    }
+    let outcome = outcome.and_then(|results| {
+        memory.check()?;
+        Ok(results)
+    });
+    let results = match outcome {
+        Ok(results) => results,
+        Err(error) => {
+            let partial = format!(
+                "# ABORTED benchmark\n\n{summary}Reason: {error:#}\n\nCompleted measurements:\n\n{}",
+                memory.samples.lock().map_err(|e| anyhow::anyhow!("{e}"))?
+            );
+            let path = options
+                .output_path
+                .clone()
+                .unwrap_or_else(|| prereqs.workspace.join("target/bench-aborted.md"));
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&path, partial)
+                .await
+                .with_context(|| format!("cannot write partial report {}", path.display()))?;
+            return Err(error).context(format!("partial report: {}", path.display()));
+        }
+    };
 
     print_results_table(&results);
     if let Some(out_path) = options.output_path.clone() {
-        let markdown = render_markdown_report(&results);
+        let markdown = format!("{summary}{}", render_markdown_report(&results));
         let written = out_path.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             if let Some(parent) = written.parent() {
@@ -1736,7 +1951,7 @@ pub fn print_results_table(results: &BenchResults) {
         );
     }
     if !results.snapshot_stages.freeze_ms.is_empty() {
-        println!("\nSnapshot Stage Breakdown (5 VMs):");
+        println!("\nSnapshot Stage Breakdown:");
         println!("{:<32} {:>12} {:>12}", "Stage", "Median", "p95");
         println!("{:-<32} {:-<12} {:-<12}", "", "", "");
         for (label, s) in results.snapshot_stages.as_slice() {
@@ -1829,7 +2044,7 @@ Quantified benchmark results evaluating Dylos technical spike microVM network co
 - **Overall Spike Verdict:** **{overall}** ({mode}, {reps} repetitions per measurement)
 - The overall verdict is computed only from what this benchmark measures.
 - **Evaluation against Go Criteria:**
-  - **Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **{snapshot}** (p95: {snap_pause_p95} vs target < 1000 ms)
+  - **Snapshot lab in under 1 s (pause window, freeze to thaw):** **{snapshot}** (p95: {snap_pause_p95} vs target < 1000 ms)
   - **Fork of one clone in under 500 ms (complete fork operation, end-to-end and amortized per clone):** **{fork}** ({forks})
   - **Fabric freeze in under 1 s:** **{freeze}** (p95: {freeze_p95})
   - **Pause confirmation skew in under 100 ms:** **{skew}** (p95: {skew_p95})
@@ -1849,7 +2064,7 @@ Quantified benchmark results evaluating Dylos technical spike microVM network co
 
 ## Performance Measurements & Go / No-Go Comparison
 
-The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-stack IPv6/IPv4 network):
+The benchmark uses the lab configuration recorded above (dual-stack IPv6/IPv4 network):
 
 | Measurement | Go Criteria Threshold | Median | p95 | Verdict |
 | :--- | :--- | :--- | :--- | :--- |
@@ -1979,7 +2194,7 @@ The benchmark runs against `labs/five.yaml` (5 microVMs, 256 MiB RAM each, dual-
 1. **Snapshot:** pause window (freeze to thaw) p95 {snap_pause_p95} (limit 1000 ms), pause skew p95 {skew_p95}, total snapshot until published p95 {snap_total_p95}. Per-stage breakdown (p95): freeze {stage_freeze_p95}, pause {stage_pause_p95}, API snapshot {stage_api_p95}, storage {stage_storage_p95}, resume {stage_resume_p95}, thaw {stage_thaw_p95}, hashing {stage_hash_p95}, manifest write {stage_manifest_p95}. Dominant stage: {dominant}.
 2. **Fork:** {forks}.
 3. **Memory:** per-clone PSS after settling: {pss_text}. PSS alone does not prove copy-on-write sharing: lazy, largely untouched guest memory also produces low PSS. A sharing / private-dirty measurement is required for that claim.
-4. **Cold boot comparison:** cold boot of 5 microVMs has a median of {cold_boot}; the fork end-to-end median for n = 1 is {fork_n1}.
+4. **Cold boot comparison:** cold boot of the lab has a median of {cold_boot}; the fork end-to-end median for n = 1 is {fork_n1}.
 
 ## Conclusion & Next Steps
 
