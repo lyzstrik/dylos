@@ -1,3 +1,5 @@
+# Routed sources require an explicit peer-filtering opt-out.
+peer_filtering: false
 nodes:
   - name: router
     image: router-qcow2

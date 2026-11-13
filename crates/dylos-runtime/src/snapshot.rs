@@ -967,6 +967,7 @@ mod tests {
             lab_id: "lab".into(),
             snapshot_id: "snap".into(),
             spec: LabSpec {
+                peer_filtering: false,
                 nodes: vec![],
                 segments: vec![],
             },

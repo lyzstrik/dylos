@@ -47,6 +47,7 @@ pub type InterfaceDiff = DiffSet<NodeInterface, NodeInterfaceChange>;
 /// Changes to an individual segment. Unchanged fields serialize as explicit null.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SegmentChange {
+    pub peer_filtering: Option<ValueChange<bool>>,
     pub name: String,
     pub ipv6: Option<ValueChange<Ipv6Net>>,
     pub ipv4: Option<ValueChange<Option<Ipv4Net>>>,
@@ -162,7 +163,11 @@ fn diff_segments(spec_a: &LabSpec, spec_b: &LabSpec) -> SegmentDiff {
                 from: sa.ipv4,
                 to: sb.ipv4,
             });
-            (ipv6.is_some() || ipv4.is_some()).then(|| SegmentChange {
+            let from = spec_a.peer_filtering_for(sa);
+            let to = spec_b.peer_filtering_for(sb);
+            let peer_filtering = (from != to).then_some(ValueChange { from, to });
+            (ipv6.is_some() || ipv4.is_some() || peer_filtering.is_some()).then(|| SegmentChange {
+                peer_filtering,
                 name: (*name).to_string(),
                 ipv6,
                 ipv4,

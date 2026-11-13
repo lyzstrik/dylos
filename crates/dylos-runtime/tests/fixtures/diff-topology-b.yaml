@@ -1,3 +1,5 @@
+# Routed sources require an explicit peer-filtering opt-out.
+peer_filtering: false
 segments:
   - name: lan1
     ipv6: fd64:796c:6f73:10::/64

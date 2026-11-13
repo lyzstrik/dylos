@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LabSpec {
+    /// Requested policy; enforcement is staged separately from schema support.
+    #[serde(default)]
+    pub peer_filtering: bool,
     pub segments: Vec<Segment>,
     pub nodes: Vec<Node>,
 }
@@ -11,6 +14,9 @@ pub struct LabSpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Segment {
+    /// Inherits the lab policy when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_filtering: Option<bool>,
     pub name: String,
     pub ipv6: Ipv6Net,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -45,4 +51,12 @@ pub struct Interface {
 pub struct StaticRoute {
     pub destination: IpNet,
     pub gateway: std::net::IpAddr,
+}
+
+impl LabSpec {
+    /// Resolves a segment override against the lab policy.
+    #[must_use]
+    pub fn peer_filtering_for(&self, segment: &Segment) -> bool {
+        segment.peer_filtering.unwrap_or(self.peer_filtering)
+    }
 }
