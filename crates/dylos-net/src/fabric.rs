@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{Instrument, info, info_span, warn};
 
 use crate::netns::{self, blocking, io_err, on_fresh_thread, on_fresh_thread_blocking};
-use crate::{Error, FabricPlan, tap};
+use crate::{Error, FabricPlan, nft, tap};
 
 /// A lab's netns with its bridges and TAPs, torn down on drop if [`LabNetwork::teardown`] was
 /// not called.
@@ -272,9 +272,23 @@ fn create_blocking(
     frozen: bool,
 ) -> Result<(File, crate::freeze::State), Error> {
     let lab = plan.lab_id();
+    let executable = if plan.peer_filters.is_empty() {
+        None
+    } else {
+        Some(nft::resolve(lab)?)
+    };
     let created = on_fresh_thread_blocking(lab, {
         let (plan, path) = (plan.clone(), path.to_owned());
-        move || create_fabric(&plan, &path, user_id, group_id, frozen)
+        move || {
+            create_fabric(
+                &plan,
+                &path,
+                user_id,
+                group_id,
+                frozen,
+                executable.as_deref(),
+            )
+        }
     });
     match created {
         Err(e) if !matches!(e, Error::NetnsExists { .. }) => {
@@ -297,6 +311,7 @@ fn create_fabric(
     user_id: u32,
     group_id: u32,
     frozen: bool,
+    executable: Option<&Path>,
 ) -> Result<(File, crate::freeze::State), Error> {
     let lab = plan.lab_id();
     let ns = netns::create_and_enter(lab, path)?;
@@ -318,13 +333,26 @@ fn create_fabric(
             let index = require_index(lab, handle, &tap.name).await?;
             let bridge = require_index(lab, handle, &tap.bridge).await?;
             let builder = LinkUnspec::new_with_index(index).controller(bridge);
-            let msg = if frozen { builder.down() } else { builder.up() }.build();
-            let res = handle.link().change(msg).execute().await;
+            let res = handle.link().change(builder.down().build()).execute().await;
             res.map_err(nl_err(lab, "attach tap", &tap.name))?;
+        }
+        if let Some(rules) = plan.peer_filter_rules() {
+            let executable = executable
+                .ok_or_else(|| nft::failure(lab, "nft was not resolved before namespace entry"))?;
+            nft::batch(lab, executable, &rules).await?;
         }
         if frozen {
             crate::freeze::initially_frozen(plan, handle).await
         } else {
+            for tap in plan.taps() {
+                let index = require_index(lab, handle, &tap.name).await?;
+                handle
+                    .link()
+                    .change(LinkUnspec::new_with_index(index).up().build())
+                    .execute()
+                    .await
+                    .map_err(nl_err(lab, "activate tap", &tap.name))?;
+            }
             Ok(crate::freeze::State::default())
         }
     })?;
@@ -334,6 +362,7 @@ fn create_fabric(
 /// With `owned`, deletes the devices in that netns, and unpins `path` only if it still pins it.
 fn teardown_blocking(plan: &FabricPlan, path: &Path, owned: Option<&File>) -> Result<(), Error> {
     let lab = plan.lab_id();
+    let executable = (!plan.peer_filters.is_empty()).then(|| nft::resolve(lab));
     let entered = match owned {
         Some(ns) => netns::enter_file(lab, ns, path)?,
         None => netns::enter(lab, path)?,
@@ -349,6 +378,14 @@ fn teardown_blocking(plan: &FabricPlan, path: &Path, owned: Option<&File>) -> Re
                     let res = handle.link().del(index).execute().await;
                     res.map_err(nl_err(lab, "delete", name))?;
                 }
+            }
+            if let Some(executable) = executable {
+                nft::batch(
+                    lab,
+                    &executable?,
+                    &format!("destroy table bridge {}\n", crate::peer_filter::TABLE),
+                )
+                .await?;
             }
             Ok(())
         })?;
@@ -366,7 +403,7 @@ fn with_netlink<T>(
     f: impl AsyncFnOnce(&Handle) -> Result<T, Error>,
 ) -> Result<T, Error> {
     let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
+        .enable_all()
         .build()
         .map_err(io_err(lab, "build netlink runtime", Path::new("")))?;
     runtime.block_on(async {
