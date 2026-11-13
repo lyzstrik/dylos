@@ -462,12 +462,12 @@ async fn run_snapshot_steps(
                 fsync_ms = timings.fsync_ms;
                 reflink_ms = timings.reflink_ms;
             }
-            let (state_file, _) = snap.capture_vm_source(
+            let state_file = snap.capture_vm_source(
                 dylos_store::VmFileSource::open(&state_src, state_max_bytes)?,
                 &node,
                 "vm.state",
             )?;
-            let (memory_file, _) = snap.capture_vm_source(
+            let memory_file = snap.capture_vm_source(
                 dylos_store::VmFileSource::open(&mem_src, mem_max_bytes)?,
                 &node,
                 "vm.mem",

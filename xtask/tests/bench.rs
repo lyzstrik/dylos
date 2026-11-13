@@ -368,7 +368,7 @@ fn failing_pause_is_no_go_regardless_of_publication_time() {
 
 #[test]
 fn storage_dominant_stage_is_identified_and_reported() {
-    let r = BenchResults {
+    let mut r = BenchResults {
         snapshot_freeze_to_thaw_ms: samples(&[850.0]),
         snapshot_total_ms: samples(&[1500.0]),
         snapshot_stages: SnapshotStages {
@@ -397,6 +397,11 @@ fn storage_dominant_stage_is_identified_and_reported() {
         report.contains("| API snapshot | 150.0 ms | 150.0 ms | Memory & state serialization |")
     );
     assert!(!report.contains("Memory & state serialization, disk reflink"));
+    for (fsync, reflink) in [(600.0, 50.0), (500.0, 600.0)] {
+        r.snapshot_stages.fsync_ms = samples(&[fsync]);
+        r.snapshot_stages.reflink_ms = samples(&[reflink]);
+        assert_eq!(r.snapshot_stages.dominant_stage(), Some(("storage", 600.0)));
+    }
 }
 
 fn fast() -> SettleParams {

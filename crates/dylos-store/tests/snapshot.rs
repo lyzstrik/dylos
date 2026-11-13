@@ -537,7 +537,7 @@ fn deferred_hash_records_retained_writer_risk_but_disks_stay_isolated() {
         let source = temp.path().join(name);
         fs::write(&source, b"captured").unwrap();
         let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
-        let (mut meta, _) = snapshot
+        let mut meta = snapshot
             .capture_vm_source(VmFileSource::open(&source, 1024).unwrap(), "node1", name)
             .unwrap();
         assert_eq!(meta.sha256, "");
@@ -676,7 +676,7 @@ fn deferred_capture_preserves_zero_chunks_and_trailing_holes() {
     file.set_len(size).unwrap();
     file.write_all(b"captured").unwrap();
     drop(file);
-    let (mut meta, _) = snapshot
+    let mut meta = snapshot
         .capture_vm_source(
             VmFileSource::open(&source, size).unwrap(),
             "node1",
@@ -717,7 +717,7 @@ fn deferred_capture_keeps_scattered_guest_pages_sparse() {
         }
         drop(file);
         let original = fs::metadata(&source).unwrap();
-        let (mut meta, _) = snapshot
+        let mut meta = snapshot
             .capture_vm_source(
                 VmFileSource::open(&source, bytes.len() as u64).unwrap(),
                 "node1",

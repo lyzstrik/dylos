@@ -559,14 +559,23 @@ impl SnapshotStages {
         ]
     }
 
-    /// Returns the name and p95 duration of the stage with the largest p95 duration,
+    /// Returns the top-level stage with the largest p95 duration, excluding storage sub-stages.
     /// or None if all stage metrics are empty.
     pub fn dominant_stage(&self) -> Option<(&'static str, f64)> {
-        self.as_slice()
-            .into_iter()
-            .filter(|(_, s)| !s.is_empty())
-            .max_by(|(_, a), (_, b)| a.p95().total_cmp(&b.p95()))
-            .map(|(name, s)| (name, s.p95()))
+        [
+            ("freeze", &self.freeze_ms),
+            ("pause", &self.pause_ms),
+            ("API snapshot", &self.api_snapshot_ms),
+            ("storage", &self.storage_ms),
+            ("resume", &self.resume_ms),
+            ("thaw", &self.thaw_ms),
+            ("hashing", &self.hash_ms),
+            ("manifest write", &self.manifest_ms),
+        ]
+        .into_iter()
+        .filter(|(_, s)| !s.is_empty())
+        .max_by(|(_, a), (_, b)| a.p95().total_cmp(&b.p95()))
+        .map(|(name, s)| (name, s.p95()))
     }
 }
 

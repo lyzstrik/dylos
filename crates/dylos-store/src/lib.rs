@@ -474,7 +474,7 @@ impl Snapshot {
         source: VmFileSource,
         node: &str,
         file_name: &str,
-    ) -> Result<(FileMeta, u64), Error> {
+    ) -> Result<FileMeta, Error> {
         valid_id(node)?;
         valid_file_name(file_name)?;
         let vm_dir = self.vm_directory(node)?;
@@ -535,15 +535,12 @@ impl Snapshot {
         };
         let size = capture().map_err(|e| contextual(&source.path, e))?;
         drop(source);
-        Ok((
-            FileMeta {
-                fsverity: None,
-                path,
-                sha256: String::new(),
-                size,
-            },
-            0,
-        ))
+        Ok(FileMeta {
+            fsverity: None,
+            path,
+            sha256: String::new(),
+            size,
+        })
     }
 
     fn vm_directory(&self, node: &str) -> Result<File, Error> {
