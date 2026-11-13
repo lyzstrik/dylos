@@ -317,14 +317,14 @@ fn passing_pause_with_slow_publication_is_go_and_shows_dominant_stage() {
     assert!(r.overall_verdict().starts_with("PENDING"));
 
     let report = render_markdown_report(&r);
+    assert!(report.contains("Snapshot lab in under 1 s (pause window, freeze to thaw):** **GO**"));
+    assert!(
+        report.contains(
+            "Snapshot pause window, freeze to thaw | < 1000 ms | 750.0 ms | 750.0 ms | GO"
+        )
+    );
     assert!(report.contains(
-        "Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **GO**"
-    ));
-    assert!(report.contains(
-        "Snapshot pause window, freeze to thaw (5 VMs) | < 1000 ms | 750.0 ms | 750.0 ms | GO"
-    ));
-    assert!(report.contains(
-        "Snapshot total until published (5 VMs) | informational | 26000.0 ms | 26000.0 ms | INFO"
+        "Snapshot total until published | informational | 26000.0 ms | 26000.0 ms | INFO"
     ));
     assert!(report.contains("Dominant stage: hashing (p95: 25000.0 ms)"));
 }
@@ -351,11 +351,11 @@ fn failing_pause_is_no_go_regardless_of_publication_time() {
     assert!(r.overall_verdict().contains("snapshot"));
 
     let report = render_markdown_report(&r);
+    assert!(
+        report.contains("Snapshot lab in under 1 s (pause window, freeze to thaw):** **NO-GO**")
+    );
     assert!(report.contains(
-        "Snapshot 5 VMs (256 MiB each) in under 1 s (pause window, freeze to thaw):** **NO-GO**"
-    ));
-    assert!(report.contains(
-        "Snapshot pause window, freeze to thaw (5 VMs) | < 1000 ms | 1250.0 ms | 1250.0 ms | NO-GO"
+        "Snapshot pause window, freeze to thaw | < 1000 ms | 1250.0 ms | 1250.0 ms | NO-GO"
     ));
     assert!(report.contains("Dominant stage: API snapshot (p95: 1100.0 ms)"));
 }
@@ -1242,4 +1242,64 @@ fn snapshot_report_counts_actual_capture_types_including_mixed_fallback() {
     assert!(report.contains("| 3 | 3 | 2 |"));
     assert!(report.contains("Capture summary (VM captures): Diff = 8, Full = 7."));
     assert!(report.contains("delete the snapshot from two repetitions back before measurement"));
+}
+
+#[test]
+fn scale_up_options_paths_and_memory_budget() {
+    use xtask::bench::{preflight_estimate_mib, validate_lab_path};
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let defaults = parse_bench_args(std::iter::empty()).unwrap();
+    assert_eq!(defaults.lab, Path::new("labs/five.yaml"));
+    assert_eq!(defaults.working_set_mib, 0);
+    let args = [
+        "--lab",
+        "labs/bench/two-8g.yaml",
+        "--working-set-mib",
+        "512",
+        "--fork-counts",
+        "1,2",
+    ];
+    let mut options = parse_bench_args(args.into_iter().map(String::from)).unwrap();
+    let path = validate_lab_path(workspace, &options.lab).unwrap();
+    let spec = LabSpec::from_yaml_str(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        preflight_estimate_mib(&spec, &options).unwrap(),
+        2 * 2 * 512 + 2 * 2 * 8192 + 1024
+    );
+    options.working_set_mib = 8192;
+    assert!(preflight_estimate_mib(&spec, &options).is_err());
+    options.working_set_mib = 0;
+    options.fork_counts = vec![usize::MAX];
+    assert!(preflight_estimate_mib(&spec, &options).is_err());
+    for bad in ["--lab", "--working-set-mib"] {
+        assert!(parse_bench_args([bad.to_owned()].into_iter()).is_err());
+    }
+    for value in ["-1", "no", "18446744073709551616"] {
+        assert!(
+            parse_bench_args(["--working-set-mib", value].into_iter().map(String::from)).is_err()
+        );
+    }
+    assert!(validate_lab_path(workspace, Path::new("labs/../Cargo.toml")).is_err());
+    assert!(validate_lab_path(workspace, Path::new("/etc/passwd")).is_err());
+    let temp = scratch("lab-boundary");
+    fs::create_dir(temp.join("labs")).unwrap();
+    symlink(workspace.join("Cargo.toml"), temp.join("labs/escape.yaml")).unwrap();
+    assert!(validate_lab_path(&temp, Path::new("labs/escape.yaml")).is_err());
+    fs::remove_dir_all(&temp).unwrap();
+    for (name, count, memory) in [
+        ("four-1g", 4, 1024),
+        ("four-2g", 4, 2048),
+        ("four-4g", 4, 4096),
+        ("two-4g", 2, 4096),
+        ("two-8g", 2, 8192),
+    ] {
+        let path = workspace.join(format!("labs/bench/{name}.yaml"));
+        let spec = LabSpec::from_yaml_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(spec.nodes.len(), count);
+        assert!(
+            spec.nodes
+                .iter()
+                .all(|node| node.memory == memory && node.vcpus == 1)
+        );
+    }
 }
