@@ -60,6 +60,8 @@ fn passing() -> BenchResults {
             pause_ms: samples(&[80.0]),
             api_snapshot_ms: samples(&[650.0]),
             storage_ms: samples(&[30.0]),
+            fsync_ms: samples(&[20.0]),
+            reflink_ms: samples(&[5.0]),
             resume_ms: samples(&[20.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[5000.0]),
@@ -305,6 +307,8 @@ fn passing_pause_with_slow_publication_is_go_and_shows_dominant_stage() {
             pause_ms: samples(&[70.0]),
             api_snapshot_ms: samples(&[600.0]),
             storage_ms: samples(&[40.0]),
+            fsync_ms: samples(&[20.0]),
+            reflink_ms: samples(&[5.0]),
             resume_ms: samples(&[20.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[25_000.0]),
@@ -339,6 +343,8 @@ fn failing_pause_is_no_go_regardless_of_publication_time() {
             pause_ms: samples(&[100.0]),
             api_snapshot_ms: samples(&[1100.0]),
             storage_ms: samples(&[30.0]),
+            fsync_ms: samples(&[20.0]),
+            reflink_ms: samples(&[5.0]),
             resume_ms: samples(&[25.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[700.0]),
@@ -362,7 +368,7 @@ fn failing_pause_is_no_go_regardless_of_publication_time() {
 
 #[test]
 fn storage_dominant_stage_is_identified_and_reported() {
-    let r = BenchResults {
+    let mut r = BenchResults {
         snapshot_freeze_to_thaw_ms: samples(&[850.0]),
         snapshot_total_ms: samples(&[1500.0]),
         snapshot_stages: SnapshotStages {
@@ -370,6 +376,8 @@ fn storage_dominant_stage_is_identified_and_reported() {
             pause_ms: samples(&[50.0]),
             api_snapshot_ms: samples(&[150.0]),
             storage_ms: samples(&[600.0]),
+            fsync_ms: samples(&[500.0]),
+            reflink_ms: samples(&[50.0]),
             resume_ms: samples(&[20.0]),
             thaw_ms: samples(&[2.0]),
             hash_ms: samples(&[300.0]),
@@ -382,11 +390,18 @@ fn storage_dominant_stage_is_identified_and_reported() {
 
     let report = render_markdown_report(&r);
     assert!(report.contains("Dominant stage: storage (p95: 600.0 ms)"));
+    assert!(report.contains("| Disk fsync (within storage) | 500.0 ms | 500.0 ms |"));
+    assert!(report.contains("| Disk reflink (within storage) | 50.0 ms | 50.0 ms |"));
     assert!(report.contains("| Storage | 600.0 ms | 600.0 ms | Disk reflink & file capture |"));
     assert!(
         report.contains("| API snapshot | 150.0 ms | 150.0 ms | Memory & state serialization |")
     );
     assert!(!report.contains("Memory & state serialization, disk reflink"));
+    for (fsync, reflink) in [(600.0, 50.0), (500.0, 600.0)] {
+        r.snapshot_stages.fsync_ms = samples(&[fsync]);
+        r.snapshot_stages.reflink_ms = samples(&[reflink]);
+        assert_eq!(r.snapshot_stages.dominant_stage(), Some(("storage", 600.0)));
+    }
 }
 
 fn fast() -> SettleParams {
@@ -1264,7 +1279,7 @@ fn scale_up_options_paths_and_memory_budget() {
     let spec = LabSpec::from_yaml_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(
         preflight_estimate_mib(&spec, &options).unwrap(),
-        2 * 2 * 512 + 2 * 2 * 160 + 1024
+        2 * 512 + 2 * 2 * 160 + 1024
     );
     options.working_set_mib = 8192;
     assert!(preflight_estimate_mib(&spec, &options).is_err());

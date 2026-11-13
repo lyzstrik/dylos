@@ -242,7 +242,14 @@ fn save_vm_file_fails_closed_on_exdev_without_copying() {
     fs::write(&shm_file, b"memory content on another device").unwrap();
 
     let res = snapshot.save_vm_file(&shm_file, "node1", "vm.mem", 1024 * 1024);
-    let _ = fs::remove_file(&shm_file);
+    let captured = snapshot.capture_vm_source(
+        VmFileSource::open(&shm_file, 1024 * 1024).unwrap(),
+        "node1",
+        "vm.mem",
+    );
+    assert!(captured.is_err(), "rename must also reject EXDEV");
+    assert!(shm_file.exists());
+    fs::remove_file(&shm_file).unwrap();
 
     assert!(res.is_err(), "expected EXDEV to fail closed");
     assert!(!snapshot.root().join("vms/node1/vm.mem").exists());
@@ -522,7 +529,7 @@ fn shared_backing_must_be_orchestrator_owned_and_unwritable() {
 }
 
 #[test]
-fn deferred_hash_reads_isolated_capture_despite_source_writer() {
+fn deferred_hash_records_retained_writer_risk_but_disks_stay_isolated() {
     use std::io::{Seek, SeekFrom, Write};
     let (temp, store, _spec) = setup();
     let snapshot = store.stage_snapshot("lab", "snap").unwrap();
@@ -530,17 +537,18 @@ fn deferred_hash_reads_isolated_capture_despite_source_writer() {
         let source = temp.path().join(name);
         fs::write(&source, b"captured").unwrap();
         let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
-        let (mut meta, _) = snapshot
+        let mut meta = snapshot
             .capture_vm_source(VmFileSource::open(&source, 1024).unwrap(), "node1", name)
             .unwrap();
         assert_eq!(meta.sha256, "");
         assert!(!source.exists());
         writer.seek(SeekFrom::Start(0)).unwrap();
         writer.write_all(b"modified").unwrap();
+        drop(writer);
         snapshot.hash_file(&mut meta).unwrap();
         assert_eq!(
             fs::read(snapshot.root().join(&meta.path)).unwrap(),
-            b"captured"
+            b"modified"
         );
         assert_eq!(meta.sha256.len(), 64);
     }
@@ -556,7 +564,7 @@ fn deferred_hash_reads_isolated_capture_despite_source_writer() {
             ) =>
         {
             eprintln!(
-                "SKIPPED deferred_hash_reads_isolated_capture_despite_source_writer: reflinks unavailable: {source}"
+                "SKIPPED deferred_hash_records_retained_writer_risk_but_disks_stay_isolated: reflinks unavailable: {source}"
             );
             return;
         }
@@ -667,7 +675,8 @@ fn deferred_capture_preserves_zero_chunks_and_trailing_holes() {
     let size = 3 * 1024 * 1024;
     file.set_len(size).unwrap();
     file.write_all(b"captured").unwrap();
-    let (mut meta, _) = snapshot
+    drop(file);
+    let mut meta = snapshot
         .capture_vm_source(
             VmFileSource::open(&source, size).unwrap(),
             "node1",
@@ -694,42 +703,38 @@ fn deferred_capture_keeps_scattered_guest_pages_sparse() {
     use sha2::Digest;
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
-    for buffered in [false, true] {
+    {
         let (temp, store, _spec) = setup();
         let snapshot = store.stage_snapshot("lab", "pages").unwrap();
         let source = temp.path().join("snap.mem");
+        let mut file = fs::File::create(&source).unwrap();
         let mut bytes = vec![0; 3 * 1024 * 1024 + 17];
+        file.set_len(bytes.len() as u64).unwrap();
         for offset in [0, 1024 * 1024 + 4096, 2 * 1024 * 1024, bytes.len() - 1] {
             bytes[offset] = 42;
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(offset as u64)).unwrap();
+            file.write_all(&[42]).unwrap();
         }
-        fs::write(&source, &bytes).unwrap();
-        let mut writer = fs::OpenOptions::new().write(true).open(&source).unwrap();
-        let source_file = VmFileSource::open(&source, bytes.len() as u64).unwrap();
-        let destination = snapshot.root().join("vms/node1/vm.mem");
-        let mut meta = if buffered {
-            let capture = snapshot
-                .buffer_vm_source(source_file, "node1", "vm.mem")
-                .unwrap();
-            assert!(!source.exists());
-            assert_eq!(fs::metadata(&destination).unwrap().len(), 0);
-            writer.write_all(b"modified").unwrap();
-            snapshot.persist_buffered_vm_file(capture).unwrap()
-        } else {
-            let (meta, _) = snapshot
-                .capture_vm_source(source_file, "node1", "vm.mem")
-                .unwrap();
-            assert!(!source.exists());
-            writer.write_all(b"modified").unwrap();
-            meta
-        };
-        store.sync_filesystem().unwrap();
-        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        drop(file);
+        let original = fs::metadata(&source).unwrap();
+        let mut meta = snapshot
+            .capture_vm_source(
+                VmFileSource::open(&source, bytes.len() as u64).unwrap(),
+                "node1",
+                "vm.mem",
+            )
+            .unwrap();
+        let destination = snapshot.root().join(&meta.path);
+        assert!(!source.exists());
         let metadata = fs::metadata(&destination).unwrap();
-        assert!(metadata.permissions().readonly());
-        assert!(
-            metadata.blocks() * 512 < 128 * 1024,
-            "scattered pages must not allocate whole MiB chunks"
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (original.dev(), original.ino())
         );
+        assert_eq!(metadata.uid(), fs::metadata(snapshot.root()).unwrap().uid());
+        assert!(metadata.permissions().readonly());
+        assert!(metadata.blocks() * 512 < 128 * 1024);
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
         snapshot.hash_file(&mut meta).unwrap();
         assert_eq!(meta.size, bytes.len() as u64);
         assert_eq!(
@@ -814,4 +819,59 @@ fn declared_verity_on_unsealed_files_fails_closed() {
     );
     assert!(store.restore("unproven", &path).is_err());
     assert!(!store.base.join("unproven").exists());
+}
+
+#[test]
+fn capture_refuses_replacements_links_growth_and_existing_destination() {
+    use std::os::unix::fs::symlink;
+    for kind in [
+        "replacement",
+        "symlink",
+        "hardlink",
+        "growth",
+        "destination",
+    ] {
+        let (temp, store, _) = setup();
+        let snapshot = store.stage_snapshot("lab", "reject").unwrap();
+        let source = temp.path().join("snap.state");
+        let other = temp.path().join("other");
+        fs::write(&source, b"original").unwrap();
+        let opened = VmFileSource::open(&source, 8).unwrap();
+        match kind {
+            "replacement" | "symlink" => {
+                fs::rename(&source, &other).unwrap();
+                if kind == "symlink" {
+                    symlink(&other, &source).unwrap();
+                } else {
+                    fs::write(&source, b"replaced").unwrap();
+                }
+            }
+            "hardlink" => fs::hard_link(&source, &other).unwrap(),
+            "growth" => fs::write(&source, b"too large").unwrap(),
+            "destination" => {
+                fs::create_dir_all(snapshot.root().join("vms/node1")).unwrap();
+                fs::write(snapshot.root().join("vms/node1/vm.state"), b"existing").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::symlink_metadata(&source).unwrap().permissions().mode();
+        assert!(
+            snapshot
+                .capture_vm_source(opened, "node1", "vm.state")
+                .is_err(),
+            "{kind}"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&source).unwrap().permissions().mode(),
+            before
+        );
+        if kind == "destination" {
+            assert_eq!(
+                fs::read(snapshot.root().join("vms/node1/vm.state")).unwrap(),
+                b"existing"
+            );
+        } else {
+            assert!(!snapshot.root().join("vms/node1/vm.state").exists());
+        }
+    }
 }
