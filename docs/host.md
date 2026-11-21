@@ -1,9 +1,29 @@
 # Development host
 
 ## Machine
-- OS : Arch Linux, host kernel 7.2.7-zen1-1-zen
+- OS : Arch Linux, reference host kernel `linux-lts` 6.18.63 (`6.18.63-3-lts`)
 - CPU : AMD Ryzen 9 5900HS (16) @ 4.68 GHz, AMD-V virtualization
 - RAM : 16G
+
+The reference LTS kernel passed the cold-read fs-verity checks on btrfs.
+Linux Zen 7.2.15 returned `EIO` on fragmented files. See the
+[final spike report](bench/spike-final.md).
+
+### systemd-boot entry for linux-lts
+
+With `linux-lts` installed, copy your existing systemd-boot entry to a new
+`.conf` file in the same `loader/entries/` directory. Give it a distinct title
+and replace the kernel and main initramfs lines with these:
+
+```ini
+linux /vmlinuz-linux-lts
+initrd /initramfs-linux-lts.img
+```
+
+Preserve your existing kernel options and any separate CPU microcode
+`initrd` line before the main initramfs. If you use Secure Boot, sign the LTS
+kernel image the same way you sign your current kernel image. Select the LTS
+entry at boot and check the running version with `uname -r`.
 
 ## Firecracker
 - Version : v1.17.0
@@ -154,7 +174,7 @@ alongside its existing host packages and runs these probes via `just e2e`.
 End-to-end tests (`just e2e`) require root and `/dev/kvm`. They run automatically in CI on disposable GitHub-hosted runners (`.github/workflows/e2e.yml`). On a developer host, they are run by a human (never run `sudo` inside tests).
 
 ### Pause KPI enforcement
-The 5-VM snapshot pause KPI (< 1 s freeze-to-thaw pause window) is enforced by default on the reference host (and in local runs of `just e2e` / `dylos-bench`), where the hardware measures well within budget (~478 ms).
+The 5-VM snapshot pause KPI (< 1 s freeze-to-thaw pause window) is enforced by default on the reference host (and in local runs of `just e2e` / `dylos-bench`), where the final `ws128` reference run measured 109.3 ms at p95.
 On GitHub CI runners, shared host I/O contention and virtualization scheduling cause intermittent Firecracker snapshot API stalls (2–6 s) that cannot be reliably eliminated in software.
 GitHub CI sets `DYLOS_E2E_PAUSE_KPI=report` in `.github/workflows/e2e.yml`: when set to `report`, `five_vms_snapshot_measurement_and_integrity` prints the timing breakdown and emits a GitHub `::warning::` annotation if the pause exceeds 1 s, without gating the merge on runner I/O jitter.
 Snapshot integrity, memory file consistency, and every other assertion remain strictly enforced in both modes.
