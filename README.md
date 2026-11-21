@@ -27,6 +27,8 @@ Out of scope for now: web UI, multi-host, Windows guests, eBPF, public API.
 
 ## Benchmark results
 
+**Technical spike verdict: GO.** All measured criteria passed, and the separate owner-host E2E run passed all three functional criteria. See the [final spike report](docs/bench/spike-final.md) for the LTS scale results and known limits.
+
 [Full report](docs/bench/spike.md): revision [`73383a2`](https://github.com/lyzstrik/dylos/commit/73383a2), 50 repetitions (`dylos-bench bench --repetitions 50`), bare-metal owner host: AMD Ryzen 9 5900HS with Radeon Graphics (16 vCPUs), 15.0 GiB RAM, Linux `7.2.15-zen1-1-zen`, btrfs, Firecracker v1.17.0; 5 VMs, 256 MiB each.
 
 | Measurement | Median | p95 | Go criterion | Result |
@@ -41,7 +43,7 @@ Out of scope for now: web UI, multi-host, Windows guests, eBPF, public API.
 | Per-clone PSS, settled (n=10) | 52.6 MiB | 54.3 MiB | < 256 MiB | PASS |
 | Per-clone PSS, settled (n=20) | 48.3 MiB | 50.1 MiB | < 256 MiB | PASS |
 
-The pause window is dominated by the [ADR-0001 memory copy](docs/adr/0001-consistency-by-fabric-freeze.md): storage-stage p95 594.3 ms of 604.8 ms; snapshot publication completes later (p95 14746.5 ms).
+At `73383a2`, the memory copy dominated the pause window. The storage stage took 594.3 ms at p95 against a total pause of 604.8 ms at p95. Snapshot publication completed later, at 14746.5 ms p95. See [ADR-0001](docs/adr/0001-consistency-by-fabric-freeze.md).
 Separate owner-host `just e2e` at `73383a2` passed 21/21 tests: [TCP survival in all ten clones](crates/dylos-runtime/tests/reliability_e2e.rs), [zero address conflict across ten simultaneous clones](crates/dylos-runtime/tests/fork_e2e.rs), and [100 snapshot/fork/destroy cycles without leaks](crates/dylos-runtime/tests/reliability_e2e.rs) (`snapshot_fork_down_endurance`, 1257 s).
 That owner-host run has no CI URL; the [E2E workflow](https://github.com/lyzstrik/dylos/actions/workflows/e2e.yml) runs these tests on every PR, with 5 endurance cycles in CI.
 
