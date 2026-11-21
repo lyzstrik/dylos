@@ -11,7 +11,7 @@ It aims to run networks of [Firecracker](https://github.com/firecracker-microvm/
 
 Technical spike. The CLI implements `dylos lab up`, `down`, `list`, `snapshot`, `restore`, `fork`, and `diff` for multi-VM labs, including the reference `A -- B -- C` lab (`labs/abc.yaml`). Lab-wide snapshot and restore use fabric freeze/thaw; fork restores independent clone labs. Snapshots use fs-verity sealing where supported, with full SHA-256 verification as the fallback ([ADR-0005](docs/adr/0005-snapshot-content-verity.md)).
 
-`just bench` runs the spike benchmark suite. See the [benchmark report](docs/bench/spike.md) for results and measurement limits, and the [architecture status](docs/architecture.md) for implementation details. At revision `73383a2`, all measured go criteria passed, as did the separate owner-host E2E checks for TCP survival, clone address isolation, and 100 cycles without resource leaks.
+`just bench` runs the spike benchmark suite. See the [final spike report](docs/bench/spike-final.md) for scale results and known limits, and the [architecture status](docs/architecture.md) for implementation details. At revision `73383a2`, all measured go criteria passed, as did the separate owner-host E2E checks for TCP survival, clone address isolation, and 100 cycles without resource leaks.
 
 The spike must prove that a network of microVMs can be snapshotted consistently and forked quickly. Reference topology: `A -- B -- C`, with B acting as a Linux router between two segments, extended to 5 VMs for measurements.
 
@@ -29,7 +29,7 @@ Out of scope for now: web UI, multi-host, Windows guests, eBPF, public API.
 
 **Technical spike verdict: GO.** All measured criteria passed, and the separate owner-host E2E run passed all three functional criteria. See the [final spike report](docs/bench/spike-final.md) for the LTS scale results and known limits.
 
-[Full report](docs/bench/spike.md): revision [`73383a2`](https://github.com/lyzstrik/dylos/commit/73383a2), 50 repetitions (`dylos-bench bench --repetitions 50`), bare-metal owner host: AMD Ryzen 9 5900HS with Radeon Graphics (16 vCPUs), 15.0 GiB RAM, Linux `7.2.15-zen1-1-zen`, btrfs, Firecracker v1.17.0; 5 VMs, 256 MiB each.
+[Earlier reference report](docs/bench/spike.md): revision [`73383a2`](https://github.com/lyzstrik/dylos/commit/73383a2), 50 repetitions (`dylos-bench bench --repetitions 50`), bare-metal owner host: AMD Ryzen 9 5900HS with Radeon Graphics (16 vCPUs), 15.0 GiB RAM, Linux `7.2.15-zen1-1-zen`, btrfs, Firecracker v1.17.0; 5 VMs, 256 MiB each.
 
 | Measurement | Median | p95 | Go criterion | Result |
 | :--- | ---: | ---: | :--- | :--- |
